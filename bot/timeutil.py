@@ -94,6 +94,7 @@ async def sync_once() -> tuple[Optional[timedelta], str]:
     global _offset, _last_sync_ts, _last_sources, _sync_count, _fail_count
 
     sampled = random.sample(_TIME_SOURCES, min(_SAMPLE_SIZE, len(_TIME_SOURCES)))
+    sys_utc_before = datetime.now(timezone.utc)  # 以发请求前的系统时钟为基准
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(
             *[_fetch_source_time(u, session) for u in sampled]
@@ -105,10 +106,8 @@ async def sync_once() -> tuple[Optional[timedelta], str]:
         _fail_count += 1
         return None, "all_sources_failed"
 
-    # 系统当前 UTC 时间
-    sys_utc = datetime.now(timezone.utc)
-    # 每个源算出的偏移 = 源时间 - 系统时间
-    offsets = [(u, t - sys_utc) for u, t in pairs]
+    # 每个源算出的偏移 = 源时间 - 系统时间（用同一基准 sys_utc_before，避免把网络延迟算进偏移）
+    offsets = [(u, t - sys_utc_before) for u, t in pairs]
 
     # 取多数一致：把偏移量化到秒，找出现次数最多的
     by_sec = {}
