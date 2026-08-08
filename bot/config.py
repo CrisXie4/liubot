@@ -22,7 +22,6 @@ class Config:
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
     LLM_API_URL: str = os.getenv("LLM_API_URL", "https://api.deepseek.com/v1")
     LLM_MODEL: str = os.getenv("LLM_MODEL", "deepseek-chat")
-    LLM_THINKING_EFFORT: str = os.getenv("LLM_THINKING_EFFORT", "medium")  # low/medium/high/xhigh/max
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.8"))
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "300"))
 

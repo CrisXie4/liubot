@@ -12,7 +12,6 @@ async function mLoad() {
     $('m-temp').value = d.temperature || 0.8;
     $('m-max').value = d.max_tokens || 800;
     $('m-ctx').value = d.context_size || 20;
-    $('m-think').value = d.thinking_effort || 'disabled';
     $('m-search').checked = d.web_search_enabled !== false;
   } catch (e) { toast('加载失败', 'err'); }
 }
@@ -25,7 +24,6 @@ async function mSave() {
       temperature: num('m-temp', 0.8),
       max_tokens: int('m-max', 800),
       context_size: int('m-ctx', 20),
-      thinking_effort: $('m-think').value,
       web_search_enabled: $('m-search').checked,
     };
     if ($('m-key').value) body.api_key = $('m-key').value;

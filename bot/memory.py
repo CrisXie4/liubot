@@ -689,7 +689,6 @@ DEFAULT_MODEL_SETTINGS = {
     "model": "glm-5.2-free",
     "temperature": 0.8,
     "max_tokens": 800,
-    "thinking_effort": "adaptive",  # adaptive / disabled (MiniMax M3)
     # 1M 上下文：context_size 不再是硬切，按 token 截断。
     # 200 条保底 + 800K token 上限，足够覆盖整个群聊历史。
     "context_size": 200,
