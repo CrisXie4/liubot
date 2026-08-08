@@ -231,10 +231,11 @@ async def main():
 
     # ── 意识系统 + 定时任务 ──
     from bot.summary import generate_and_publish_summary
-    from bot import consciousness as cs
+    from bot import consciousness as cs, guardian
     from bot.ai_brain import (
         share_news_if_ready, sync_qq_status,
         maybe_proactive_action, daily_self_summary,
+        maybe_auto_essence, is_big_news,
     )
     _last_summary_date = None
     _last_reflection_hour = -1
@@ -303,13 +304,31 @@ async def main():
             try:
                 news = await share_news_if_ready(bot)
                 if news:
+                    big = is_big_news(
+                        news if isinstance(news, str)
+                        else " ".join(s.get("data", {}).get("text", "") for s in news if isinstance(s, dict))
+                    )
                     r = await bot._call("get_group_list", {})
                     groups = r.get("data", []) if r.get("status") == "ok" else []
                     for g in groups:
                         gid = g.get("group_id", 0)
-                        if gid:
-                            await bot.send_group_msg(gid, news)
-                            await asyncio.sleep(random.uniform(5, 8))
+                        if not gid:
+                            continue
+                        msg_to_send = news
+                        # 重大新闻：满足限速 + @全体额度 → 给该群加 [CQ:at,qq=all]
+                        if big and guardian.check_at_all_rate(gid):
+                            try:
+                                remain = await bot.get_group_at_all_remain(gid)
+                                can = bool(remain and remain.get("can_at_all"))
+                            except Exception:
+                                can = False
+                            if can:
+                                if isinstance(msg_to_send, str):
+                                    msg_to_send = "[CQ:at,qq=all] " + msg_to_send
+                                elif isinstance(msg_to_send, list):
+                                    msg_to_send = [{"type": "at", "data": {"qq": "all"}}] + msg_to_send
+                        await bot.send_group_msg(gid, msg_to_send)
+                        await asyncio.sleep(random.uniform(5, 8))
             except Exception as e:
                 logger.debug(f"新闻分享跳过: {e}")
 
@@ -327,7 +346,27 @@ async def main():
                                 # 使用群级 Bot 名称（优先群人设 > 全局人设 > .env）
                                 from bot.group_personality import get_group_bot_name
                                 bot_name = get_group_bot_name(gid)
-                                await generate_and_publish_summary(bot, gid, bot_name)
+                                summary_text = await generate_and_publish_summary(bot, gid, bot_name)
+                                # 总结同步上传群文件（.txt），方便群友回看
+                                if summary_text:
+                                    try:
+                                        import os as _os
+                                        import tempfile as _tf
+                                        date_tag = now.strftime("%Y%m%d")
+                                        fn = f"{date_tag}_总结.txt"
+                                        fd, tmp_path = _tf.mkstemp(suffix=".txt", prefix="qqbot_summary_")
+                                        try:
+                                            with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                                                f.write(summary_text)
+                                            await bot.upload_group_file(gid, tmp_path, fn)
+                                            logger.info(f"📤 群{gid} 总结已传群文件: {fn}")
+                                        finally:
+                                            try:
+                                                _os.remove(tmp_path)
+                                            except OSError:
+                                                pass
+                                    except Exception as e:
+                                        logger.debug(f"总结传群文件失败 群{gid}: {e}")
                                 await asyncio.sleep(random.uniform(3, 5))
                             except Exception as e:
                                 logger.warning(f"群{gid}自动总结失败: {e}")
@@ -357,6 +396,15 @@ async def main():
                         bot_mod.monitor_all_group_names(bot)
                     )
                     consciousness_loop._last_name_scan_date = today_str
+
+            # ── 9. 自主设精华（每 30 分钟：整点 / 半点）──
+            if now.minute in (0, 30):
+                try:
+                    n = await maybe_auto_essence(bot)
+                    if n:
+                        logger.info(f"⭐ 自主设了 {n} 条精华")
+                except Exception as e:
+                    logger.debug(f"自主设精华跳过: {e}")
 
             # ── 保存意识状态 ──
             if now.minute % 5 == 0:

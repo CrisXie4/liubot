@@ -360,12 +360,20 @@ async def extract_and_learn_from_message(user_qq: int, user_name: str,
 
 _last_proactive_time: dict[int, float] = {}
 
-def window_add_message(group_id: int, user_qq: int, user_name: str, message: str):
-    """向主动聊天观察窗口添加消息"""
+def window_add_message(group_id: int, user_qq: int, user_name: str, message: str,
+                       message_id: int = 0, ts: float = None):
+    """向主动聊天观察窗口添加消息。
+
+    message_id / ts 可选 —— 供自主设精华等被动扫描使用；
+    为向后兼容，老调用方不传时默认 0 / now。
+    """
+    import time as _t
     _group_message_window[group_id].append({
         "user_qq": user_qq,
         "user_name": user_name,
         "message": message,
+        "message_id": int(message_id) if message_id else 0,
+        "ts": ts if ts is not None else _t.time(),
     })
     if len(_group_message_window[group_id]) > PROACTIVE_WINDOW_SIZE:
         _group_message_window[group_id] = _group_message_window[group_id][-PROACTIVE_WINDOW_SIZE:]

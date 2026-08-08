@@ -21,6 +21,7 @@ from .config import config
 from . import consciousness as cs
 from . import memory
 from . import llm_call
+from . import guardian, influence
 
 logger = logging.getLogger("qqbot")
 
@@ -421,6 +422,95 @@ async def share_news_if_ready(bot):
     if seg:
         return [seg, {"type": "text", "data": {"text": f"\n📰 {text}"}}]
     return f"📰 {text}"
+
+
+# ── 重大新闻检测（@全体用）──
+_BIG_NEWS_KEYWORDS = (
+    "灾难", "突发", "重大", "地震", "事故", "疫情", "警告", "警报",
+    "海啸", "台风", "爆炸", "坍塌", "火灾", "恐袭", "战争",
+)
+
+
+def is_big_news(text: str) -> bool:
+    """判断一段新闻文本是否属于"重大"（值得 @全体）。"""
+    if not text:
+        return False
+    return any(kw in text for kw in _BIG_NEWS_KEYWORDS)
+
+
+async def maybe_auto_essence(bot) -> int:
+    """扫所有群，对近 N 分钟高影响力消息主动设精华。返回设精数目。
+
+    适配说明：brief 假设有 `influence.score(text)`，实际没有。
+    influence 体系是"按作者互动次数"打分（mention_bot/reply/total_score 等），
+    没有"按文本质量"打分。所以这里改成：在最近消息窗口里，
+    挑出**作者影响力最高**且**超过阈值**的消息设精华——
+    即"尊重/活跃成员发的话优先被设为精华"，而非"最好的文本被设为精华"。
+
+    阈值经实测数据校准（data/member_influence.json top15: 144..6018），
+    默认 50.0 大约能覆盖每群 top 30-50 活跃成员。
+    """
+    count = 0
+    try:
+        r = await bot._call("get_group_list", {})
+        groups = r.get("data", []) if r.get("status") == "ok" else []
+
+        # 阈值可由 ai_guard_config.json 调整
+        cfg = guardian.load_config().get("thresholds", {})
+        min_influence = cfg.get("essence_min_author_influence", 50.0)
+        lookback_secs = cfg.get("essence_lookback_seconds", 1800)
+
+        now_ts = time.time()
+        cutoff = now_ts - lookback_secs
+
+        for g in groups:
+            try:
+                gid = g.get("group_id", 0)
+                if not gid:
+                    continue
+                # 每群每天 N 次限速
+                if not guardian.check_essence_rate(gid):
+                    continue
+
+                recent = memory._group_message_window.get(gid, [])
+                if not recent:
+                    continue
+
+                # 取最近 50 条里时间窗内、有 message_id 的候选
+                candidates = [
+                    m for m in recent[-50:]
+                    if m.get("message_id")
+                    and m.get("ts", 0) > cutoff
+                    and m.get("user_qq")
+                ]
+                if not candidates:
+                    continue
+
+                # 按作者影响力排序，挑最高
+                best = max(
+                    candidates,
+                    key=lambda m: influence.get_influence(gid, m.get("user_qq", 0)),
+                )
+                author_score = influence.get_influence(gid, best.get("user_qq", 0))
+                if author_score < min_influence:
+                    continue
+
+                try:
+                    ok = await bot.set_essence_msg(best["message_id"])
+                    if ok:
+                        count += 1
+                        logger.info(
+                            f"⭐ 自主设精华 群{gid}: msg={best['message_id']} "
+                            f"作者={best.get('user_name')} 影响力={author_score:.1f}"
+                        )
+                        await asyncio.sleep(random.uniform(3, 6))
+                except Exception as e:
+                    logger.debug(f"自主设精华失败 群{gid}: {e}")
+            except Exception as e:
+                logger.debug(f"maybe_auto_essence 单群异常 群{g.get('group_id')}: {e}")
+    except Exception as e:
+        logger.debug(f"maybe_auto_essence 异常: {e}")
+    return count
 
 
 async def _push_personalized_news(bot, topic: str, news_text: str, image_url: str = ""):

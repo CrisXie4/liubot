@@ -1178,7 +1178,7 @@ async def handle_group_message(bot: OneBotClient, event: dict):
     if raw_message and len(raw_message) > 2:
         memory.remember_user(user_id, group_id, user_name, raw_message)
         memory.buffer_message(group_id, user_id, user_name, raw_message)
-        memory.window_add_message(group_id, user_id, user_name, raw_message)
+        memory.window_add_message(group_id, user_id, user_name, raw_message, message_id=message_id)
         asyncio.create_task(
             memory.extract_and_learn_from_message(user_id, user_name, group_id, raw_message)
         )
