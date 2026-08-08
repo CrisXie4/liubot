@@ -871,6 +871,9 @@ async def handle_group_message(bot: OneBotClient, event: dict):
     sender = event.get("sender", {})
     user_name = sender.get("card", "") or sender.get("nickname", "")
 
+    # 是否主人发言（透传给 chat_reply → execute_tool → guardian，决定重度动作是否跳异步裁判）
+    is_master = _is_owner(user_id)
+
     # ── 记流水账 ──
     # reply_policy 用它判断"这条消息是不是还在当前话头上"（决定要不要引用）
     # identity 用它维护"在场的人"名单（决定 AI 知道在跟谁说话、@ 谁用哪个号）
@@ -1225,19 +1228,6 @@ async def handle_group_message(bot: OneBotClient, event: dict):
         cmd_text = text
         cmd, arg = _parse_command(cmd_text)
 
-        # --- 违规处理 ---
-        if cmd in ("违规", "violation", "举报"):
-            target_msg_id = reply_msg_id
-            if target_msg_id:
-                await violation.handle_violation(bot, group_id, user_id, target_msg_id, note=arg)
-                trainer.train_if_ready()
-                return
-            else:
-                await bot.send_group_msg(group_id,
-                    "⚠️ 请**回复**要标记为违规的消息，然后 @我 说「违规」\n"
-                    "例如: 回复一条广告消息 + @bot 违规")
-                return
-
         # --- 统计报告 ---
         if cmd in ("统计", "报告", "report", "stats"):
             gid = int(arg) if arg.isdigit() else group_id
@@ -1457,17 +1447,6 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             return
 
         # --- 黑名单管理 ---
-        if cmd in ("拉黑", "blacklist"):
-            parts = arg.split(maxsplit=1)
-            if parts and parts[0].isdigit():
-                target_qq = int(parts[0])
-                reason = parts[1] if len(parts) > 1 else "手动拉黑"
-                blacklist.add_to_blacklist(target_qq, "", group_id, reason, "ban", user_id)
-                await bot.send_group_msg(group_id, f"🚫 QQ {target_qq} 已加入黑名单: {reason}")
-            else:
-                await bot.send_group_msg(group_id, "⚠️ 用法: 拉黑 <QQ号> [原因]")
-            return
-
         if cmd in ("取消拉黑", "unblacklist"):
             if arg.isdigit():
                 target_qq = int(arg)
@@ -1522,44 +1501,12 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             await bot.send_group_msg(group_id, "\n".join(lines))
             return
 
-        # --- 禁言/解禁 ---
-        if cmd in ("禁言", "mute"):
-            parts = arg.split()
-            if len(parts) >= 1 and parts[0].isdigit():
-                target = int(parts[0])
-                duration = int(parts[1]) * 60 if len(parts) > 1 and parts[1].isdigit() else 600
-                ok = await bot.set_group_ban(group_id, target, duration)
-                await bot.send_group_msg(group_id,
-                    f"{'✅' if ok else '❌'} {'禁言成功' if ok else '禁言失败'}" +
-                    (f" (时长: {duration}秒)" if ok else "，请确认机器人是群管理员"))
-            else:
-                await bot.send_group_msg(group_id, "⚠️ 用法: 禁言 <QQ号> [分钟数]")
-            return
-
+        # --- 解禁 ---
         if cmd in ("解禁", "unmute"):
             if arg.isdigit():
                 target = int(arg)
                 ok = await bot.set_group_ban(group_id, target, 0)
                 await bot.send_group_msg(group_id, f"{'✅' if ok else '❌'} 已解除禁言")
-            return
-
-        # --- 踢人 ---
-        if cmd in ("踢人", "kick", "踢"):
-            parts = arg.split(maxsplit=1)
-            if parts and parts[0].isdigit():
-                target = int(parts[0])
-                reason = parts[1] if len(parts) > 1 else "主人手动踢出"
-                try:
-                    await bot.set_group_kick(group_id, target)
-                    await bot.send_group_msg(group_id,
-                        f"👢 已踢出 {target}\n原因: {reason}")
-                    # 也加入黑名单
-                    blacklist.add_to_blacklist(target, "", group_id, reason, "ban", user_id)
-                except Exception as e:
-                    await bot.send_group_msg(group_id,
-                        f"❌ 踢人失败: {e}\n请确认Bot是管理员")
-            else:
-                await bot.send_group_msg(group_id, "⚠️ 用法: 踢人 <QQ号> [原因]")
             return
 
         # --- 开启/关闭自动审核 ---
@@ -1730,30 +1677,6 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             await bot.send_group_msg(group_id, "✅ 群公告已发布" if ok else "❌ 发布失败，请确认Bot是管理员")
             return
 
-        # --- 设为精华 ---
-        if cmd in ("精华", "essence"):
-            if reply_msg_id:
-                ok = await bot.set_essence_msg(reply_msg_id)
-                await bot.send_group_msg(group_id, "✅ 已设为精华消息" if ok else "❌ 设置失败")
-            else:
-                await bot.send_group_msg(group_id, "⚠️ 请回复一条消息 + @我 精华")
-            return
-
-        # --- 取消精华 ---
-        if cmd in ("取消精华", "unessence"):
-            if reply_msg_id:
-                ok = await bot.delete_essence_msg(reply_msg_id)
-                await bot.send_group_msg(group_id, "✅ 已取消精华" if ok else "❌ 取消失败")
-            else:
-                await bot.send_group_msg(group_id, "⚠️ 请回复一条消息 + @我 取消精华")
-            return
-
-        # --- 全员禁言 ---
-        if cmd in ("全员禁言", "shutup", "muteall"):
-            ok = await bot.set_group_whole_ban(group_id, True)
-            await bot.send_group_msg(group_id, "🔇 全员禁言已开启" if ok else "❌ 操作失败")
-            return
-
         if cmd in ("取消全员禁言", "unshutup", "unmuteall"):
             ok = await bot.set_group_whole_ban(group_id, False)
             await bot.send_group_msg(group_id, "🔊 全员禁言已解除" if ok else "❌ 操作失败")
@@ -1822,7 +1745,6 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             help_text = (
                 "🤖 **Xie 命令清单（主人专属）**\n\n"
                 "🚫 **违规管理:**\n"
-                "• 回复消息 + @Xie 违规 [备注] — 标记为违规\n"
                 "• @Xie 违规昵称 <QQ号> [是/违规] — 查/标违规昵称\n"
                 "• @Xie 违规昵称 处理 <QQ号> — 踢出+拉黑违规昵称用户\n"
                 "• @Xie 查昵称 — 扫描全群成员昵称\n"
@@ -1830,15 +1752,14 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                 "• @Xie 统计 — 违规统计报告\n"
                 "• @Xie 查询 <QQ号> — 查某人的违规记录\n"
                 "• @Xie 加词 <词1,词2> — 手动添加违禁关键词\n\n"
-                "🔇 **群管理:**\n"
-                "• @Xie 禁言 <QQ号> [分钟] · 解禁 <QQ号>\n"
-                "• @Xie 拉黑 <QQ号> [原因] · 取消拉黑 <QQ号>\n"
+                "🔇 **群管理（直接说话即可，AI 自动执行）:**\n"
+                "• 「把xxx禁言10分钟」「踢掉xxx」「拉黑xxx」— 自然语言指令\n"
+                "• 「回复xxx设精华」「全员禁言」— AI 会触发对应工具\n"
+                "• @Xie 解禁 <QQ号> · 取消拉黑 <QQ号>\n"
                 "• @Xie 黑名单 — 查看黑名单\n"
-                "• @Xie 全员禁言 · 取消全员禁言\n"
+                "• @Xie 取消全员禁言\n"
                 "• @Xie 设管理 <QQ号> · 头衔 <QQ号> <头衔>\n"
-                "• @Xie 公告 <标题>|<内容> — 发布群公告\n"
-                "• @Xie 精华 · 取消精华 — 回复消息操作\n"
-                "• @Xie 踢人 <QQ号> [原因] — 直接踢出群成员\n\n"
+                "• @Xie 公告 <标题>|<内容> — 发布群公告\n\n"
                 "⚖️ **模式切换:**\n"
                 "• @Xie 群友模式 · 管理模式 · 自动模式\n\n"
                 "🤖 **自动审核 & 学习:**\n"
@@ -2094,6 +2015,7 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             message_id=message_id,
             roster=roster,
             at_bot=at_bot,
+            master_instructed=is_master,
         )
         if reply:
             clean_text = await _execute_ai_actions(
@@ -2177,6 +2099,7 @@ async def _auto_reply(
             message_id=message_id,
             roster=roster,
             at_bot=False,  # 自主回复不是被 @
+            master_instructed=_is_owner(user_qq),
         )
         if reply:
             clean_text, actions = chat.parse_actions(reply)

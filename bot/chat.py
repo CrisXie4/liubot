@@ -320,6 +320,7 @@ async def chat_reply(
     quoted_context: dict = None, media_context: list[dict] = None,
     message_id: int = 0, roster: str = "",
     at_bot: bool = False,
+    master_instructed: bool = False,
 ) -> Optional[str]:
     """
     生成 AI 聊天回复。
@@ -334,6 +335,8 @@ async def chat_reply(
         message_id: 本条消息 ID
         roster: 在场人员名单（来自 identity.build_roster）——让 AI 知道在跟谁说话
         at_bot: 用户是否 @ 了机器人（影响重要性评分）
+        master_instructed: 本次回复是否由主人发言触发（透传给 execute_tool → guardian，
+            True 时重度动作跳过异步裁判直接执行）
 
     Returns:
         AI 回复文本（可能包含 [ACTION:...] 标记和 [CQ:...] 表情），
@@ -504,7 +507,7 @@ async def chat_reply(
                 result_text = await ai_tools.execute_tool(
                     _bot, group_id, user_qq, tool.name, tool_input, 0,
                     caller_qq=user_qq,
-                    master_instructed=(str(user_qq) == config.OWNER_QQ),
+                    master_instructed=master_instructed,
                 )
                 user_tool_results.append({
                     "type": "tool_result",
