@@ -142,6 +142,19 @@ def init_db():
             updated_at      TEXT    NOT NULL
         );
 
+        -- AI 破坏性动作审计（recall/ban/kick/mute/essence/at_all 等）
+        CREATE TABLE IF NOT EXISTS ai_audit (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts                TEXT    NOT NULL,                       -- %Y-%m-%d %H:%M:%S（系统时间，仅审计用）
+            group_id          INTEGER NOT NULL,
+            action            TEXT    NOT NULL,                      -- recall/ban/kick/mute/whole_ban/essence/at_all/...
+            target_qq         INTEGER,                               -- 目标 QQ（无目标时 NULL，如 whole_ban）
+            reason            TEXT,
+            judge_verdict     TEXT,                                  -- allow/deny/light/exempt/master_instructed
+            master_instructed INTEGER DEFAULT 0,                     -- 0/1
+            undone            INTEGER DEFAULT 0                      -- 0/1 是否已撤销
+        );
+
         -- 索引
         CREATE INDEX IF NOT EXISTS idx_violations_group     ON violations(group_id);
         CREATE INDEX IF NOT EXISTS idx_violations_violator  ON violations(violator_qq);
@@ -155,6 +168,8 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_conv_memories_imp    ON conversation_memories(importance);
         CREATE INDEX IF NOT EXISTS idx_knowledge_category   ON knowledge_facts(category);
         CREATE INDEX IF NOT EXISTS idx_training_label       ON training_data(label);
+        CREATE INDEX IF NOT EXISTS idx_ai_audit_target      ON ai_audit(target_qq);
+        CREATE INDEX IF NOT EXISTS idx_ai_audit_ts          ON ai_audit(ts);
     """)
     conn.commit()
     conn.close()
@@ -746,3 +761,58 @@ def training_data_get_unapplied(limit: int = 200) -> list[dict]:
         (limit,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ===================== AI Audit (破坏性动作审计) =====================
+
+def record_ai_audit(group_id: int, action: str, target_qq: int = None,
+                    reason: str = "", verdict: str = "",
+                    master_instructed: bool = False) -> int:
+    """记录一条 AI 破坏性动作审计，返回 audit id"""
+    conn = get_connection()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.execute(
+        """INSERT INTO ai_audit (ts, group_id, action, target_qq, reason,
+           judge_verdict, master_instructed) VALUES (?,?,?,?,?,?,?)""",
+        (ts, int(group_id), action,
+         int(target_qq) if target_qq else None,
+         reason[:500], verdict, 1 if master_instructed else 0))
+    conn.commit()
+    aid = cur.lastrowid
+    conn.close()
+    return aid
+
+
+def list_ai_audit(target_qq: int = None, action: str = None,
+                  group_id: int = None, limit: int = 50,
+                  only_undone: bool = False) -> list[dict]:
+    """查询审计记录，按 id 倒序（最新在前）。only_undone=True 只看未撤销的"""
+    conn = get_connection()
+    sql = "SELECT * FROM ai_audit WHERE 1=1"
+    args = []
+    if target_qq:
+        sql += " AND target_qq = ?"
+        args.append(int(target_qq))
+    if action:
+        sql += " AND action = ?"
+        args.append(action)
+    if group_id:
+        sql += " AND group_id = ?"
+        args.append(int(group_id))
+    if only_undone:
+        sql += " AND undone = 0"
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(int(limit))
+    rows = conn.execute(sql, args).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def mark_ai_audit_undone(audit_id: int) -> bool:
+    """标记某条审计已撤销（主人执行了解禁/撤精华后调）。返回是否有行被更新"""
+    conn = get_connection()
+    cur = conn.execute("UPDATE ai_audit SET undone = 1 WHERE id = ?", (int(audit_id),))
+    ok = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
