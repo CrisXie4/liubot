@@ -1,0 +1,101 @@
+/* ════════════════════════════════════════════════
+   sections.css — 各 section 特化样式 + stat-row 修复
+   ════════════════════════════════════════════════ */
+
+/* ─── stat-row: 横向 grid，与 .stats 同样的布局 ───
+   之前的 bug: .stat-row 没有定义 grid 样式，
+   直接套用了 .stat 的子元素样式，导致 4 个 div 竖着排。
+   这里修复为与 .stats 一致的 grid 布局。 */
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* ─── 仪表盘：快控卡片 ─── */
+.dash-quick {
+  display: flex; gap: 24px; flex-wrap: wrap; align-items: center;
+}
+.dash-quick .tog { font-size: 14px; }
+.dash-quick .tog .muted { font-size: 12px; margin-left: 4px; }
+
+/* ─── 仪表盘：最近违规表格容器 ─── */
+.recent-tbl-wrap { padding: 0; }
+
+/* ─── AI 状态：情绪 / 节律 网格 ─── */
+.cs-grid-2 {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+}
+@media (max-width: 768px) { .cs-grid-2 { grid-template-columns: 1fr; } }
+
+/* 日记条目 */
+.diary-item {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.diary-item:last-child { border-bottom: 0; }
+.diary-item .meta {
+  font-size: 11px; color: var(--fg3);
+}
+.diary-item .body {
+  margin-top: 3px; font-size: 13px;
+}
+
+/* ─── 登录页 ─── */
+.login-bg {
+  position: fixed; inset: 0; z-index: 999;
+  background: linear-gradient(135deg, #f5f3ee 0%, #e9e6df 100%);
+  display: flex; align-items: center; justify-content: center;
+}
+.login-card {
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 40px 36px;
+  width: 380px; max-width: 92vw;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, .05);
+}
+.login-card .brand-mark {
+  width: 44px; height: 44px;
+  border-radius: 11px;
+  margin-bottom: 20px; font-size: 19px;
+}
+.login-card h2 {
+  font-size: 21px; font-weight: 600;
+  margin-bottom: 4px; letter-spacing: -.3px;
+}
+.login-card .sub { color: var(--fg2); font-size: 13px; margin-bottom: 22px; }
+.login-card input {
+  text-align: center; font-size: 15px;
+  letter-spacing: 2px; padding: 11px;
+  margin-bottom: 12px;
+}
+.login-card .err {
+  color: var(--red); font-size: 12px;
+  min-height: 18px; margin-bottom: 8px;
+  text-align: center;
+}
+.login-card .btn {
+  width: 100%; padding: 11px;
+  justify-content: center; font-size: 14px;
+}
+.login-foot {
+  margin-top: 22px; font-size: 10.5px;
+  color: var(--fg3); text-align: center;
+  letter-spacing: .3px;
+}
+
+/* ─── 拟人化页：时间一致性代码块 ─── */
+.time-facts-pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+/* ─── 仪表盘：快控区 ─── */
+.quick-card {
+  border-left: 3px solid var(--accent);
+}

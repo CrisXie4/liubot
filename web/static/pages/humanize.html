@@ -1,0 +1,36 @@
+<!-- HUMANIZE -->
+<div class="card panel">
+  <div class="panel-h">引用 &amp; @ 的克制</div>
+  <div class="panel-b">
+    <p class="muted" style="font-size:13px;margin-bottom:14px">
+      真人聊天极少引用、也很少 @。对方刚说完话你直接回就行——<strong>引用只有"不引用就会认错对象"时才有用</strong>。
+      AI 加的多余引用/@ 会在发送前被剥掉。
+    </p>
+    <div class="fr">
+      <div class="fg"><label>隔多少条消息才值得引用</label><input type="number" id="hz-gap-msgs" min="1" max="30"></div>
+      <div class="fg"><label>隔多少秒才值得引用</label><input type="number" id="hz-gap-secs" min="10" max="3600"></div>
+      <div class="fg"><label>单条回复最多引用</label><input type="number" id="hz-max-quotes" min="0" max="3"></div>
+    </div>
+    <div class="fr"><label class="tog"><input type="checkbox" id="hz-at-absent"><span class="sw"></span>只 @ 不在对话里的人<span class="lab-off">关</span><span class="lab-on">开</span></label></div>
+    <button class="btn pri" onclick="hzSave()">保存</button>
+  </div>
+</div>
+<div class="card panel">
+  <div class="panel-h">深夜静默时段</div>
+  <div class="panel-b">
+    <p class="muted" style="font-size:13px;margin-bottom:14px">这段时间内 Bot <strong>不会主动冒泡</strong>。被 @ 了仍然会回。</p>
+    <div class="fr">
+      <label class="tog"><input type="checkbox" id="hz-quiet-on"><span class="sw"></span>启用<span class="lab-off">关</span><span class="lab-on">开</span></label>
+      <div class="fg" style="max-width:120px"><label>开始（整点）</label><input type="number" id="hz-quiet-start" min="0" max="23"></div>
+      <div class="fg" style="max-width:120px"><label>结束（整点）</label><input type="number" id="hz-quiet-end" min="0" max="23"></div>
+    </div>
+    <button class="btn pri" onclick="hzSave()">保存</button>
+  </div>
+</div>
+<div class="card panel">
+  <div class="panel-h">时间一致性 · 当前注入</div>
+  <div class="panel-b">
+    <p class="muted" style="font-size:13px;margin-bottom:10px">每次生成群消息都会把下面的事实一起喂给模型。</p>
+    <pre class="code time-facts-pre" id="hz-time-facts">加载中…</pre>
+  </div>
+</div>

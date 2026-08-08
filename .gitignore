@@ -1,0 +1,26 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime state & secrets (user requested data excluded)
+data/
+.env
+bot.log
+
+# Third-party framework (not our code, plan never touches it)
+NapCatQQ-main/
+
+# Training datasets (data, not source)
+model/
+
+# Superpowers SDD workspace
+.superpowers/
+
+# Node (NapCatQQ is a sibling, not our concern)
+node_modules/
+
+# OS / IDE
+Thumbs.db
+.vscode/
+.idea/

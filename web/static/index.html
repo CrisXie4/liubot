@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Xie · 控制台</title>
+
+<!-- 第三方库 -->
+<script src="/chart.min.js"></script>
+
+<!-- 拆分后的 CSS -->
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<link rel="stylesheet" href="/static/css/components.css">
+<link rel="stylesheet" href="/static/css/sections.css">
+</head>
+<body>
+
+<!-- 登录页 -->
+<div class="login-bg" id="login">
+  <div class="login-card">
+    <div class="brand-mark">X</div>
+    <h2>Xie Console</h2>
+    <p class="sub">机器人管理面板</p>
+    <div class="err" id="login-err"></div>
+    <input type="password" id="login-pw" placeholder="管理密码" autofocus
+           onkeydown="if(event.key==='Enter')doLogin()">
+    <button class="btn pri" onclick="doLogin()" style="width:100%;justify-content:center;padding:11px">
+      解锁
+    </button>
+    <div class="login-foot">JWT 鉴权 · 数据本地传输</div>
+  </div>
+</div>
+
+<!-- 主应用 -->
+<div class="shell" id="app" style="display:none">
+
+  <!-- 侧边栏 -->
+  <aside class="sidebar" id="sb">
+    <div class="brand">
+      <div class="brand-mark">X</div>
+      <div>
+        <div class="brand-name">Xie</div>
+        <div class="brand-sub">QQ 机器人控制台</div>
+      </div>
+    </div>
+    <nav class="nav" id="nav">
+      <div class="nav-sec">总览</div>
+      <a data-tab="dash"><span class="ico">📊</span>仪表盘</a>
+      <a data-tab="humanize"><span class="ico">💬</span>拟人化</a>
+      <a data-tab="brain"><span class="ico">🧠</span>AI 状态</a>
+
+      <div class="nav-sec">群管理</div>
+      <a data-tab="groups"><span class="ico">👥</span>群成员</a>
+      <a data-tab="modes"><span class="ico">⚖️</span>群模式</a>
+      <a data-tab="welcome"><span class="ico">👋</span>欢迎</a>
+      <a data-tab="schedules"><span class="ico">⏰</span>定时</a>
+
+      <div class="nav-sec">安全</div>
+      <a data-tab="violations"><span class="ico">🚫</span>违规记录</a>
+      <a data-tab="blacklist"><span class="ico">⛔</span>黑名单</a>
+      <a data-tab="automod"><span class="ico">🤖</span>自动审核</a>
+      <a data-tab="llm"><span class="ico">🛡️</span>LLM 审核</a>
+      <a data-tab="approval"><span class="ico">📋</span>待审批</a>
+      <a data-tab="verify"><span class="ico">🔑</span>加群验证</a>
+
+      <div class="nav-sec">AI</div>
+      <a data-tab="personality"><span class="ico">🎭</span>人设</a>
+      <a data-tab="group-personality"><span class="ico">👤</span>群人设</a>
+      <a data-tab="model"><span class="ico">⚙️</span>模型</a>
+      <a data-tab="memory"><span class="ico">💭</span>记忆</a>
+      <a data-tab="stickers"><span class="ico">🎨</span>表情</a>
+      <a data-tab="influence"><span class="ico">🌟</span>影响力</a>
+
+      <div class="nav-sec">训练</div>
+      <a data-tab="keywords"><span class="ico">🔑</span>关键词</a>
+      <a data-tab="training"><span class="ico">🧪</span>训练</a>
+      <a data-tab="learn"><span class="ico">📖</span>学习</a>
+
+      <div class="nav-sec">工具</div>
+      <a data-tab="send"><span class="ico">📨</span>发消息</a>
+      <a data-tab="checkin"><span class="ico">📅</span>签到榜</a>
+      <a data-tab="points"><span class="ico">💰</span>积分榜</a>
+      <a data-tab="bot-settings"><span class="ico">🔧</span>设置</a>
+
+      <div class="nav-sec">系统</div>
+      <a data-tab="env"><span class="ico">📝</span>环境</a>
+      <a data-tab="logs"><span class="ico">📋</span>日志</a>
+    </nav>
+    <div class="side-foot">
+      <span class="dot" id="bot-dot"></span>
+      <span id="bot-state">连接中</span>
+      <button class="btn ghost xs" onclick="doLogout()" style="margin-left:auto">退出</button>
+    </div>
+  </aside>
+  <div class="mob-mask" id="mob-mask" onclick="closeMob()"></div>
+
+  <!-- 主区 -->
+  <main class="main">
+    <div class="topbar">
+      <div style="display:flex;align-items:center;gap:10px">
+        <button class="menu-btn" onclick="toggleMob()">☰</button>
+        <h1 id="page-title">仪表盘</h1>
+      </div>
+      <div class="topbar-r">
+        <span class="dot" id="bot-dot2" style="margin-right:8px"></span>
+        <span class="muted" id="bot-state2" style="font-size:12.5px">连接中</span>
+      </div>
+    </div>
+
+    <div class="content">
+      <!-- section 容器，由 nav.js 动态加载 HTML 片段 -->
+      <div id="content-body"></div>
+    </div>
+  </main>
+</div>
+
+<!-- Toast 容器 -->
+<div class="toasts" id="toasts"></div>
+
+<!-- 弹窗容器（启动后由 JS 动态插入 modals.html） -->
+<div id="modals-container"></div>
+
+<!-- 拆分后的 JS —— 加载顺序很重要 -->
+<script src="/static/js/core.js"></script>
+<script src="/static/js/api.js"></script>
+<script src="/static/js/ws.js"></script>
+<script src="/static/js/nav.js"></script>
+
+<!-- 各 section 的 load/save 函数 -->
+<script src="/static/js/dash.js"></script>
+<script src="/static/js/humanize.js"></script>
+<script src="/static/js/brain.js"></script>
+<script src="/static/js/groups.js"></script>
+<script src="/static/js/modes.js"></script>
+<script src="/static/js/welcome.js"></script>
+<script src="/static/js/schedules.js"></script>
+<script src="/static/js/violations.js"></script>
+<script src="/static/js/blacklist.js"></script>
+<script src="/static/js/automod.js"></script>
+<script src="/static/js/llm.js"></script>
+<script src="/static/js/approval.js"></script>
+<script src="/static/js/verify.js"></script>
+<script src="/static/js/personality.js"></script>
+<script src="/static/js/group-personality.js"></script>
+<script src="/static/js/model.js"></script>
+<script src="/static/js/memory.js"></script>
+<script src="/static/js/stickers.js"></script>
+<script src="/static/js/remaining.js"></script>
+
+<!-- 启动 -->
+<script>
+  /* 加载 modals */
+  fetch('/static/modals.html').then(r => r.text()).then(html => {
+    document.getElementById('modals-container').innerHTML = html;
+    /* 给黑名单弹窗注入群选择器——只在已登录时执行，否则 /api/groups 会 401
+       触发 location.reload()，形成「未登录 → modals fetch → loadGroups → 401 → reload → 死循环」 */
+    if (TOKEN && typeof loadGroups === 'function') {
+      loadGroups().then(fillGroupSelects);
+    }
+  });
+
+  async function boot() {
+    if (!TOKEN) {
+      $('login').style.display = 'flex';
+      $('app').style.display = 'none';
+      $('login-pw').focus();
+      return;
+    }
+    try {
+      await api('/auth/status');
+      $('login').style.display = 'none';
+      $('app').style.display = 'flex';
+    } catch {
+      setToken('');
+      $('login').style.display = 'flex';
+      $('app').style.display = 'none';
+      $('login-pw').focus();
+      return;
+    }
+    const gs = await loadGroups();
+    fillGroupSelects(gs);
+    navTo('dash');
+    pollStatus();
+    window._pollTimer = setInterval(pollStatus, 30000);
+    connectWS();
+  }
+  boot();
+</script>
+
+</body>
+</html>

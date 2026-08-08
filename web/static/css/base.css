@@ -1,0 +1,88 @@
+/* ════════════════════════════════════════════════
+   base.css — 重置 / 变量 / 字体 / 通用基础
+   ════════════════════════════════════════════════ */
+
+:root {
+  --bg: #fafaf9;
+  --bg2: #ffffff;
+  --bg3: #f4f4f3;
+  --bg4: #ebebe9;
+  --fg: #1c1d22;
+  --fg2: #5b5d68;
+  --fg3: #8d8f99;
+  --line: #e7e7e5;
+  --line2: #d6d6d2;
+
+  --accent: #2f6f57;
+  --accent2: #3d8a6e;
+  --accent3: #5fa286;
+  --accent-soft: #eaf3ee;
+
+  --red: #c2363d;
+  --red-soft: #fbeaeb;
+  --orange: #c97a18;
+  --orange-soft: #fbf0e0;
+  --green: #2f8f5d;
+  --green-soft: #e6f3ec;
+  --blue: #2f5fa8;
+  --blue-soft: #e9eef8;
+
+  --r: 10px;
+  --r-sm: 8px;
+  --r-xs: 6px;
+  --shadow-xs: 0 1px 0 rgba(20, 20, 30, .04);
+  --shadow-sm: 0 1px 3px rgba(20, 20, 30, .05), 0 1px 2px rgba(20, 20, 30, .04);
+  --shadow: 0 4px 12px rgba(20, 20, 30, .06), 0 1px 3px rgba(20, 20, 30, .04);
+
+  --font: -apple-system, BlinkMacSystemFont, 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --mono: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+
+  --sb-w: 240px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 3px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+html, body { height: 100%; }
+
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  -webkit-tap-highlight-color: transparent;
+  display: flex;
+  min-height: 100vh;
+}
+
+a { color: inherit; text-decoration: none; }
+button { font-family: inherit; }
+
+/* 通用工具类 */
+.muted { color: var(--fg3); }
+.mono { font-family: var(--mono); font-size: 12px; }
+.cut {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+/* 通用动画 */
+@keyframes fade {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(10px); }
+  to   { opacity: 1; transform: none; }
+}

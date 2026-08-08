@@ -1,0 +1,12 @@
+<!-- WELCOME -->
+<div class="card panel">
+  <div class="panel-b">
+    <div class="fr">
+      <div class="fg"><label>目标群</label><select id="wc-gid" class="grp-sel"></select></div>
+      <label class="tog"><input type="checkbox" id="wc-on"><span class="sw"></span>启用<span class="lab-off">关</span><span class="lab-on">开</span></label>
+    </div>
+    <div class="fg"><label>欢迎消息</label><textarea id="wc-msg" rows="3" placeholder="支持变量：{nickname} {qq} {at} {group_id}"></textarea></div>
+    <div class="muted" style="font-size:11.5px;margin-bottom:10px">{at} 会展开为 @群名片</div>
+    <button class="btn pri" onclick="wcSave()">保存</button>
+  </div>
+</div>

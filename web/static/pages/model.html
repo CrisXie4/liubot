@@ -1,0 +1,24 @@
+<!-- MODEL -->
+<div class="card panel">
+  <div class="panel-b">
+    <div class="fr">
+      <div class="fg"><label>API 端点</label><input id="m-url"></div>
+      <div class="fg"><label>API Key</label><input type="password" id="m-key" placeholder="留空保留原值"></div>
+    </div>
+    <div class="fr">
+      <div class="fg"><label>模型</label><input id="m-model"></div>
+      <div class="fg" style="max-width:120px"><label>Temperature</label><input type="number" id="m-temp" step="0.1" min="0" max="2"></div>
+      <div class="fg" style="max-width:140px"><label>Max Tokens</label><input type="number" id="m-max" step="50"></div>
+      <div class="fg" style="max-width:140px"><label>上下文条数</label><input type="number" id="m-ctx"></div>
+    </div>
+    <div class="fr">
+      <div class="fg" style="max-width:200px"><label>思考强度</label>
+        <select id="m-think"><option value="disabled">关闭</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select>
+      </div>
+      <div class="fg" style="max-width:200px"><label>联网搜索</label>
+        <label class="tog"><input type="checkbox" id="m-search"><span class="sw"></span>联网搜索<span class="lab-off">关</span><span class="lab-on">开</span></label>
+      </div>
+    </div>
+    <button class="btn pri" onclick="mSave()">保存</button>
+  </div>
+</div>

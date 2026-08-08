@@ -1,0 +1,19 @@
+<!-- AUTOMOD -->
+<div class="stats" id="am-stats"></div>
+<div class="card panel">
+  <div class="panel-h">消息评分测试</div>
+  <div class="panel-b">
+    <div class="fr">
+      <div class="fg"><input id="am-test" placeholder="输入测试消息"></div>
+      <button class="btn pri" onclick="amTest()">评分</button>
+    </div>
+    <pre class="code" id="am-res" style="display:none"></pre>
+  </div>
+</div>
+<div class="card panel">
+  <div class="panel-h">审核日志</div>
+  <div class="panel-b np"><div class="tw"><table class="tbl" id="am-log-tbl">
+    <thead><tr><th>时间</th><th>消息</th><th class="num">置信</th><th>命中</th><th>动作</th></tr></thead>
+    <tbody></tbody>
+  </table></div></div>
+</div>

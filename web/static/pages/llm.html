@@ -1,0 +1,19 @@
+<!-- LLM MOD -->
+<div class="stats" id="llm-stats"></div>
+<div class="card panel">
+  <div class="panel-h">LLM 审核测试</div>
+  <div class="panel-b">
+    <div class="fr">
+      <div class="fg"><input id="llm-test" placeholder="输入测试消息"></div>
+      <button class="btn pri" onclick="llmTest()">审核</button>
+    </div>
+    <pre class="code" id="llm-res" style="display:none"></pre>
+  </div>
+</div>
+<div class="card panel">
+  <div class="panel-h">审核日志</div>
+  <div class="panel-b np"><div class="tw"><table class="tbl" id="llm-log-tbl">
+    <thead><tr><th>时间</th><th>消息</th><th class="num">KW</th><th>LLM</th><th class="num">LLM 置信</th><th>结果</th><th class="num">耗时</th></tr></thead>
+    <tbody></tbody>
+  </table></div></div>
+</div>

@@ -1,0 +1,43 @@
+<!-- BOT SETTINGS -->
+<div class="card panel">
+  <div class="panel-h">基础</div>
+  <div class="panel-b">
+    <div class="fr">
+      <div class="fg"><label>Bot 名称</label><input id="bs-name"></div>
+      <div class="fg" style="max-width:140px"><label>上下文条数</label><input type="number" id="bs-ctx" min="2" max="50"></div>
+    </div>
+    <div class="fr">
+      <label class="tog"><input type="checkbox" id="bs-invite"><span class="sw"></span>自动同意邀请<span class="lab-off">关</span><span class="lab-on">开</span></label>
+      <label class="tog"><input type="checkbox" id="bs-automod"><span class="sw"></span>自动审核<span class="lab-off">关</span><span class="lab-on">开</span></label>
+    </div>
+    <div class="fr">
+      <div class="fg"><label>Bot QQ</label><input id="bs-bot-qq" readonly></div>
+      <div class="fg"><label>Owner QQ</label><input id="bs-owner-qq" readonly></div>
+    </div>
+  </div>
+</div>
+<div class="card panel">
+  <div class="panel-h">主人通知</div>
+  <div class="panel-b">
+    <div class="fr">
+      <label class="tog"><input type="checkbox" id="bs-n-viol"><span class="sw"></span>违规<span class="lab-off">关</span><span class="lab-on">开</span></label>
+      <label class="tog"><input type="checkbox" id="bs-n-high"><span class="sw"></span>高风险<span class="lab-off">关</span><span class="lab-on">开</span></label>
+      <label class="tog"><input type="checkbox" id="bs-n-kick"><span class="sw"></span>踢人审批<span class="lab-off">关</span><span class="lab-on">开</span></label>
+      <label class="tog"><input type="checkbox" id="bs-n-err"><span class="sw"></span>异常<span class="lab-off">关</span><span class="lab-on">开</span></label>
+    </div>
+  </div>
+</div>
+<div class="card panel">
+  <div class="panel-h">自动操作</div>
+  <div class="panel-b">
+    <div class="fr">
+      <div class="fg" style="max-width:160px"><label>低风险禁言 (s)</label><input type="number" id="bs-m-low"></div>
+      <div class="fg" style="max-width:160px"><label>高风险禁言 (s)</label><input type="number" id="bs-m-high"></div>
+      <label class="tog"><input type="checkbox" id="bs-a-mute"><span class="sw"></span>自动禁言<span class="lab-off">关</span><span class="lab-on">开</span></label>
+      <label class="tog"><input type="checkbox" id="bs-a-recall"><span class="sw"></span>自动撤回<span class="lab-off">关</span><span class="lab-on">开</span></label>
+    </div>
+  </div>
+</div>
+<div class="card panel"><div class="panel-b">
+  <button class="btn pri" onclick="bsSave()">保存所有设置</button>
+</div></div>
