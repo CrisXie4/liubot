@@ -31,7 +31,7 @@ import time
 import uvicorn
 
 import bot as bot_mod
-from bot import OneBotClient, config, db, handle_group_message, handle_notice, automod, trainer, scheduler, security
+from bot import OneBotClient, config, db, handle_group_message, handle_notice, automod, trainer, scheduler, security, timeutil
 config._load_group_modes()
 from web.server import app as web_app
 
@@ -253,7 +253,7 @@ async def main():
 
         while True:
             await asyncio.sleep(60)
-            now = __import__("datetime").datetime.now()
+            now = timeutil.now_shanghai()
             today = now.strftime("%Y%m%d")
             current_hour = now.hour
 
@@ -352,8 +352,7 @@ async def main():
             today_str = now.strftime('%Y-%m-%d')
             # 每2天（偶数日）凌晨3:00执行一次
             if now.hour == 3 and now.minute == 0 and _last_name_scan_date != today_str:
-                from datetime import date as _date
-                if _date.today().day % 2 == 0:
+                if timeutil.today_shanghai().day % 2 == 0:
                     asyncio.create_task(
                         bot_mod.monitor_all_group_names(bot)
                     )

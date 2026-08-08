@@ -18,6 +18,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
+from . import timeutil
 from .config import config
 
 logger = logging.getLogger("qqbot.consciousness")
@@ -131,8 +132,9 @@ def save_state(state: dict):
 
 def get_circadian_modifiers() -> dict:
     """根据当前时间返回对各情绪的修正值"""
-    hour = datetime.now().hour
-    weekday = datetime.now().weekday()  # 0=周一
+    now = timeutil.now_shanghai()
+    hour = now.hour
+    weekday = now.weekday()  # 0=周一
 
     mods = {}
 
@@ -179,7 +181,7 @@ def get_circadian_modifiers() -> dict:
 
 def get_time_of_day_name() -> str:
     """获取时段名称"""
-    h = datetime.now().hour
+    h = timeutil.now_shanghai().hour
     if 0 <= h < 6: return "深夜"
     if 6 <= h < 8: return "清晨"
     if 8 <= h < 11: return "上午"
@@ -192,7 +194,7 @@ def get_time_of_day_name() -> str:
 
 def get_circadian_prompt() -> str:
     """获取时段提示词（注入到系统提示词）"""
-    h = datetime.now().hour
+    h = timeutil.now_shanghai().hour
     prompts = {
         (0, 6): "现在是深夜，你可能有点困了，回消息随意一点就好",
         (6, 8): "现在是清晨，你刚起床不久，还有点迷糊，话比较少",
@@ -242,7 +244,7 @@ def get_time_facts_prompt() -> str:
 
     只讲事实和红线，不讲情绪——情绪部分由 get_consciousness_prompt 负责。
     """
-    now = datetime.now()
+    now = timeutil.now_shanghai()
     hour = now.hour
     tod = get_time_of_day_name()
     weekday = _WEEKDAY_CN[now.weekday()]
@@ -294,7 +296,7 @@ def is_quiet_hours() -> bool:
     enabled, start, end = _quiet_cfg()
     if not enabled or start == end:
         return False
-    h = datetime.now().hour
+    h = timeutil.now_shanghai().hour
     if start <= end:
         return start <= h < end
     return h >= start or h < end
@@ -972,7 +974,7 @@ async def self_reflection(state: dict) -> Optional[str]:
 
 def check_daily_reset(state: dict):
     """跨天重置每日统计"""
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = timeutil.now_shanghai().strftime("%Y-%m-%d")
     if state["today"].get("date") != today_str:
         # 在重置前，先写一条昨天的总结日记
         yesterday = state["today"]

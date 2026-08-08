@@ -6,7 +6,7 @@
 import logging
 from datetime import datetime
 
-from . import db, memory
+from . import db, memory, timeutil
 from .config import config
 
 logger = logging.getLogger("qqbot")
@@ -27,7 +27,7 @@ async def generate_and_publish_summary(bot, group_id: int, bot_name: str = ""):
 
 async def generate_group_summary(group_id: int, bot_name: str = "") -> str:
     """生成群聊总结，返回格式化文本"""
-    now = datetime.now()
+    now = timeutil.now_shanghai()
     date_str = now.strftime("%Y年%m月%d日")
 
     # ── 收集数据 ──

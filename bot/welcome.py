@@ -11,6 +11,8 @@ import os
 import random
 from datetime import datetime, date
 
+from . import timeutil
+
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 logger = logging.getLogger("qqbot")
@@ -110,7 +112,7 @@ def save_checkin(data: dict):
 def do_checkin(user_qq: int, group_id: int, user_name: str) -> dict:
     """执行签到，返回签到结果"""
     data = load_checkin()
-    today = date.today().isoformat()
+    today = timeutil.today_shanghai().isoformat()
     key = f"{group_id}:{user_qq}"
 
     if key not in data:
@@ -124,7 +126,7 @@ def do_checkin(user_qq: int, group_id: int, user_name: str) -> dict:
         return {"ok": False, "message": "今天已经签到过了哦~", "streak": record["streak"], "total": record["total"]}
 
     # 检查连续签到
-    yesterday = date.today()
+    yesterday = timeutil.today_shanghai()
     from datetime import timedelta
     yesterday = (yesterday - timedelta(days=1)).isoformat()
 
@@ -168,7 +170,7 @@ def get_checkin_status(user_qq: int, group_id: int) -> dict:
     """获取签到状态"""
     data = load_checkin()
     key = f"{group_id}:{user_qq}"
-    today = date.today().isoformat()
+    today = timeutil.today_shanghai().isoformat()
 
     if key not in data:
         return {"checked_today": False, "streak": 0, "total": 0}

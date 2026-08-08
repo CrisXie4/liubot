@@ -250,5 +250,5 @@ def get_system_prompt() -> str:
 
 def get_time_context() -> str:
     """获取当前时间上下文（动态信息，通过用户消息注入以保持系统提示词可缓存）"""
-    from datetime import datetime
-    return datetime.now().strftime("%Y年%m月%d日 %H:%M")
+    from . import timeutil
+    return timeutil.now_shanghai().strftime("%Y年%m月%d日 %H:%M")

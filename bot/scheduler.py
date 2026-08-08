@@ -9,6 +9,8 @@ import time
 from datetime import datetime
 from typing import Optional
 
+from . import timeutil
+
 logger = logging.getLogger("qqbot")
 
 SCHEDULE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "schedule.json")
@@ -86,7 +88,7 @@ class Scheduler:
                     await asyncio.sleep(secs)
                 else:
                     # 每天定点
-                    now = datetime.now()
+                    now = timeutil.now_shanghai()
                     parts = cron.split(":")
                     target_h, target_m = int(parts[0]), int(parts[1])
                     target = now.replace(hour=target_h, minute=target_m, second=0, microsecond=0)

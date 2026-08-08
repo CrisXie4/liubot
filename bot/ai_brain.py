@@ -16,6 +16,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
+from . import timeutil
 from .config import config
 from . import consciousness as cs
 from . import memory
@@ -89,7 +90,7 @@ async def sync_qq_status(bot):
     """同步 QQ 在线状态 —— 用个性化在线状态让心情可见"""
     state = cs.get_state()
     mood = cs.get_dominant_mood(state)
-    hour = datetime.now().hour
+    hour = timeutil.now_shanghai().hour
 
     if state.get("sleeping"):
         # 深夜/睡觉：白天累了显示"熬夜中"，睡觉时段显示"睡觉中"
@@ -527,7 +528,7 @@ async def maybe_proactive_action(bot):
             if not ms.get("api_key"):
                 return None
 
-            hour = datetime.now().hour
+            hour = timeutil.now_shanghai().hour
             mood = cs.get_dominant_mood(state)
             e = state["emotions"]
 
@@ -550,7 +551,7 @@ async def maybe_proactive_action(bot):
                 temperature=1.0,
                 system=prompt,
                 messages=[{"role": "user", "content": (
-                    f"现在是{hour}点，{'周末' if datetime.now().weekday() >= 5 else '工作日'}，"
+                    f"现在是{hour}点，{'周末' if timeutil.now_shanghai().weekday() >= 5 else '工作日'}，"
                     "随口发一条，内容要跟这个时间对得上"
                 )}],
             )
