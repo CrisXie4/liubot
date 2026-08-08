@@ -502,7 +502,9 @@ async def chat_reply(
                 import bot as _bot_mod
                 _bot = getattr(_bot_mod, 'bot_instance', None)
                 result_text = await ai_tools.execute_tool(
-                    _bot, group_id, user_qq, tool.name, tool_input, 0
+                    _bot, group_id, user_qq, tool.name, tool_input, 0,
+                    caller_qq=user_qq,
+                    master_instructed=(str(user_qq) == config.OWNER_QQ),
                 )
                 user_tool_results.append({
                     "type": "tool_result",

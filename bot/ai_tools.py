@@ -37,6 +37,8 @@ _ADMIN_ONLY_TOOLS = {
     "recall_msg", "ban_member", "kick_member", "whole_ban",
     "set_admin", "at_all", "send_notice", "send_essence",
     "change_group_name", "delete_file",
+    "upload_group_file", "create_group_folder",
+    "set_member_card", "set_member_title",
 }
 
 def get_tools_for_group(bot_is_admin: bool, web_search_enabled: bool = True) -> list[dict]:
@@ -105,7 +107,7 @@ ALL_TOOLS = [
     # ── 消息操作类 ──
     {
         "name": "recall_msg",
-        "description": "撤回自己发的消息。当自己说错话、发错消息时主动撤回。",
+        "description": "撤回一条群消息（自己的或他人的）。撤回他人消息会进轻量护栏。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -377,6 +379,32 @@ ALL_TOOLS = [
             "required": ["enable"],
         },
     },
+    {
+        "name": "set_member_card",
+        "description": "修改某群成员的群昵称（群名片）。仅当机器人是群主/管理员时可用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "integer"},
+                "user_id": {"type": "integer", "description": "目标 QQ"},
+                "card": {"type": "string", "description": "新昵称"},
+            },
+            "required": ["user_id", "card"],
+        },
+    },
+    {
+        "name": "set_member_title",
+        "description": "设置某群成员的头衔。仅当机器人是群主时可用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "integer"},
+                "user_id": {"type": "integer"},
+                "title": {"type": "string", "description": "新头衔"},
+            },
+            "required": ["user_id", "title"],
+        },
+    },
 
     # ── 群娱乐类 ──
     {
@@ -452,6 +480,33 @@ ALL_TOOLS = [
                 "reason": {"type": "string", "description": "删除理由"},
             },
             "required": ["file_id", "reason"],
+        },
+    },
+    {
+        "name": "upload_group_file",
+        "description": "把指定文本内容作为 .txt 文件上传到群文件。用于分享总结/笔记/精华合集。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "integer", "description": "群号"},
+                "filename": {"type": "string", "description": "文件名（含扩展名，如 总结.txt）"},
+                "content": {"type": "string", "description": "文件正文"},
+                "folder_id": {"type": "string", "description": "目标文件夹 ID（可选，默认根目录）"},
+            },
+            "required": ["filename", "content"],
+        },
+    },
+    {
+        "name": "create_group_folder",
+        "description": "在群文件系统建一个文件夹。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "integer"},
+                "name": {"type": "string", "description": "文件夹名"},
+                "parent_id": {"type": "string", "description": "父文件夹 ID（默认根目录）"},
+            },
+            "required": ["name"],
         },
     },
 
@@ -622,6 +677,18 @@ ALL_TOOLS = [
         "description": "获取群中被忽略的加群请求列表。",
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "undo_recent_action",
+        "description": "撤销机器人最近对某成员执行的破坏性动作（解禁等）。主人说\"撤销对xxx的禁言\"时用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target_qq": {"type": "integer", "description": "目标 QQ"},
+                "group_id": {"type": "integer"},
+            },
+            "required": ["target_qq"],
+        },
+    },
 ]
 
 
@@ -629,10 +696,41 @@ ALL_TOOLS = [
 #  工具执行器
 # ═══════════════════════════════════════════════════════════
 
+async def _gated(group_id, action, tool_input, caller_qq,
+                 master_instructed, bot, member_info=None, mute_seconds=0):
+    """对破坏性动作过 guardian 闸门。
+
+    返回 None = 放行（调用方继续执行真实动作）；
+    返回 str = 拒绝原因（调用方应直接 return 该字符串给 AI）。
+    """
+    from . import guardian
+    target = tool_input.get("user_id") or tool_input.get("target_id")
+    target_name = tool_input.get("user_name", "")
+    r = await guardian.request(
+        group_id=group_id, action=action,
+        target_qq=target, target_name=target_name,
+        reason=tool_input.get("reason", ""),
+        caller_qq=caller_qq,
+        master_instructed=master_instructed,
+        member_info=member_info,
+        mute_seconds=mute_seconds,
+    )
+    if not r["allow"]:
+        return f"⨯ 闸门拒绝: {r.get('reason','')} ({r.get('verdict','')})"
+    return None
+
+
 async def execute_tool(
-    bot, group_id: int, user_id: int, tool_name: str, tool_input: dict, message_id: int = 0
+    bot, group_id: int, user_id: int, tool_name: str, tool_input: dict, message_id: int = 0,
+    caller_qq: int = None, master_instructed: bool = False,
 ) -> str:
-    """执行 AI 调用的工具，返回结果文本。危险操作会返回「需要用户批准」标记。"""
+    """执行 AI 调用的工具，返回结果文本。危险操作会返回「需要用户批准」标记。
+
+    caller_qq: 触发本次工具调用的发言者 QQ（用于闸门裁判）；为 None 时回退到 user_id。
+    master_instructed: 本次调用是否由主人的自然语言指令触发（True 时重度动作跳异步裁判）。
+    """
+    if caller_qq is None:
+        caller_qq = user_id
 
     try:
         # ── 信息查询 ──
@@ -692,6 +790,23 @@ async def execute_tool(
         # ── 消息操作 ──
         elif tool_name == "recall_msg":
             mid = int(tool_input.get("message_id", 0))
+            # 判断是否撤回自己发的消息：自己发的不过闸门
+            is_self = False
+            try:
+                from .config import config
+                bot_qq = int(config.BOT_QQ or 0)
+                if bot_qq:
+                    msg_info = await bot.get_msg(mid)
+                    sender = (msg_info or {}).get("sender", {}) if isinstance(msg_info, dict) else {}
+                    is_self = (sender.get("user_id") == bot_qq)
+            except Exception:
+                pass
+            if not is_self:
+                # 撤回他人消息 → 过 light 闸门
+                gate = await _gated(group_id, "recall", tool_input,
+                                    caller_qq, master_instructed, bot)
+                if gate is not None:
+                    return gate
             ok = await bot.delete_msg(mid)
             return f"消息已撤回 ✓" if ok else "撤回失败"
 
@@ -714,6 +829,14 @@ async def execute_tool(
             if not mid:
                 return "需要提供 message_id"
             reason = tool_input.get("reason", "")
+            # 自主设精华限速：每群每天 N 次
+            from . import guardian
+            if not guardian.check_essence_rate(group_id):
+                return "⨯ 设精华限速（每群每天有上限）"
+            gate = await _gated(group_id, "set_essence", tool_input,
+                                caller_qq, master_instructed, bot)
+            if gate is not None:
+                return gate
             ok = await bot.set_essence_msg(mid)
             return f"已设为精华消息 {reason}✓" if ok else "设精华失败（可能不是管理员或消息不可加精）"
 
@@ -830,8 +953,26 @@ async def execute_tool(
             uid = int(tool_input.get("user_id", 0))
             minutes = int(tool_input.get("minutes", 10))
             reason = tool_input.get("reason", "未提供理由")
-            # 危险操作: 返回警告标记
-            ok = await bot.set_group_ban(group_id, uid, minutes * 60)
+            mute_seconds = minutes * 60
+            # 拿 member_info 判断保护名单
+            member_info = None
+            try:
+                mi = await bot.get_group_member_info(group_id, uid)
+                member_info = mi if isinstance(mi, dict) else None
+            except Exception:
+                pass
+            # >10min 为重度：非主人指令时先发占位文案
+            if minutes > 10 and not master_instructed:
+                from . import guardian
+                try:
+                    await bot.send_group_msg(group_id, guardian.pick_placeholder())
+                except Exception:
+                    pass
+            gate = await _gated(group_id, "mute", tool_input, caller_qq,
+                                master_instructed, bot, member_info, mute_seconds)
+            if gate is not None:
+                return gate
+            ok = await bot.set_group_ban(group_id, uid, mute_seconds)
             if ok:
                 logger.warning(f"AI 执行了禁言: user={uid} {minutes}分钟 理由:{reason}")
             return f"已禁言 {uid} {minutes} 分钟 ({reason}) ✓" if ok else "禁言失败"
@@ -839,6 +980,24 @@ async def execute_tool(
         elif tool_name == "kick_member":
             uid = int(tool_input.get("user_id", 0))
             reason = tool_input.get("reason", "未提供理由")
+            # 拿 member_info 判断保护名单
+            member_info = None
+            try:
+                mi = await bot.get_group_member_info(group_id, uid)
+                member_info = mi if isinstance(mi, dict) else None
+            except Exception:
+                pass
+            # 重度动作：非主人指令时先发占位文案
+            if not master_instructed:
+                from . import guardian
+                try:
+                    await bot.send_group_msg(group_id, guardian.pick_placeholder())
+                except Exception:
+                    pass
+            gate = await _gated(group_id, "kick", tool_input, caller_qq,
+                                master_instructed, bot, member_info)
+            if gate is not None:
+                return gate
             ok = await bot.set_group_kick(group_id, uid)
             if ok:
                 logger.warning(f"AI 执行了踢人: user={uid} 理由:{reason}")
@@ -846,6 +1005,17 @@ async def execute_tool(
 
         elif tool_name == "whole_ban":
             enable = tool_input.get("enable", True)
+            # 重度动作：非主人指令时先发占位文案
+            if not master_instructed:
+                from . import guardian
+                try:
+                    await bot.send_group_msg(group_id, guardian.pick_placeholder())
+                except Exception:
+                    pass
+            gate = await _gated(group_id, "whole_ban", tool_input, caller_qq,
+                                master_instructed, bot)
+            if gate is not None:
+                return gate
             ok = await bot.set_group_whole_ban(group_id, enable)
             action = "开启" if enable else "关闭"
             if ok:
@@ -854,8 +1024,15 @@ async def execute_tool(
 
         # ── 群娱乐 ──
         elif tool_name == "at_all":
-            from . import ai_brain
+            from . import ai_brain, guardian
             msg = str(tool_input.get("message", ""))[:50]
+            # @全体限速：每群每 6h 至多 1 次
+            if not guardian.check_at_all_rate(group_id):
+                return "⨯ @全体限速（每群每 6h 至多 1 次）"
+            gate = await _gated(group_id, "at_all", tool_input, caller_qq,
+                                master_instructed, bot)
+            if gate is not None:
+                return gate
             ok = await ai_brain.at_all(bot, group_id, msg)
             return f"@全体成员 {msg} ✓" if ok else "@全体失败（可能不是管理员）"
 
@@ -1077,6 +1254,94 @@ async def execute_tool(
                     return f"被忽略的加群请求 ({len(msgs)}条):\n" + "\n".join(lines)
                 return "没有被忽略的请求"
             return "获取失败"
+
+        # ── 群文件管理（自主） ──
+        elif tool_name == "upload_group_file":
+            fn = str(tool_input.get("filename", "note.txt"))[:100]
+            content = str(tool_input.get("content", ""))
+            if not content:
+                return "content 为空"
+            import tempfile, os
+            tmp = os.path.join(tempfile.gettempdir(), f"qqbot_{fn}")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+            folder_id = str(tool_input.get("folder_id", "") or "")
+            try:
+                ok = await bot.upload_group_file(group_id, tmp, fn, folder_id)
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            return "群文件已上传 ✓" if ok else "上传失败（可能不是管理员）"
+
+        elif tool_name == "create_group_folder":
+            name = str(tool_input.get("name", "新建文件夹"))[:50]
+            ok = await bot.create_group_file_folder(group_id, name)
+            return f"已创建文件夹「{name}」✓" if ok else "创建失败（可能不是管理员）"
+
+        # ── 改他人资料（轻量闸门） ──
+        elif tool_name == "set_member_card":
+            uid = int(tool_input.get("user_id", 0))
+            if not uid:
+                return "需要提供 user_id"
+            member_info = None
+            try:
+                mi = await bot.get_group_member_info(group_id, uid)
+                member_info = mi if isinstance(mi, dict) else None
+            except Exception:
+                pass
+            gate = await _gated(group_id, "set_member_card", tool_input,
+                                caller_qq, master_instructed, bot, member_info)
+            if gate is not None:
+                return gate
+            card = str(tool_input.get("card", ""))[:20]
+            ok = await bot.set_group_card(group_id, uid, card)
+            return f"已修改群名片为「{card}」✓" if ok else "修改失败（Bot 不是管理员？）"
+
+        elif tool_name == "set_member_title":
+            uid = int(tool_input.get("user_id", 0))
+            if not uid:
+                return "需要提供 user_id"
+            member_info = None
+            try:
+                mi = await bot.get_group_member_info(group_id, uid)
+                member_info = mi if isinstance(mi, dict) else None
+            except Exception:
+                pass
+            gate = await _gated(group_id, "set_member_title", tool_input,
+                                caller_qq, master_instructed, bot, member_info)
+            if gate is not None:
+                return gate
+            title = str(tool_input.get("title", ""))[:20]
+            ok = await bot.set_group_special_title(group_id, uid, title)
+            return f"已设置头衔为「{title}」✓" if ok else "设置失败（Bot 不是群主？）"
+
+        # ── 撤销最近动作（主人自然语言撤销） ──
+        elif tool_name == "undo_recent_action":
+            from . import db
+            target = int(tool_input.get("target_qq", 0) or tool_input.get("user_id", 0))
+            if not target:
+                return "需要提供 target_qq"
+            records = db.list_ai_audit(target_qq=target, group_id=group_id,
+                                       only_undone=True, limit=5)
+            if not records:
+                return f"没有对 {target} 可撤销的记录"
+            undone = []
+            for rec in records:
+                act = rec.get("action")
+                try:
+                    if act in ("mute", "ban"):
+                        # 解禁/解封
+                        await bot.set_group_ban(group_id, target, 0)
+                        db.mark_ai_audit_undone(rec["id"])
+                        undone.append(act)
+                    # kick 无法撤销（人已不在群）；essence 撤销需 message_id（审计表未存），暂跳过
+                except Exception as e:
+                    logger.debug(f"撤销 {act} 失败: {e}")
+            if undone:
+                return f"已撤销对 {target} 的: {','.join(undone)} ✓"
+            return "无可自动撤销的动作（kick/essence 需人工处理）"
 
         else:
             return f"未知工具: {tool_name}"
