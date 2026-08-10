@@ -1,4 +1,4 @@
-"""image_mod 三级降级 + GIF + 并发调度测试 — python tests/test_image_fallback.py"""
+"""image_mod Vision 审核 + GIF + 并发调度测试 — python tests/test_image_fallback.py"""
 import asyncio
 import sys
 import os
@@ -19,52 +19,67 @@ class TestReviewImageWithFallback(unittest.TestCase):
     def setUp(self):
         image_mod._mod_cache.clear()
 
-    def test_vision_success_skips_ocr(self):
-        """Vision 返回结果 → 不调 OCR"""
+    def _patched(self, **kw):
+        """统一 patch 帮手：禁用磁盘缓存加载，避免测试污染"""
+        patches = {
+            "_init_mod_cache": MagicMock(),  # 禁用磁盘加载
+            **kw,
+        }
+        return [patch.object(image_mod, k, new=v) for k, v in patches.items()]
+
+    def test_vision_success_first_try(self):
+        """Vision 首次成功 → 直接返回，不重试"""
         bot = MagicMock()
-        with patch.object(image_mod, "review_image_with_ai", new=AsyncMock(return_value={
+        mock_vision = AsyncMock(return_value={
             "is_violation": True, "confidence": 0.9, "violation_type": "ad",
             "ocr_text": "加微信", "reason": "广告",
-        })), patch.object(image_mod, "_ocr_image_bytes", new=AsyncMock(return_value="")) as mock_ocr:
+        })
+        with patch.object(image_mod, "_init_mod_cache", new=MagicMock()), \
+             patch.object(image_mod, "review_image_with_ai", new=mock_vision):
             result = _run(image_mod.review_image_with_fallback(bot, "fid", "http://x/vision_ok.jpg"))
             self.assertTrue(result["is_violation"])
-            mock_ocr.assert_not_called()
+            self.assertEqual(mock_vision.call_count, 1)
 
-    def test_vision_failure_triggers_ocr(self):
-        """Vision 抛超时 → 触发 OCR → OCR 拿到文字 → llm_moderate"""
+    def test_vision_failure_triggers_retry(self):
+        """Vision 首次抛异常 → 重试一次成功"""
         bot = MagicMock()
-        ocr_result = "加微信 vx123 免费领取"
-        llm_result = {
+        side_effects = [TimeoutError("API down"), {
             "is_violation": True, "confidence": 0.85, "violation_type": "ad",
-            "ocr_text": ocr_result, "reason": "OCR 后判定广告",
-            "keywords_matched": [], "category": "ad", "source": "llm_confirmed",
-            "suggested_action": "mute", "latency_ms": 10,
-        }
-        with patch.object(image_mod, "review_image_with_ai", new=AsyncMock(side_effect=TimeoutError("API down"))), \
-             patch.object(image_mod, "_ocr_available_or_init", new=MagicMock(return_value=True)), \
-             patch.object(image_mod, "_download_image_bytes", new=AsyncMock(return_value=b"fake-img")), \
-             patch.object(image_mod, "_extract_gif_frames", new=MagicMock(return_value=[b"frame1"])), \
-             patch.object(image_mod, "_ocr_image_bytes", new=AsyncMock(return_value=ocr_result)), \
-             patch("bot.llm_mod.llm_moderate", new=AsyncMock(return_value=llm_result)):
-            result = _run(image_mod.review_image_with_fallback(bot, "fid", "http://x/ocr_fallback.jpg"))
+            "ocr_text": "加微信 vx123", "reason": "重试成功",
+        }]
+        mock_vision = AsyncMock(side_effect=side_effects)
+        with patch.object(image_mod, "_init_mod_cache", new=MagicMock()), \
+             patch.object(image_mod, "review_image_with_ai", new=mock_vision):
+            result = _run(image_mod.review_image_with_fallback(bot, "fid", "http://x/retry_ok.jpg"))
             self.assertIsNotNone(result)
             self.assertTrue(result["is_violation"])
-            self.assertIn("加微信", result.get("ocr_text", ""))
+            self.assertEqual(mock_vision.call_count, 2)
 
     def test_all_fail_returns_none(self):
-        """Vision + OCR + LLM 全失败 → 返回 None"""
+        """Vision 两次都失败 → 返回 None"""
         bot = MagicMock()
-        with patch.object(image_mod, "review_image_with_ai", new=AsyncMock(return_value=None)), \
-             patch.object(image_mod, "_ocr_available_or_init", new=MagicMock(return_value=False)):
+        mock_vision = AsyncMock(side_effect=[TimeoutError("down"), TimeoutError("still down")])
+        with patch.object(image_mod, "_init_mod_cache", new=MagicMock()), \
+             patch.object(image_mod, "review_image_with_ai", new=mock_vision):
             result = _run(image_mod.review_image_with_fallback(bot, "fid", "http://x/all_fail.jpg"))
+            self.assertIsNone(result)
+            self.assertEqual(mock_vision.call_count, 2)
+
+    def test_vision_returns_none_returns_none(self):
+        """Vision 首次返回 None → 重试一次仍 None → 返回 None"""
+        bot = MagicMock()
+        mock_vision = AsyncMock(return_value=None)
+        with patch.object(image_mod, "_init_mod_cache", new=MagicMock()), \
+             patch.object(image_mod, "review_image_with_ai", new=mock_vision):
+            result = _run(image_mod.review_image_with_fallback(bot, "fid", "http://x/none_ret.jpg"))
             self.assertIsNone(result)
 
     def test_cache_hit_skips_api(self):
         """缓存命中 → 不调 Vision"""
         bot = MagicMock()
         image_mod._mod_cache["http://x/cached.jpg"] = {"result": {"is_violation": False}, "ts": __import__("time").time()}
-        # 强制不再从磁盘重载：直接清掉懒加载状态后塞内存值
-        with patch.object(image_mod, "review_image_with_ai", new=AsyncMock()) as mock_v:
+        with patch.object(image_mod, "_init_mod_cache", new=MagicMock()), \
+             patch.object(image_mod, "review_image_with_ai", new=AsyncMock()) as mock_v:
             result = _run(image_mod.review_image_with_fallback(bot, "", "http://x/cached.jpg"))
             mock_v.assert_not_called()
             self.assertFalse(result["is_violation"])
@@ -120,7 +135,7 @@ class TestAuditAllMedia(unittest.TestCase):
         images = [{"url": f"http://x/{i}.jpg", "file_id": str(i)} for i in range(11)]
         with patch.object(image_mod, "review_image_with_fallback", new=fake_review):
             _run(image_mod._audit_all_media(MagicMock(), images))
-        # 验证前 5 个调用时间几乎同时，后 6 个明显晚于前 5 个结束
+        # 验证前 5 个调用时间几乎同时（Semaphore(5) 控并发）
         first_batch = sorted(call_times[:5])
         self.assertTrue(all(t - first_batch[0] < 0.02 for t in first_batch))
 

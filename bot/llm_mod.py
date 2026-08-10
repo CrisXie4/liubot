@@ -25,7 +25,7 @@ from .config import config
 
 logger = logging.getLogger("qqbot")
 
-# ─── LLM 客户端（统一走 llm_call 共享客户端，读 model_settings 的 glm-5.2-free）───
+# ─── LLM 客户端（统一走 llm_call 共享客户端，读 model_settings 的 gemini-3.5-flash-free）───
 # 注：旧版 llm_mod 维护独立的 _get_client（优先 minimax_api_key），
 # 跟主聊天用的模型分裂，且硬编码 MiniMax-M3。
 # 现已统一——所有 AI 调用走 llm_call.llm_create，读同一份 model_settings。
@@ -197,7 +197,7 @@ async def _call_minimax_moderation(prompt: str) -> Optional[dict]:
     ms = memory.load_model_settings()
     try:
         response = await llm_call.llm_create(
-            model=ms.get("model", "glm-5.2-free"),
+            model=ms.get("model", "gemini-3.5-flash-free"),
             max_tokens=200,
             temperature=0.05,  # 极低温度保证一致性
             messages=[{"role": "user", "content": prompt}],

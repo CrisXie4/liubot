@@ -284,7 +284,7 @@ async def get_model_settings():
 @router.post("/model-settings")
 async def save_model_settings(data: dict):
     """保存模型设置"""
-    allowed = {"api_url", "api_key", "minimax_api_key", "model", "temperature", "max_tokens",
+    allowed = {"api_url", "api_key", "minimax_api_key", "model", "fallback_model", "vision_model", "temperature", "max_tokens",
                "context_size"}
     filtered = {k: v for k, v in data.items() if k in allowed}
     # 如果 api_key 是脱敏值（含 ****），保留原来的 key

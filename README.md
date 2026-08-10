@@ -196,23 +196,20 @@ python main.py
 
 ---
 
-## 图片审核与 OCR 降级
+## 图片审核（Vision）
 
-机器人会对群里的**所有图片、GIF 动图、商城表情**自动做违规识别：
+机器人会对群里的**所有图片、GIF 动图、商城表情**自动做违规识别，用专门的 vision 模型（默认 `minimax-m3-free`）：
 
-1. **Vision API 直接审核**（主路径，需配置 `LLM_API_KEY`）
-2. **OCR 文字识别**（Vision 失败时降级，需安装 Tesseract）
-3. **文字结果送 LLM 审核**（OCR 拿到文字后再判断）
+- 识别图片里的广告/色情/赌博/诈骗内容
+- 自动读出图片里的文字（OCR 能力由 Vision 模型自带，无需装 Tesseract）
+- GIF 自动抽取首/中/末 3 个关键帧分别识别
+- 同一张图 24 小时内只审一次（缓存）
 
-### 安装 Tesseract（可选，但推荐）
+主模型 `gemini-3.5-flash-free` 通过此 API 网关**不支持 vision**（API 收图但模型忽略），所以图片类任务一律走 vision 模型。在 `.env` 里配置：
 
-Vision API 故障时依赖 Tesseract 做 OCR 降级。
-
-- **Windows**: 下载 [Tesseract-OCR](https://github.com/UB-Mannheim/tesseract/wiki)，安装时勾选 **Chinese (Simplified)** 语言包
-- 默认检测路径：`E:\ocr\tesseract.exe`、`C:\Program Files\Tesseract-OCR\`、`C:\Program Files (x86)\Tesseract-OCR\`
-- **Linux**: `sudo apt install tesseract-ocr tesseract-ocr-chi-sim`
-
-未安装 Tesseract 时，Vision 失败的图片会被跳过（不制造误判），但不影响文本审核。
+```
+LLM_VISION_MODEL=minimax-m3-free   # 必须是支持 vision 的模型
+```
 
 ---
 

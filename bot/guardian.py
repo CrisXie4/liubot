@@ -29,7 +29,7 @@ async def _call_minimax(text: str) -> Optional[dict]:
     try:
         ms = memory.load_model_settings()
         response = await llm_call.llm_create(
-            model=ms.get("model", "glm-5.2-free"),
+            model=ms.get("model", "gemini-3.5-flash-free"),
             max_tokens=150,
             temperature=0.1,
             messages=[{"role": "user", "content": (
@@ -272,7 +272,7 @@ async def judge(action: str, target_qq: int, target_name: str,
     )
     try:
         response = await llm_call.llm_create(
-            model=cfg.get("model") or ms.get("model", "glm-5.2-free"),
+            model=cfg.get("model") or ms.get("model", "gemini-3.5-flash-free"),
             max_tokens=cfg.get("max_tokens", 100),
             temperature=cfg.get("temperature", 0.1),
             messages=[{"role": "user", "content": prompt}],

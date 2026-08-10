@@ -93,7 +93,7 @@ async def generate_group_summary(group_id: int, bot_name: str = "") -> str:
         from . import llm_call
 
         response = await llm_call.llm_create(
-            model=ms.get("model", "glm-5.2-free"),
+            model=ms.get("model", "gemini-3.5-flash-free"),
             max_tokens=400,
             temperature=0.7,
             system=f"你是名叫「{bot_name or config.BOT_NAME}」的QQ群机器人。请根据提供的群聊数据生成一份简洁有趣的每日总结。风格活泼、带emoji、像朋友聊天。控制在200字以内。按以下格式：先总评（今天群里怎么样），再列出关键数据（消息量/活跃成员/热门话题/违规），最后来一句有趣的收尾。",

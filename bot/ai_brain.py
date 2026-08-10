@@ -302,7 +302,7 @@ async def autonomous_learn(bot) -> Optional[dict]:
         )
 
         response = await llm_call.llm_create(
-            model=ms.get("model", "glm-5.2-free"),
+            model=ms.get("model", "gemini-3.5-flash-free"),
             max_tokens=200,
             temperature=0.8,
             system=f"你现在{cs.get_dominant_mood(state)}。根据搜索结果做两件事：\n"
@@ -538,7 +538,7 @@ async def _push_personalized_news(bot, topic: str, news_text: str, image_url: st
             return
 
         response = await llm_call.llm_create(
-            model=ms.get("model", "glm-5.2-free"),
+            model=ms.get("model", "gemini-3.5-flash-free"),
             max_tokens=150,
             temperature=0.7,
             system="你有机会把一条新闻私聊推给感兴趣的群友。不是每个群友都需要推送——"
@@ -636,7 +636,7 @@ async def maybe_proactive_action(bot):
             prompt += "\n\n" + cs.get_time_facts_prompt()
 
             response = await llm_call.llm_create(
-                model=ms.get("model", "glm-5.2-free"),
+                model=ms.get("model", "gemini-3.5-flash-free"),
                 max_tokens=40,
                 temperature=1.0,
                 system=prompt,

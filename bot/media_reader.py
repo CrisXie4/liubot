@@ -136,11 +136,12 @@ async def describe_image(image_url: str, context: str = "") -> Optional[str]:
         "至少50字，信息越多越好。"
     ) + (f"\n对话上下文: {context}" if context else "")
 
-    # MiniMax M3 Vision
+    # 图片理解走 vision_model（gemini 经此网关不支持 vision）
     from . import llm_call
+    vision_model = ms.get("vision_model") or ms.get("fallback_model") or "minimax-m3-free"
     try:
         response = await llm_call.llm_create(
-            model=ms.get("model", "glm-5.2-free"),
+            model=vision_model,
             max_tokens=400,
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": content_type, "data": img_data}},

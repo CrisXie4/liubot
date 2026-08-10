@@ -440,7 +440,7 @@ async def generate_idle_thought(state: dict) -> str | None:
         )
 
         response = await llm_call.llm_create(
-            model=ms.get("model", "glm-5.2-free"),
+            model=ms.get("model", "gemini-3.5-flash-free"),
             max_tokens=60,
             temperature=0.95,
             messages=[{"role": "user", "content": prompt}],

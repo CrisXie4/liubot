@@ -686,7 +686,13 @@ MODEL_SETTINGS_PATH = os.path.join(config.DATA_DIR, "model_settings.json")
 DEFAULT_MODEL_SETTINGS = {
     "api_url": "https://api.ccode.vip",
     "api_key": "",
-    "model": "glm-5.2-free",
+    "model": "gemini-3.5-flash-free",
+    # 主模型不可用时自动降级到这个模型（在 llm_call.llm_create 中处理）
+    "fallback_model": "minimax-m3-free",
+    # 图片审核 / 图片理解专用模型（必须支持 vision 输入）
+    # 主模型 gemini-3.5-flash-free 经此 API 网关不支持 vision，
+    # 所以图片类任务一律走 minimax-m3-free（已验证支持）。
+    "vision_model": "minimax-m3-free",
     "temperature": 0.8,
     "max_tokens": 800,
     # 1M 上下文：context_size 不再是硬切，按 token 截断。
@@ -722,8 +728,14 @@ def load_model_settings() -> dict:
     if not settings.get("model"):
         model = config.LLM_MODEL or ""
         if "deepseek" in model.lower():
-            model = DEFAULT_MODEL_SETTINGS["model"]  # 回退到 glm-5.2-free
+            model = DEFAULT_MODEL_SETTINGS["model"]  # 回退到 gemini-3.5-flash-free
         settings["model"] = model
+    # fallback_model：JSON 没有 → 用 .env 的 LLM_FALLBACK_MODEL
+    if not settings.get("fallback_model"):
+        settings["fallback_model"] = config.LLM_FALLBACK_MODEL or DEFAULT_MODEL_SETTINGS["fallback_model"]
+    # vision_model：JSON 没有 → 用 .env 的 LLM_VISION_MODEL
+    if not settings.get("vision_model"):
+        settings["vision_model"] = config.LLM_VISION_MODEL or DEFAULT_MODEL_SETTINGS["vision_model"]
 
     cache.model_settings_cache.set("model_settings", settings)
     return settings

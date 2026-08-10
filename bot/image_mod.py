@@ -137,13 +137,17 @@ VISION_MODERATION_PROMPT = """你是一个QQ群内容审核助手。请仔细检
 # ═══════════════════════════════════════════════════════════
 
 async def _get_mm_client():
-    """返回模型名（客户端由 llm_call 共享管理）。无 api_key 返回 None。"""
+    """返回图片审核要用的模型名（客户端由 llm_call 共享管理）。无 api_key 返回 None。
+
+    固定走 vision_model（已验证支持图片输入）—— 主模型 gemini-3.5-flash-free
+    通过此 API 网关时不支持 vision，所以图片审核不能用 ms['model']。
+    """
     from bot import memory
     from . import llm_call
     if llm_call.get_client() is None:
         return None
     ms = memory.load_model_settings()
-    return ms.get("model", "glm-5.2-free")
+    return ms.get("vision_model") or ms.get("fallback_model") or "minimax-m3-free"
 
 async def review_image_with_ai(
     bot, file_id: str, image_url: str = "", caption: str = ""
@@ -336,38 +340,9 @@ def extract_image_info(message: list) -> tuple[str, str]:
             return seg["data"].get("file", ""), seg["data"].get("url", "")
     return "", ""
 
-# ═══════════════════════════════════════════════════════════
-#  本地 OCR 检查（保留兼容，不再使用）
-# ═══════════════════════════════════════════════════════════
-
-_ocr_available = None
-
-def check_ocr():
-    """检查本地 OCR 是否可用（已弃用，改用 AI 视觉）"""
-    global _ocr_available
-    if _ocr_available is not None:
-        return _ocr_available
-    try:
-        import pytesseract
-        from PIL import Image
-        import os
-        tesseract_paths = [
-            r"E:\ocr\tesseract.exe",
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        ]
-        for p in tesseract_paths:
-            if os.path.exists(p):
-                pytesseract.pytesseract.tesseract_cmd = p
-                break
-        _ocr_available = True
-    except ImportError:
-        _ocr_available = False
-    return _ocr_available
-
 
 # ═══════════════════════════════════════════════════════════
-#  三级降级 + GIF 抽帧 + 并发调度（Task 2 新增）
+#  Vision 审核 + GIF 抽帧 + 并发调度（OCR 降级已废弃 — minimax-m3-free 的 Vision 自带 OCR）
 # ═══════════════════════════════════════════════════════════
 
 import io
@@ -423,10 +398,9 @@ def _init_mod_cache():
 
 async def review_image_with_fallback(bot, file_id: str, image_url: str = "", caption: str = "") -> Optional[dict]:
     """
-    图片审核三级降级链:
-      1. Vision API (review_image_with_ai)
-      2. OCR (Tesseract)
-      3. OCR 文字喂 llm_moderate
+    图片审核：Vision API 主路径 + 一次重试。
+    不再依赖本地 OCR（minimax-m3-free 的 Vision 已能读图中文字）。
+    GIF 仍走关键帧抽取后逐帧送 Vision。
 
     Returns:
         {is_violation, confidence, violation_type, ocr_text, reason, keywords_matched}
@@ -440,64 +414,44 @@ async def review_image_with_fallback(bot, file_id: str, image_url: str = "", cap
         if _time.time() - entry.get("ts", 0) < IMAGE_MOD_CACHE_TTL:
             return entry["result"]
 
-    # ── 第 1 级: Vision ──
+    # ── 第 1 次 Vision ──
     try:
         vision = await review_image_with_ai(bot, file_id, image_url, caption)
         if vision is not None:
             _cache_result(image_url, vision)
             return vision
     except Exception as e:
-        logger.info(f"Vision 审核失败，降级 OCR: {str(e)[:80]}")
+        logger.info(f"Vision 首次失败，准备重试: {str(e)[:80]}")
 
-    # ── 第 2 级: OCR ──
-    if not _ocr_available_or_init():
-        logger.debug("OCR 不可用，跳过 OCR 降级")
-        return None
+    # ── 重试一次（GIF 先抽帧，避免网关拒绝动图）──
+    try:
+        # 对 GIF：下载后抽帧，第一帧作为静态图送审
+        if image_url and image_url.lower().endswith(".gif"):
+            img_bytes = await _download_image_bytes(image_url)
+            if img_bytes:
+                frames = _extract_gif_frames(img_bytes)
+                if len(frames) > 1:
+                    # 把第一帧转成 base64 塞回 file_id 参数走静态图审核
+                    import tempfile, os as _os, base64 as _b64
+                    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                    tmp.write(frames[0])
+                    tmp.close()
+                    try:
+                        vision = await review_image_with_ai(bot, tmp.name, "", caption)
+                    finally:
+                        try: _os.unlink(tmp.name)
+                        except Exception: pass
+                    if vision is not None:
+                        _cache_result(image_url, vision)
+                        return vision
 
-    img_bytes = await _download_image_bytes(image_url) if image_url else None
-    if not img_bytes:
-        return None
-
-    # GIF 拆帧（任一帧违规即违规）
-    frames = _extract_gif_frames(img_bytes)
-    all_ocr_texts = []
-    any_violation = None
-    for frame_bytes in frames:
-        ocr_text = await _ocr_image_bytes(frame_bytes)
-        if not ocr_text.strip():
-            continue
-        all_ocr_texts.append(ocr_text)
-        # ── 第 3 级: OCR 文字喂 llm_moderate ──
-        try:
-            from . import llm_mod
-            llm_r = await llm_mod.llm_moderate(ocr_text, force_llm=True)
-            if llm_r and llm_r.get("is_violation"):
-                any_violation = {
-                    "is_violation": True,
-                    "confidence": llm_r.get("confidence", 0.7),
-                    "violation_type": llm_r.get("category", "ad"),
-                    "ocr_text": " | ".join(all_ocr_texts),
-                    "reason": f"OCR识别: {llm_r.get('reason', '')[:30]}",
-                    "keywords_matched": llm_r.get("keywords_matched", []),
-                }
-                break  # 任一帧命中即停
-        except Exception as e:
-            logger.warning(f"OCR 文字喂 LLM 审核失败: {e}")
-
-    if any_violation:
-        _cache_result(image_url, any_violation)
-        return any_violation
-
-    # 全部 OCR 文字都没有命中违规
-    if all_ocr_texts:
-        result = {
-            "is_violation": False, "confidence": 0.3,
-            "violation_type": "none",
-            "ocr_text": " | ".join(all_ocr_texts),
-            "reason": "OCR 后判定正常",
-        }
-        _cache_result(image_url, result)
-        return result
+        # 非 GIF 或 GIF 抽帧失败 → 直接重试一次原参数
+        vision = await review_image_with_ai(bot, file_id, image_url, caption)
+        if vision is not None:
+            _cache_result(image_url, vision)
+            return vision
+    except Exception as e:
+        logger.warning(f"Vision 重试仍失败: {str(e)[:80]}")
 
     return None
 
@@ -510,14 +464,6 @@ def _cache_result(url: str, result: dict):
         _save_mod_cache(_mod_cache)
     except Exception:
         pass
-
-
-def _ocr_available_or_init() -> bool:
-    """检测 Tesseract 是否可用（沿用 check_ocr 路径检测）"""
-    global _ocr_available
-    if _ocr_available is None:
-        check_ocr()
-    return _ocr_available
 
 
 async def _download_image_bytes(url: str) -> Optional[bytes]:
@@ -535,24 +481,6 @@ async def _download_image_bytes(url: str) -> Optional[bytes]:
     except Exception as e:
         logger.info(f"图片下载失败: {e}")
     return None
-
-
-async def _ocr_image_bytes(raw_bytes: bytes) -> str:
-    """用 Tesseract OCR 提取图片文字（chi_sim + eng）"""
-    if not _ocr_available_or_init():
-        return ""
-    try:
-        from PIL import Image
-        import pytesseract
-        img = Image.open(io.BytesIO(raw_bytes))
-        # chi_sim 找不到会抛错，try eng 兜底
-        try:
-            return pytesseract.image_to_string(img, lang="chi_sim+eng")
-        except Exception:
-            return pytesseract.image_to_string(img, lang="eng")
-    except Exception as e:
-        logger.info(f"OCR 失败: {e}")
-        return ""
 
 
 def _extract_gif_frames(raw_bytes: bytes) -> list[bytes]:

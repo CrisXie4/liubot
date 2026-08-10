@@ -388,7 +388,7 @@ async def _generate_question() -> tuple[str, str]:
     )
 
     response = await llm_call.llm_create(
-        model=ms.get("model", "glm-5.2-free"),
+        model=ms.get("model", "gemini-3.5-flash-free"),
         max_tokens=150,
         temperature=0.6,
         system=system_prompt,
@@ -437,7 +437,7 @@ async def _judge_answer(question: str, expected: str, user_answer: str) -> tuple
     )
 
     response = await llm_call.llm_create(
-        model=ms.get("model", "glm-5.2-free"),
+        model=ms.get("model", "gemini-3.5-flash-free"),
         max_tokens=100,
         temperature=0.1,
         system=system_prompt,

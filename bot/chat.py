@@ -240,7 +240,7 @@ async def maybe_compress_context(group_id: int):
     try:
         ms = memory.load_model_settings()
         response = await llm_call.llm_create(
-            model=ms.get("model", "glm-5.2-free"),
+            model=ms.get("model", "gemini-3.5-flash-free"),
             max_tokens=400,
             temperature=0.3,
             system=(
@@ -450,7 +450,7 @@ async def chat_reply(
 
         # --- 构建 API 参数 ---
         kwargs = {
-            "model": ms.get("model", "glm-5.2-free"),
+            "model": ms.get("model", "gemini-3.5-flash-free"),
             "max_tokens": ms.get("max_tokens", 800),
             "system": system_prompt,
             "messages": messages,
@@ -610,7 +610,7 @@ async def try_proactive_chat(bot, group_id: int) -> Optional[str]:
                 # 出现过早上 6 点在群里宣布"下班了"这种穿帮。
                 time_facts = _cs.get_time_facts_prompt()
                 response = await llm_call.llm_create(
-                    model=ms.get("model", "glm-5.2-free"),
+                    model=ms.get("model", "gemini-3.5-flash-free"),
                     max_tokens=60,
                     temperature=1.0,
                     system=(
@@ -730,7 +730,7 @@ async def chat_private_reply(user_id: int, user_name: str, message: str) -> Opti
 
         # API 调用 — 无工具
         response = await llm_call.llm_create(
-            model=ms.get("model", "glm-5.2-free"),
+            model=ms.get("model", "gemini-3.5-flash-free"),
             max_tokens=ms.get("max_tokens", 500),
             system=system_prompt,
             messages=messages,

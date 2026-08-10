@@ -74,15 +74,63 @@ def _is_retryable(exc) -> bool:
     return False
 
 
-async def llm_create(**kwargs):
-    """包装 client.messages.create，带 429/5xx 重试。
+def _is_auth_error(exc) -> bool:
+    """鉴权/权限错误：换模型也救不了，不应该触发 fallback。"""
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403):
+        return True
+    name = type(exc).__name__
+    if name in ("AuthenticationError", "PermissionDeniedError"):
+        return True
+    msg = str(exc).lower()
+    if any(k in msg for k in ("unauthorized", "forbidden", "invalid api key",
+                              "invalid_api_key", "authentication")):
+        return True
+    return False
 
-    重试耗尽后抛出最后一次异常，调用方可捕获后降级或入补发队列。
+
+async def llm_create(**kwargs):
+    """包装 client.messages.create，带 429/5xx 重试 + 模型降级。
+
+    - 429/5xx/超时/连接错误：指数退避重试（5s→15s→40s，最多3次）
+    - 主模型彻底失败（重试耗尽或非可重试错误）→ 自动切换 fallback_model
+    - fallback 也失败 → 抛出 fallback 的异常
+
+    用户可见的主回复路径（chat.chat_reply）额外使用延迟补发队列：
+      - 重试耗尽仍 429 → 回复存入 pending_replies.json
+      - consciousness_loop 每分钟调 flush_pending_retries 尝试补发
+      - 超过 1 小时的待发回复丢弃（过时了发出去反而怪）
     """
     client = get_client()
     if client is None:
         raise RuntimeError("LLM client unavailable (no api_key)")
 
+    primary_model = kwargs.get("model")
+    ms = memory.load_model_settings()
+    fallback_model = ms.get("fallback_model") or ""
+
+    # 主模型调用（含重试）
+    try:
+        return await _call_with_retries(client, **kwargs)
+    except Exception as primary_exc:
+        # 没有 fallback、fallback 与主模型相同、或是鉴权错误（换模型也救不了）→ 直接抛
+        if not fallback_model or fallback_model == primary_model:
+            raise
+        if _is_auth_error(primary_exc):
+            raise
+        # 主模型不可用 → 降级到 fallback
+        logger.warning(
+            f"主模型 {primary_model} 调用失败，降级到 {fallback_model}: "
+            f"{_short_exc(primary_exc)}"
+        )
+        fb_kwargs = dict(kwargs)
+        fb_kwargs["model"] = fallback_model
+        # fallback 也走完整重试，再失败就抛它自己的异常
+        return await _call_with_retries(client, **fb_kwargs)
+
+
+async def _call_with_retries(client, **kwargs):
+    """单模型的指数退避重试调用。"""
     last_exc = None
     attempts = [0] + RETRY_DELAYS  # 首次不延迟
     for attempt, delay in enumerate(attempts):

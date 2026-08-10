@@ -20,8 +20,11 @@ class Config:
 
     # --- AI 聊天 ---
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
-    LLM_API_URL: str = os.getenv("LLM_API_URL", "https://api.deepseek.com/v1")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "deepseek-chat")
+    LLM_API_URL: str = os.getenv("LLM_API_URL", "https://api.ccode.vip")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-3.5-flash-free")
+    LLM_FALLBACK_MODEL: str = os.getenv("LLM_FALLBACK_MODEL", "minimax-m3-free")
+    # 图片审核/理解专用模型（必须支持 vision 输入）
+    LLM_VISION_MODEL: str = os.getenv("LLM_VISION_MODEL", "minimax-m3-free")
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.8"))
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "300"))
 
