@@ -156,6 +156,10 @@ python main.py
 | `@Bot 群友记忆` | 查看本群活跃群友画像 |
 | `@Bot 最近回忆` | 查看最近的对话摘要 |
 | `@Bot 帮助` | 命令列表 |
+| `@Bot 同意入群 <QQ号>` | 立即放行该 QQ 在本群的待验证状态（若不在待验证则加入免验证白名单） |
+| `@Bot 免验证 <QQ号>` | 加入本群免验证白名单（若当前在待验证则顺带放行） |
+| `@Bot 取消免验证 <QQ号>` | 从免验证白名单移除 |
+| `@Bot 免验证列表` | 查看全局 + 本群免验证白名单 |
 
 ### 群友互动
 
@@ -189,6 +193,26 @@ python main.py
 ## 自定义违禁词
 
 编辑 `bot/automod.py` 中的 `SENSITIVE_WORDS` 字典和 `AD_PATTERNS` 正则列表。权重越高越容易触发。
+
+---
+
+## 图片审核与 OCR 降级
+
+机器人会对群里的**所有图片、GIF 动图、商城表情**自动做违规识别：
+
+1. **Vision API 直接审核**（主路径，需配置 `LLM_API_KEY`）
+2. **OCR 文字识别**（Vision 失败时降级，需安装 Tesseract）
+3. **文字结果送 LLM 审核**（OCR 拿到文字后再判断）
+
+### 安装 Tesseract（可选，但推荐）
+
+Vision API 故障时依赖 Tesseract 做 OCR 降级。
+
+- **Windows**: 下载 [Tesseract-OCR](https://github.com/UB-Mannheim/tesseract/wiki)，安装时勾选 **Chinese (Simplified)** 语言包
+- 默认检测路径：`E:\ocr\tesseract.exe`、`C:\Program Files\Tesseract-OCR\`、`C:\Program Files (x86)\Tesseract-OCR\`
+- **Linux**: `sudo apt install tesseract-ocr tesseract-ocr-chi-sim`
+
+未安装 Tesseract 时，Vision 失败的图片会被跳过（不制造误判），但不影响文本审核。
 
 ---
 
