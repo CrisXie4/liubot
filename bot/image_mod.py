@@ -364,3 +364,243 @@ def check_ocr():
     except ImportError:
         _ocr_available = False
     return _ocr_available
+
+
+# ═══════════════════════════════════════════════════════════
+#  三级降级 + GIF 抽帧 + 并发调度（Task 2 新增）
+# ═══════════════════════════════════════════════════════════
+
+import io
+import os
+import time as _time
+
+# 24h 审核结果缓存: url -> {"result": dict, "ts": float}
+_mod_cache: dict[str, dict] = {}
+IMAGE_MOD_CACHE_TTL = 86400  # 24 小时
+
+# 并发上限
+_AUDIT_SEMAPHORE = asyncio.Semaphore(5)
+# 单条消息媒体上限
+AUDIT_MEDIA_CAP = 20
+
+
+def _load_mod_cache() -> dict:
+    """从 data/image_mod_cache.json 读缓存"""
+    from .config import config
+    path = os.path.join(config.DATA_DIR, "image_mod_cache.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_mod_cache(cache: dict):
+    """写缓存到 data/image_mod_cache.json"""
+    from .config import config
+    path = os.path.join(config.DATA_DIR, "image_mod_cache.json")
+    try:
+        import json
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # 清过期
+        now = _time.time()
+        cleaned = {k: v for k, v in cache.items() if now - v.get("ts", 0) < IMAGE_MOD_CACHE_TTL}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cleaned, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"图片审核缓存写入失败: {e}")
+
+
+def _init_mod_cache():
+    """启动时加载（懒加载）"""
+    global _mod_cache
+    if not _mod_cache:
+        _mod_cache = _load_mod_cache()
+
+
+async def review_image_with_fallback(bot, file_id: str, image_url: str = "", caption: str = "") -> Optional[dict]:
+    """
+    图片审核三级降级链:
+      1. Vision API (review_image_with_ai)
+      2. OCR (Tesseract)
+      3. OCR 文字喂 llm_moderate
+
+    Returns:
+        {is_violation, confidence, violation_type, ocr_text, reason, keywords_matched}
+        或 None（全失败）
+    """
+    _init_mod_cache()
+
+    # 缓存命中
+    if image_url and image_url in _mod_cache:
+        entry = _mod_cache[image_url]
+        if _time.time() - entry.get("ts", 0) < IMAGE_MOD_CACHE_TTL:
+            return entry["result"]
+
+    # ── 第 1 级: Vision ──
+    try:
+        vision = await review_image_with_ai(bot, file_id, image_url, caption)
+        if vision is not None:
+            _cache_result(image_url, vision)
+            return vision
+    except Exception as e:
+        logger.info(f"Vision 审核失败，降级 OCR: {str(e)[:80]}")
+
+    # ── 第 2 级: OCR ──
+    if not _ocr_available_or_init():
+        logger.debug("OCR 不可用，跳过 OCR 降级")
+        return None
+
+    img_bytes = await _download_image_bytes(image_url) if image_url else None
+    if not img_bytes:
+        return None
+
+    # GIF 拆帧（任一帧违规即违规）
+    frames = _extract_gif_frames(img_bytes)
+    all_ocr_texts = []
+    any_violation = None
+    for frame_bytes in frames:
+        ocr_text = await _ocr_image_bytes(frame_bytes)
+        if not ocr_text.strip():
+            continue
+        all_ocr_texts.append(ocr_text)
+        # ── 第 3 级: OCR 文字喂 llm_moderate ──
+        try:
+            from . import llm_mod
+            llm_r = await llm_mod.llm_moderate(ocr_text, force_llm=True)
+            if llm_r and llm_r.get("is_violation"):
+                any_violation = {
+                    "is_violation": True,
+                    "confidence": llm_r.get("confidence", 0.7),
+                    "violation_type": llm_r.get("category", "ad"),
+                    "ocr_text": " | ".join(all_ocr_texts),
+                    "reason": f"OCR识别: {llm_r.get('reason', '')[:30]}",
+                    "keywords_matched": llm_r.get("keywords_matched", []),
+                }
+                break  # 任一帧命中即停
+        except Exception as e:
+            logger.warning(f"OCR 文字喂 LLM 审核失败: {e}")
+
+    if any_violation:
+        _cache_result(image_url, any_violation)
+        return any_violation
+
+    # 全部 OCR 文字都没有命中违规
+    if all_ocr_texts:
+        result = {
+            "is_violation": False, "confidence": 0.3,
+            "violation_type": "none",
+            "ocr_text": " | ".join(all_ocr_texts),
+            "reason": "OCR 后判定正常",
+        }
+        _cache_result(image_url, result)
+        return result
+
+    return None
+
+
+def _cache_result(url: str, result: dict):
+    if not url:
+        return
+    _mod_cache[url] = {"result": result, "ts": _time.time()}
+    try:
+        _save_mod_cache(_mod_cache)
+    except Exception:
+        pass
+
+
+def _ocr_available_or_init() -> bool:
+    """检测 Tesseract 是否可用（沿用 check_ocr 路径检测）"""
+    global _ocr_available
+    if _ocr_available is None:
+        check_ocr()
+    return _ocr_available
+
+
+async def _download_image_bytes(url: str) -> Optional[bytes]:
+    """下载图片原始 bytes（修复 HTML 实体）"""
+    if not url:
+        return None
+    import html as _html
+    clean = _html.unescape(url)
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as s:
+            async with s.get(clean, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    return await r.read()
+    except Exception as e:
+        logger.info(f"图片下载失败: {e}")
+    return None
+
+
+async def _ocr_image_bytes(raw_bytes: bytes) -> str:
+    """用 Tesseract OCR 提取图片文字（chi_sim + eng）"""
+    if not _ocr_available_or_init():
+        return ""
+    try:
+        from PIL import Image
+        import pytesseract
+        img = Image.open(io.BytesIO(raw_bytes))
+        # chi_sim 找不到会抛错，try eng 兜底
+        try:
+            return pytesseract.image_to_string(img, lang="chi_sim+eng")
+        except Exception:
+            return pytesseract.image_to_string(img, lang="eng")
+    except Exception as e:
+        logger.info(f"OCR 失败: {e}")
+        return ""
+
+
+def _extract_gif_frames(raw_bytes: bytes) -> list[bytes]:
+    """
+    GIF → 多帧 PNG bytes。非 GIF 返回 [raw_bytes]。
+    ≤3 帧全提；>3 帧取首/中/末 3 帧。
+    """
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw_bytes))
+        n = getattr(img, "n_frames", 1)
+        if n <= 1:
+            return [raw_bytes]
+        picks = list(range(n)) if n <= 3 else [0, n // 2, n - 1]
+        frames = []
+        for idx in picks:
+            img.seek(idx)
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="PNG")
+            frames.append(buf.getvalue())
+        return frames
+    except Exception as e:
+        logger.debug(f"GIF 抽帧失败，按静态图处理: {e}")
+        return [raw_bytes]
+
+
+async def _audit_all_media(bot, images: list[dict], caption: str = "") -> list[dict]:
+    """
+    并发审核所有图片。Semaphore(5) 控并发，单条上限 20。
+    返回每个图片的审核结果（可能含 None 元素，调用方需过滤）。
+    """
+    if not images:
+        return []
+    # 截断
+    to_audit = images[:AUDIT_MEDIA_CAP]
+    if len(images) > AUDIT_MEDIA_CAP:
+        logger.info(f"媒体超上限 {AUDIT_MEDIA_CAP}，截断（共 {len(images)} 个）")
+
+    async def _one(img: dict) -> Optional[dict]:
+        async with _AUDIT_SEMAPHORE:
+            extra_caption = img.get("caption_hint", "")
+            full_caption = f"{caption} {extra_caption}".strip()
+            try:
+                return await review_image_with_fallback(
+                    bot, img.get("file_id", ""), img.get("url", ""), caption=full_caption
+                )
+            except Exception as e:
+                logger.warning(f"单图审核失败 ({img.get('url','')[:50]}): {e}")
+                return None
+
+    return await asyncio.gather(*[_one(im) for im in to_audit])
