@@ -220,10 +220,10 @@ async def main():
     # 启动调度器
     asyncio.create_task(sched.start())
 
-    # 启动权威时间同步（后台：启动时立即同步 + 每 30min 一次）
+    # 启动权威时间同步（后台：启动时立即同步 + 每 10min 一次）
     from bot import timeutil
     asyncio.create_task(timeutil.start_background_sync())
-    logger.info("启动时间同步后台任务（10 源随机抽样，每 30min 同步）")
+    logger.info("启动时间同步后台任务（10 源随机抽样，每 10min 同步）")
 
     # 尝试加载 ML 模型
     if config.AUTO_MOD_ENABLED:

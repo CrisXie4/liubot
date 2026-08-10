@@ -206,3 +206,57 @@ def clear_group(group_id: int):
     """清理某群的缓存（调试/重置用）"""
     _name_cache.pop(group_id, None)
     _recent_speakers.pop(group_id, None)
+
+
+# ═══════════════════════════════════════════════════════════
+#  名字 → QQ 解析（让 AI 能按名字找人）
+# ═══════════════════════════════════════════════════════════
+
+_FIND_LIMIT = 5  # 最多返回几个候选
+
+
+async def find_members_by_name(bot, group_id: int, query: str) -> list[dict]:
+    """按群名片/QQ 昵称查群成员。
+
+    匹配策略（用户已确认）：
+    - 第一轮：card 或 nickname 完全等于 query → match_type="exact"
+    - 第二轮：query 是 card 或 nickname 的子串 → match_type="substring"
+    - 大小写无关（英文场景）
+    - 按 exact 优先排序，封顶 _FIND_LIMIT 个
+
+    返回 [{"qq", "card", "nickname", "role", "match_type"}]，空列表=没找到
+    """
+    query = (query or "").strip().lower()
+    if not query:
+        return []
+
+    try:
+        members = await bot.get_group_member_list(group_id)
+    except Exception as e:
+        logger.warning(f"find_members_by_name 拉成员列表失败: {e}")
+        return []
+
+    exact_hits: list[dict] = []
+    sub_hits: list[dict] = []
+
+    for m in members or []:
+        qq = int(m.get("user_id", 0) or 0)
+        if not qq:
+            continue
+        card = (m.get("card", "") or "").strip()
+        nick = (m.get("nickname", "") or "").strip()
+        role = m.get("role", "member")
+
+        if query == card.lower() or query == nick.lower():
+            exact_hits.append({
+                "qq": qq, "card": card, "nickname": nick,
+                "role": role, "match_type": "exact",
+            })
+        elif query in card.lower() or query in nick.lower():
+            sub_hits.append({
+                "qq": qq, "card": card, "nickname": nick,
+                "role": role, "match_type": "substring",
+            })
+
+    # exact 优先，封顶
+    return (exact_hits + sub_hits)[:_FIND_LIMIT]

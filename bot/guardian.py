@@ -205,13 +205,24 @@ async def is_protected(target_qq: int, group_id: int,
 
     master_instructed=True 且配置允许覆盖时，
     保护名单里除主人自身外都可被覆盖。
+
+    主人 QQ 统一从 config.OWNER_QQ 读（与 master_instructed 判定同源），
+    不在 ai_guard_config.json 里重复维护。
     """
     cfg = load_config().get("protected", {})
-    master_list = set(int(x) for x in cfg.get("master_qq", []))
+    # 主人 QQ：合并 config.OWNER_QQ（主）+ ai_guard_config.master_qq（兼容旧配置）
+    master_set = set()
+    try:
+        from .config import config as _cfg
+        if getattr(_cfg, "OWNER_QQ", ""):
+            master_set.add(int(_cfg.OWNER_QQ))
+    except Exception:
+        pass
+    master_set.update(int(x) for x in cfg.get("master_qq", []))
     whitelist = set(int(x) for x in cfg.get("whitelist", []))
 
     # 主人永远受保护（即使 master_instructed 也不能动主人自己）
-    if target_qq in master_list:
+    if target_qq in master_set:
         return True
     if target_qq in whitelist:
         return True

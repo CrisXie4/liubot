@@ -906,7 +906,17 @@ async def request(group_id: int, action: str,
                 "severity": severity, "reason": reason,
                 "placeholder_sent": False}
 
-    # 重度 → 异步裁判（调用方应在调本函数前已发占位文案）
+    # 重度 → 主人指令跳裁判立即执行；否则异步裁判
+    # （调用方应在调本函数前已发占位文案——仅非主人触发时）
+    if master_instructed:
+        # 主人明确指令：保护名单已在上面检查过（主人自身永远拒），
+        # 其余一律放行，不再等 ~100s 裁判
+        aid = db.record_ai_audit(group_id, action, target_qq, reason,
+                                 "master_instructed", master_instructed)
+        return {"allow": True, "verdict": "master_instructed",
+                "audit_id": aid, "severity": severity,
+                "reason": reason, "placeholder_sent": False}
+
     allow, verdict = await judge(
         action, target_qq or 0, target_name, reason,
         context_snippets or [], master_instructed)
@@ -1508,6 +1518,8 @@ git commit -m "test: 端到端 smoke test 通过"
 **3. Type consistency:** `guardian.request` 返回 dict 字段在 Task 5 定义，Task 6 `_gated` 用了 `r["reason"]`/`r["verdict"]` ✓ 一致。`db.record_ai_audit` 返回 int，Task 5 用 `aid = db.record_ai_audit(...)` ✓。
 
 **补缺：Task 6.5 — undo_action 工具（主人自然语言撤销）**
+
+**Pre-flight ruling (2026-08-07):** 主人明确指令的重度动作（kick/ban/whole_ban/长mute）**跳过 judge 异步裁判**，只检查"目标不是主人自己"（已在 is_protected 里处理），其余立即执行。Task 5 `request()` 的 heavy 分支已据此更新：`master_instructed=True` 直接放行，verdict 标 `master_instructed`。Task 6 placeholder 逻辑（仅 `master_instructed=False` 时发占位）因此一致——主人指令零延迟，非主人指令仍走 ~100s 裁判并先发"让我想想…"。
 
 ---
 

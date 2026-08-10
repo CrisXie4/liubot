@@ -50,7 +50,7 @@ const _pageCache = {};
 async function loadPage(tab) {
   if (_pageCache[tab]) return _pageCache[tab];
   try {
-    const r = await fetch(`/static/pages/${tab}.html`);
+    const r = await fetch(`/static/pages/${tab}.html`, { cache: 'no-cache' });
     if (!r.ok) throw new Error('加载失败');
     const html = await r.text();
     _pageCache[tab] = html;

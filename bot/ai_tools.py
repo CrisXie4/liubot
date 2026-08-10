@@ -25,6 +25,7 @@ DANGEROUS_TOOLS = {
     "whole_ban",
     "bot_exit",
     "set_restart",
+    "punish_violation",
 }
 
 
@@ -71,6 +72,21 @@ ALL_TOOLS = [
         "name": "count_members",
         "description": "统计群成员数量和在线情况。当有人问群有多少人、在线多少人时使用。",
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "find_member",
+        "description": (
+            "按名字（群名片或昵称）查群成员的 QQ 号。"
+            "用户只给名字（'封禁嘟嘟'/'给那个谁发私聊'/'@一下小王'）时，先用这个查 QQ，再调具体动作工具。"
+            "命中多人会返回候选清单——这时要反问用户确认是哪一个，不要自己猜、不要随便选一个就执行。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "要查的名字（群名片或昵称的片段）"},
+            },
+            "required": ["name"],
+        },
     },
     {
         "name": "get_member_info",
@@ -156,6 +172,22 @@ ALL_TOOLS = [
         },
     },
     {
+        "name": "send_sticker",
+        "description": (
+            "返回一个表情的 CQ 码（QQ大黄脸/动图/收藏的GIF），你把它放在回复文本里就能发出去。"
+            "适用场景：觉得对方可爱、被逗笑、想卖萌、表达情绪但文字不够时。"
+            "emotion 传情绪关键词，工具会优先从你收藏的表情里选合适的，没有就用QQ自带大黄脸兜底。"
+            "常用 emotion：开心/大笑/害羞/生气/哭泣/惊讶/喜欢/撒娇/调皮/安慰/无奈/卖萌/赞/鄙视/尴尬/害怕/疑问/无语/庆祝"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "emotion": {"type": "string", "description": "情绪关键词，如 开心/无奈/赞/哭。空则随机选一个"},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "send_forward",
         "description": "发送合并转发消息。用于整理聊天记录、「总结」等场景。",
         "input_schema": {
@@ -164,18 +196,6 @@ ALL_TOOLS = [
                 "messages": {"type": "string", "description": "JSON格式的合并转发node数组"},
             },
             "required": ["messages"],
-        },
-    },
-    {
-        "name": "send_private",
-        "description": "给某人发私聊消息。发现群友发广告/违规时主动私聊提醒对方。有人需要单独沟通时使用。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "user_id": {"type": "integer", "description": "目标用户QQ号"},
-                "message": {"type": "string", "description": "私聊内容"},
-            },
-            "required": ["user_id", "message"],
         },
     },
     {
@@ -199,6 +219,7 @@ ALL_TOOLS = [
             "@某个群成员，返回 CQ 码。⚠️ 很少需要用。"
             "正在跟你说话的人不用 @（直接回就行），刚发过言的人也不用 @。"
             "只有要喊一个当前不在对话里、可能没在看群的人时才用。QQ号从「在场的人」名单里取。"
+            "只有名字、没有 QQ 号时，先调 find_member 查到 QQ 再调用本工具。"
         ),
         "input_schema": {
             "type": "object",
@@ -345,7 +366,7 @@ ALL_TOOLS = [
     },
     {
         "name": "ban_member",
-        "description": "禁言某个群成员。⚠️ 需要用户批准。",
+        "description": "禁言某个群成员。⚠️ 需要用户批准。只有名字、没有 QQ 号时，先调 find_member 查到 QQ 再调用本工具。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -357,8 +378,28 @@ ALL_TOOLS = [
         },
     },
     {
+        "name": "punish_violation",
+        "description": (
+            "一站式违规处罚：撤回消息 + 阶梯禁言 + 群里 @ 警告 + 记违规。"
+            "主人标记某人违规（广告/推广/刷屏/违规内容）时直接调这个，不要再尝试私聊对方（不是好友发不出去）。"
+            "禁言时长按累犯自动递增：第1次30分钟 → 第2次1小时 → 第3次3小时 → 第4次24小时 → 第5次踢人审批。"
+            "需要 Bot 是群管理员。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "integer", "description": "违规者 QQ 号"},
+                "user_name": {"type": "string", "description": "违规者名字（用于警告文案，可选）"},
+                "message_id": {"type": "integer", "description": "要撤回的消息 ID（0=不撤回）"},
+                "reason": {"type": "string", "description": "违规原因（如：广告推广、刷屏、色情内容）"},
+                "keywords": {"type": "array", "items": {"type": "string"}, "description": "命中的违规关键词，可选"},
+            },
+            "required": ["user_id", "reason"],
+        },
+    },
+    {
         "name": "kick_member",
-        "description": "踢出群成员。⚠️ 需要用户批准。",
+        "description": "踢出群成员。⚠️ 需要用户批准。只有名字、没有 QQ 号时，先调 find_member 查到 QQ 再调用本工具。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -381,7 +422,7 @@ ALL_TOOLS = [
     },
     {
         "name": "set_member_card",
-        "description": "修改某群成员的群昵称（群名片）。仅当机器人是群主/管理员时可用。",
+        "description": "修改某群成员的群昵称（群名片）。仅当机器人是群主/管理员时可用。只有名字、没有 QQ 号时，先调 find_member 查到 QQ 再调用本工具。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -394,7 +435,7 @@ ALL_TOOLS = [
     },
     {
         "name": "set_member_title",
-        "description": "设置某群成员的头衔。仅当机器人是群主时可用。",
+        "description": "设置某群成员的头衔。仅当机器人是群主时可用。只有名字、没有 QQ 号时，先调 find_member 查到 QQ 再调用本工具。",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -746,6 +787,28 @@ async def execute_tool(
             admins = sum(1 for m in members if m.get("role") in ("admin", "owner"))
             return f"本群共 {total} 人，其中管理员 {admins} 人"
 
+        elif tool_name == "find_member":
+            name = str(tool_input.get("name", "")).strip()
+            if not name:
+                return "要查的名字不能为空"
+            from . import identity
+            hits = await identity.find_members_by_name(bot, group_id, name)
+            if not hits:
+                return f"群里没找到叫「{name}」的人"
+            if len(hits) == 1:
+                m = hits[0]
+                display = m["card"] or m["nickname"] or str(m["qq"])
+                return f"找到了：{display} (QQ={m['qq']})"
+            # 多个候选：列出来让 AI 反问
+            lines = []
+            for m in hits:
+                display = m["card"] or m["nickname"] or str(m["qq"])
+                tag = "精确" if m["match_type"] == "exact" else "模糊"
+                role_cn = {"owner": "群主", "admin": "管理员", "member": ""}.get(m["role"], "")
+                role_str = f" 角色:{role_cn}" if role_cn else ""
+                lines.append(f"- {display} (QQ={m['qq']}, {tag}{role_str})")
+            return f"查到 {len(hits)} 个叫「{name}」的人，重名，请让用户指明具体是哪个 QQ：\n" + "\n".join(lines)
+
         elif tool_name == "get_member_info":
             uid = int(tool_input.get("user_id", 0))
             info = await bot.get_group_member_info(group_id, uid)
@@ -847,6 +910,14 @@ async def execute_tool(
             ok = await bot.set_msg_emoji_like(mid, emoji_id, set=not cancel)
             return f"表情表态 {'取消' if cancel else '已'}✓" if ok else "表态失败"
 
+        elif tool_name == "send_sticker":
+            emotion = str(tool_input.get("emotion", "") or "").strip() or "开心"
+            from . import sticker as _st
+            cq = _st.pick_emotion_face(emotion, group_id=group_id)
+            # 返回 CQ 码给 AI，让它拼进回复
+            logger.info(f"AI 选表情: emotion={emotion} → {cq[:40]}")
+            return f"[表情] {cq}（把上面的 CQ 码直接放进你的回复文本里发出去）"
+
         elif tool_name == "send_forward":
             import json
             try:
@@ -855,15 +926,6 @@ async def execute_tool(
                 return "合并转发已发送 ✓" if ok else "发送失败"
             except json.JSONDecodeError:
                 return "消息格式错误"
-
-        elif tool_name == "send_private":
-            uid = int(tool_input.get("user_id", 0))
-            msg = str(tool_input.get("message", ""))
-            if not uid or not msg:
-                return "参数不全"
-            result = await bot.send_private_msg(uid, msg)
-            logger.info(f"AI 自主操作: 私聊 {uid} → {msg[:50]}")
-            return f"私聊消息已发送 ✓" if result else "私聊发送失败"
 
         elif tool_name == "reply_msg":
             mid = int(tool_input.get("message_id", 0))
@@ -976,6 +1038,35 @@ async def execute_tool(
             if ok:
                 logger.warning(f"AI 执行了禁言: user={uid} {minutes}分钟 理由:{reason}")
             return f"已禁言 {uid} {minutes} 分钟 ({reason}) ✓" if ok else "禁言失败"
+
+        elif tool_name == "punish_violation":
+            uid = int(tool_input.get("user_id", 0))
+            uname = str(tool_input.get("user_name", "") or str(uid))
+            mid = int(tool_input.get("message_id", 0) or 0)
+            reason = str(tool_input.get("reason", "") or "违规")
+            kws = tool_input.get("keywords", []) or []
+            if not uid:
+                return "需要提供 user_id"
+            # 检查保护名单（主人/管理员永远不能罚）
+            member_info = None
+            try:
+                mi = await bot.get_group_member_info(group_id, uid)
+                member_info = mi if isinstance(mi, dict) else None
+            except Exception:
+                pass
+            from . import guardian as _g
+            if await _g.is_protected(uid, group_id, member_info, master_instructed):
+                return f"⨯ 目标 {uname} 受保护，不能处罚"
+            # 检查 bot 是否是管理员
+            from . import handler as _h
+            bot_is_admin = await _h._is_bot_admin(bot, group_id) if group_id else False
+            if not bot_is_admin:
+                return "⨯ Bot 不是管理员，无法执行处罚"
+            from . import punish as _p
+            return await _p.punish_violation(
+                bot, group_id, uid, uname, mid, reason,
+                bot_is_admin=True, keywords=kws,
+            )
 
         elif tool_name == "kick_member":
             uid = int(tool_input.get("user_id", 0))

@@ -13,7 +13,7 @@ from . import (
     chat, violation, automod, trainer, blacklist, learner, memory, db,
     image_mod, cache, sticker, media_reader, quote_handler,
     group_personality, decision_engine, influence, welcome, guardian,
-    llm_mod, ai_brain, humanizer,
+    llm_mod, ai_brain, humanizer, group_events,
 )
 from .config import config
 from .onebot_client import OneBotClient
@@ -162,7 +162,7 @@ async def _build_roster(
     quoted_qq = int((quoted_context or {}).get("sender_qq") or 0)
     quoted_name = (quoted_context or {}).get("sender_name", "")
     try:
-        return await _get_identity().build_roster(
+        roster = await _get_identity().build_roster(
             bot, group_id,
             speaker_qq=user_id, speaker_name=user_name,
             mentioned_qqs=mentioned,
@@ -171,7 +171,16 @@ async def _build_roster(
         )
     except Exception as e:
         logger.debug(f"花名册构建失败: {e}")
-        return f"【正在跟你说话的人】{user_name} (QQ={user_id})"
+        roster = f"【正在跟你说话的人】{user_name} (QQ={user_id})"
+
+    # 拼接群事件感知块（有事件时才加）
+    try:
+        events_block = group_events.build_recent_events_block(group_id)
+        if events_block:
+            roster = f"{roster}\n{events_block}" if roster else events_block
+    except Exception:
+        pass
+    return roster
 
 
 def _is_at_bot(message: list[dict], bot_qq: str) -> bool:
@@ -370,6 +379,9 @@ async def handle_notice(bot: OneBotClient, event: dict):
         except Exception:
             pass
 
+        # 🧠 群事件感知：记录入群（无论后续是否被黑名单踢，事件本身发生了）
+        group_events.record(group_id, "join", target_qq, nickname)
+
         # 入群验证：检查是否在黑名单
         if blacklist.is_blacklisted(target_qq, group_id):
             try:
@@ -423,6 +435,7 @@ async def handle_notice(bot: OneBotClient, event: dict):
         if sub_type == "kick" or sub_type == "kick_me":
             # 被踢
             logger.info(f"群{group_id} {nickname}({target_qq}) 被踢出")
+            group_events.record(group_id, "kick", target_qq, nickname)
         else:
             # 主动退群
             leave_msg = welcome.get_leave_message(group_id, nickname, target_qq)
@@ -432,16 +445,24 @@ async def handle_notice(bot: OneBotClient, event: dict):
                     logger.info(f"群{group_id} 成员 {nickname}({target_qq}) 退群")
                 except Exception as e:
                     logger.warning(f"发送退群通知失败: {e}")
+            group_events.record(group_id, "leave", target_qq, nickname)
 
     elif notice_type == "group_ban":
         sub_type = event.get("sub_type", "")
         duration = event.get("duration", 0)
         target_qq = event.get("user_id", 0)
+        try:
+            tgt_name = _get_identity().peek_name(group_id, target_qq) or str(target_qq)
+        except Exception:
+            tgt_name = str(target_qq)
         if sub_type == "ban":
             if duration > 0:
                 logger.info(f"群{group_id} {target_qq} 被禁言 {duration}s")
+                group_events.record(group_id, "mute", target_qq, tgt_name,
+                                    detail=f"{duration}s")
         elif sub_type == "lift_ban":
             logger.info(f"群{group_id} {target_qq} 被解除禁言")
+            group_events.record(group_id, "unmute", target_qq, tgt_name)
 
     elif notice_type == "group_card":
         # 有人改了群名片/昵称 → 立刻审核
@@ -494,13 +515,7 @@ async def handle_notice(bot: OneBotClient, event: dict):
                             f"命中: {', '.join(hit_words[:5])}\n"
                             f"已禁言30分钟 | 名片已改为'违规昵称' | 已提交踢人审批\n"
                             f"请立即修改！")
-                        # 私聊提醒
-                        try:
-                            await bot.send_private_msg(user_id,
-                                f"⚠️ 你在群内的名片「{card_new}」被检测为违规（第{violation_count}次）。\n"
-                                f"请尽快修改，否则将被移出群聊。")
-                        except Exception:
-                            pass
+                        # 群里已经 @ 警告过了，不再额外私聊
                     except Exception:
                         pass
                     # 通知主人
@@ -549,8 +564,13 @@ async def handle_notice(bot: OneBotClient, event: dict):
                         pass
 
     elif notice_type == "group_recall":
-        # 消息被撤回
-        pass
+        # 消息被撤回 —— 记给 AI 看
+        operator = event.get("operator_id", 0) or user_id
+        try:
+            op_name = _get_identity().peek_name(group_id, operator) or str(operator)
+        except Exception:
+            op_name = str(operator)
+        group_events.record(group_id, "recall", operator, op_name)
 
     # 戳一戳 → 回戳（兼容多种事件格式）
     if (notice_type == "notify" and event.get("sub_type") == "poke") or notice_type == "poke":
@@ -672,21 +692,8 @@ async def check_member_names(bot: OneBotClient, group_id: int, dry_run: bool = F
                                     f"（第{violation_count}/3次，满3次将被踢出）")
                             except Exception as e:
                                 logger.warning(f"昵称违规@提醒失败: {qq} {e}")
-                        # 4. 私聊提醒（独立 try，不受群消息失败影响）
-                        try:
-                            dm_text = (
-                                f"⚠️ 你在群内的昵称「{display_name}」被检测为疑似广告（第{violation_count}/3次）。\n"
-                                f"名片已被改为'违规昵称'，请尽快修改群名片，避免被移出群聊。"
-                            ) if violation_count < 3 else (
-                                f"🚫 你在群内的昵称「{display_name}」已累计违规{violation_count}次，管理员将审核是否踢出。"
-                            )
-                            ok = await bot.send_private_msg(qq, dm_text)
-                            if ok:
-                                logger.info(f"昵称违规私聊已发送: {qq}")
-                            else:
-                                logger.warning(f"昵称违规私聊失败(API): {qq} (可能未加好友)")
-                        except Exception as e:
-                            logger.warning(f"昵称违规私聊异常: {qq} {e}")
+                        # 私聊改成了群里 @ 警告（不是好友私聊发不出去）
+                        # 群里 @ 警告已在上面 send_group_msg 完成
 
                         # 第3次：创建踢人审批（不自动踢）
                         if violation_count >= 3:
@@ -1033,20 +1040,20 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                     )
                 except Exception:
                     pass
-                # 私聊提醒违规者（前2次警告，第3次踢出审批）
+                # 群里 @ 警告违规者（替代私聊——不是好友私聊发不出去）
                 v_records = db.query_violations(group_id=group_id, violator_qq=user_id)
                 strike = len(v_records) + 1
                 try:
-                    dm_msg = (
-                        f"⚠️ 你在群内的消息被检测为违规（第{strike}/3次）。\n"
+                    warn_msg = (
+                        f"[CQ:at,qq={user_id}] ⚠️ 你的消息被检测为违规（第{strike}/3次）。\n"
                         f"原因: {reason}\n"
                         f"请遵守群规，满3次将被移出群聊。"
                     ) if strike < 3 else (
-                        f"🚫 你在群内的消息已累计违规{strike}次，管理员将审核是否踢出。"
+                        f"[CQ:at,qq={user_id}] 🚫 你已累计违规{strike}次，管理员将审核是否踢出。"
                     )
-                    await bot.send_private_msg(user_id, dm_msg)
+                    await bot.send_group_msg(group_id, warn_msg)
                 except Exception:
-                    pass  # 私聊失败不阻断
+                    pass  # 群警告失败不阻断
 
             # ── 分级动作: 警告 / 禁言 / 审批踢人 ──
             # 注意: LLM 经常返回 "warn"，但 warn 也应该禁言（短时间）

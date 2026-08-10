@@ -48,6 +48,9 @@ async def security_headers_middleware(request: Request, call_next):
     for key, value in SECURITY_HEADERS.items():
         if value:
             response.headers[key] = value
+    # HTML 片段（动态注入的页面）不缓存，避免更新后浏览器仍用旧版本
+    if request.url.path.endswith(".html") or request.url.path in ("/", "/index.html"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
     for h in ("X-Powered-By", "Server"):
         try: del response.headers[h]
         except (KeyError, TypeError): pass

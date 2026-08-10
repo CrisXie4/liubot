@@ -1,5 +1,11 @@
 <!-- LOGS -->
 <div class="card panel">
+  <div class="panel-h"><div class="fr">
+    <div class="fg" style="max-width:120px"><label>行数</label><input type="number" id="log-lines" value="200" min="1" max="2000"></div>
+    <div class="fg" style="max-width:120px"><label>级别</label><select id="log-level"><option value="">全部</option><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select></div>
+    <button class="btn pri" onclick="logLoad()">刷新</button>
+    <label class="tog"><input type="checkbox" id="log-auto" onchange="logToggleAuto()"><span class="sw"></span>自动刷新<span class="lab-off">关</span><span class="lab-on">开</span></label>
+  </div></div>
   <div class="panel-b np">
     <pre class="code" id="log-out" style="border:0;border-radius:0">点击刷新加载…</pre>
   </div>

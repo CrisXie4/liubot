@@ -282,22 +282,25 @@ async function envEditSensitive(k) {
 let _logTimer = null;
 
 async function logLoad() {
-  const lines = $('log-lines').value, level = $('log-level').value;
+  const lines = $('log-lines')?.value || '200';
+  const level = $('log-level')?.value || '';
   try {
     const d = await api('/logs?lines=' + lines + '&level=' + encodeURIComponent(level));
-    if (!d.ok) { $('log-out').textContent = '加载失败: ' + (d.error || ''); return; }
-    $('log-out').innerHTML = (d.lines || []).map(l => {
+    if (!d.ok) { const o = $('log-out'); if (o) o.textContent = '加载失败: ' + (d.error || ''); return; }
+    const o = $('log-out');
+    if (!o) return;
+    o.innerHTML = (d.lines || []).map(l => {
       let cls = 'muted';
       if (l.includes('| ERROR')) cls = 'err';
       else if (l.includes('| WARNING')) cls = 'warn';
       else if (l.includes('| INFO')) cls = 'info';
       return `<span style="display:block" class="${cls}">${esc(l)}</span>`;
     }).join('');
-    $('log-out').scrollTop = $('log-out').scrollHeight;
-  } catch (e) { $('log-out').textContent = '错误: ' + e.message; }
+    o.scrollTop = o.scrollHeight;
+  } catch (e) { const o = $('log-out'); if (o) o.textContent = '错误: ' + e.message; }
 }
 
-$('log-auto')?.addEventListener('change', e => {
-  if (e.target.checked) _logTimer = setInterval(logLoad, 5000);
+function logToggleAuto() {
+  if ($('log-auto')?.checked) _logTimer = setInterval(logLoad, 5000);
   else { if (_logTimer) clearInterval(_logTimer); _logTimer = null; }
-});
+}

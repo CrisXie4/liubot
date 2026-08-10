@@ -4,7 +4,7 @@
 从国内/国际 HTTP 源拉 Date 头，算系统时钟与权威时间的偏移，
 保证部署到错误 TZ/漂移的机器上 bot 仍然知道真实上海时间。
 
-启动时 + 每 30min 同步一次。每次从 10 个源里随机抽 3 个并发测，
+启动时 + 每 10min 同步一次。每次从 10 个源里随机抽 3 个并发测，
 取多数一致值。全失败则保留上次偏移；从未成功过则退回系统时钟。
 """
 import asyncio
@@ -19,21 +19,24 @@ from zoneinfo import ZoneInfo
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 # 10 个 HTTP 时间源（返回 GMT Date 头，+8 = 上海时间）
+# 注意：taobao / apple 的 Date 头长期落后真实时间 1~4 分钟（CDN 时钟漂移），
+# 会污染 3 取样多数一致判定，已剔除。下面 10 个均经实测与系统时钟偏差 < 1s。
 _TIME_SOURCES = [
     "https://www.baidu.com",
     "https://www.qq.com",
-    "https://www.taobao.com",
-    "https://www.microsoft.com",
-    "https://www.apple.com",
-    "https://www.bing.com",
-    "https://github.com",
-    "https://www.cloudflare.com",
-    "https://www.alibaba.com",
+    "https://www.163.com",
+    "https://www.sina.com.cn",
+    "https://www.jd.com",
     "https://www.sohu.com",
+    "https://www.alibaba.com",
+    "https://www.microsoft.com",
+    "https://www.bing.com",
+    "https://www.cloudflare.com",
 ]
 
-_SYNC_INTERVAL = 1800          # 30 分钟
+_SYNC_INTERVAL = 600           # 10 分钟
 _SAMPLE_SIZE = 3               # 每次随机抽 3 个
+_MAX_ATTEMPTS = 2              # 一轮采样分歧时最多重试次数（每轮重新抽 3 个）
 _SOURCE_TIMEOUT = 8            # 单源超时 8s
 _MAX_TOLERANCE = timedelta(seconds=2)  # 源间最大允许偏差；超差则放弃本次
 
@@ -88,58 +91,82 @@ async def _fetch_source_time(url: str, session) -> Optional[datetime]:
 
 
 async def sync_once() -> tuple[Optional[timedelta], str]:
-    """同步一次。返回 (偏移量, 状态描述)。偏移量 None = 失败。"""
+    """同步一次。返回 (偏移量, 状态描述)。偏移量 None = 失败。
+
+    从 10 个源里随机抽 3 个；若三者全不一致（>2s），换 3 个重新抽，
+    最多 _MAX_ATTEMPTS 轮。避免少数坏源（偶发 CDN 时钟漂移）污染同步。
+    """
     import aiohttp
 
     global _offset, _last_sync_ts, _last_sources, _sync_count, _fail_count
 
-    sampled = random.sample(_TIME_SOURCES, min(_SAMPLE_SIZE, len(_TIME_SOURCES)))
-    sys_utc_before = datetime.now(timezone.utc)  # 以发请求前的系统时钟为基准
     async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(
-            *[_fetch_source_time(u, session) for u in sampled]
-        )
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            sampled = random.sample(_TIME_SOURCES, min(_SAMPLE_SIZE, len(_TIME_SOURCES)))
+            # 每轮重新取系统时钟基准，减少跨轮延迟引入的误差
+            sys_utc_before = datetime.now(timezone.utc)
+            results = await asyncio.gather(
+                *[_fetch_source_time(u, session) for u in sampled]
+            )
 
-    # 过滤失败的
-    pairs = [(u, t) for u, t in zip(sampled, results) if t is not None]
-    if not pairs:
-        _fail_count += 1
-        return None, "all_sources_failed"
+            pairs = [(u, t) for u, t in zip(sampled, results) if t is not None]
+            if not pairs:
+                _fail_count += 1
+                return None, "all_sources_failed"
 
-    # 每个源算出的偏移 = 源时间 - 系统时间（用同一基准 sys_utc_before，避免把网络延迟算进偏移）
-    offsets = [(u, t - sys_utc_before) for u, t in pairs]
+            offsets = [(u, t - sys_utc_before) for u, t in pairs]
+            consensus = _reach_consensus(offsets)
+            if consensus is not None:
+                consensus_offset, winning = consensus
+                _offset = consensus_offset
+                _last_sync_ts = time.time()
+                _last_sources = winning
+                _sync_count += 1
+                logger.info(
+                    f"timeutil 同步成功: 偏移={consensus_offset.total_seconds():+.1f}s "
+                    f"来源={_last_sources}"
+                )
+                return consensus_offset, "ok"
 
-    # 取多数一致：把偏移量化到秒，找出现次数最多的
-    by_sec = {}
+            # 本轮分歧：记录后重试（如果还有次数）
+            detail = {u: round(o.total_seconds()) for u, o in offsets}
+            logger.debug(f"timeutil 第{attempt}/{_MAX_ATTEMPTS}轮采样分歧: {detail}")
+
+    _fail_count += 1
+    return None, "sources_disagree"
+
+
+def _reach_consensus(offsets: list[tuple[str, timedelta]]):
+    """从 [(url, offset)] 取多数一致偏移量。
+
+    返回 (offset, [winning_urls]) 或 None（分歧）。
+    - >=2 个源一致 → 采纳（含"2 对 1"中 2 个一致的多数）
+    - 仅 1 个有效源 → 采纳（聊胜于无）
+    - 多个源且全不一致、最大偏差 > 容差 → None（交由上层重试）
+    """
+    if not offsets:
+        return None
+    by_sec: dict[int, list[tuple[str, timedelta]]] = {}
     for u, off in offsets:
         sec = round(off.total_seconds())
         by_sec.setdefault(sec, []).append((u, off))
 
-    # 选票数最多且与第二差距满足多数的
     best_sec = max(by_sec, key=lambda s: len(by_sec[s]))
     winners = by_sec[best_sec]
 
-    # 若多数组只有 1 个源、且源间偏差 > 容差，判为不一致
-    if len(winners) == 1 and len(offsets) > 1:
-        secs = [round(o.total_seconds()) for _, o in offsets]
-        if max(secs) - min(secs) > _MAX_TOLERANCE.total_seconds():
-            _fail_count += 1
-            return None, "sources_disagree"
+    if len(winners) >= 2:
+        return winners[0][1], [u for u, _ in winners]
+    if len(offsets) == 1:
+        return winners[0][1], [u for u, _ in winners]
 
-    consensus_offset = winners[0][1]
-    _offset = consensus_offset
-    _last_sync_ts = time.time()
-    _last_sources = [u for u, _ in winners]
-    _sync_count += 1
-    logger.info(
-        f"timeutil 同步成功: 偏移={consensus_offset.total_seconds():+.1f}s "
-        f"来源={_last_sources}"
-    )
-    return consensus_offset, "ok"
+    secs = [round(o.total_seconds()) for _, o in offsets]
+    if max(secs) - min(secs) > _MAX_TOLERANCE.total_seconds():
+        return None
+    return winners[0][1], [u for u, _ in winners]
 
 
 async def start_background_sync():
-    """启动后台同步：启动后立即一次 + 每 30min 一次。永不退出。"""
+    """启动后台同步：启动后立即一次 + 每 10min 一次。永不退出。"""
     # 立即同步一次（启动后尽快拿到准确时间）
     try:
         off, status = await sync_once()

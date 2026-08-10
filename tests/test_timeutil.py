@@ -10,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bot import timeutil
+from datetime import datetime, timezone
 
 
 class TestTimeUtil(unittest.TestCase):
@@ -55,6 +56,52 @@ class TestTimeUtil(unittest.TestCase):
     def test_sample_size_within_bounds(self):
         self.assertLessEqual(timeutil._SAMPLE_SIZE, len(timeutil._TIME_SOURCES))
 
+    def test_no_known_stale_sources(self):
+        """taobao / apple 的 Date 头长期落后真实时间，不得出现在源列表里"""
+        for bad in ("taobao.com", "apple.com"):
+            self.assertFalse(
+                any(bad in u for u in timeutil._TIME_SOURCES),
+                f"源列表不应包含已知时钟漂移源 {bad}",
+            )
+
+
+class TestReachConsensus(unittest.TestCase):
+    """_reach_consensus: 多数一致判定"""
+
+    def test_majority_two_of_three_wins(self):
+        """2 个一致、1 个离群 → 取多数"""
+        off_good = timedelta(seconds=0)
+        off_bad = timedelta(seconds=-100)
+        offsets = [
+            ("https://a", off_good),
+            ("https://b", off_good),
+            ("https://c", off_bad),
+        ]
+        res = timeutil._reach_consensus(offsets)
+        self.assertIsNotNone(res)
+        off, winning = res
+        self.assertEqual(off, off_good)
+        self.assertIn("https://a", winning)
+        self.assertIn("https://b", winning)
+        self.assertNotIn("https://c", winning)
+
+    def test_all_disagree_returns_none(self):
+        """三者全不一致且超容差 → None（交由上层重试）"""
+        offsets = [
+            ("https://a", timedelta(seconds=0)),
+            ("https://b", timedelta(seconds=-100)),
+            ("https://c", timedelta(seconds=-200)),
+        ]
+        self.assertIsNone(timeutil._reach_consensus(offsets))
+
+    def test_single_source_accepted(self):
+        """只有 1 个有效源 → 采纳（聊胜于无）"""
+        offsets = [("https://a", timedelta(seconds=5))]
+        res = timeutil._reach_consensus(offsets)
+        self.assertIsNotNone(res)
+        off, winning = res
+        self.assertEqual(off, timedelta(seconds=5))
+
 
 class TestSyncOnce(unittest.TestCase):
 
@@ -66,6 +113,31 @@ class TestSyncOnce(unittest.TestCase):
             off, status = asyncio.run(timeutil.sync_once())
         self.assertIsNone(off)
         self.assertEqual(status, "all_sources_failed")
+
+    def test_retry_on_disagreement_then_success(self):
+        """第 1 轮 3 个源全不一致 → 重试；第 2 轮 2 个一致 → 成功"""
+        sys_base = datetime.now(timezone.utc)
+
+        def src_time(sec_off):
+            return sys_base + timedelta(seconds=sec_off)
+
+        call = {"n": 0}
+
+        async def fake_fetch(url, session):
+            call["n"] += 1
+            # 前 3 次（第 1 轮）：全不一致
+            if call["n"] <= 3:
+                return src_time([-100, 0, -200][call["n"] - 1])
+            # 后 3 次（第 2 轮）：两个一致
+            return src_time([0, 0, -5][call["n"] - 4])
+
+        with patch.object(timeutil, "_fetch_source_time", fake_fetch):
+            off, status = asyncio.run(timeutil.sync_once())
+        self.assertEqual(status, "ok")
+        self.assertIsNotNone(off)
+        # 偏移应在 0 附近（第 2 轮多数值）
+        self.assertLess(abs(off.total_seconds()), 5)
+        self.assertEqual(call["n"], 6)  # 两轮各 3 次
 
 
 if __name__ == "__main__":

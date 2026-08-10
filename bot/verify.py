@@ -35,6 +35,9 @@ VERIFY_TIMEOUT = 300  # 5 分钟
 # ─── 每群最多同时验证人数 ───
 MAX_PER_GROUP = 5
 
+# ─── 每个新人最多答错次数（第 N+1 次错才踢）───
+MAX_WRONG_ATTEMPTS = 2
+
 
 def _get_client():
     """获取 Anthropic 客户端（委托给 llm_call 共享客户端）"""
@@ -153,6 +156,7 @@ async def handle_member_increase(bot, event: dict):
         "answer": answer,
         "user_name": user_name,
         "created_at": time.time(),
+        "wrong_attempts": 0,
     }
     _used_questions.add(question)
 
@@ -234,18 +238,30 @@ async def handle_group_verify_answer(bot, event: dict) -> bool:
 
     logger.info(f"🔑 验证回答: {user_name}({user_id}) → \"{raw[:30]}\" (题: {question[:20]})")
 
-    # AI 判题
-    try:
-        is_correct, reason = await _judge_answer(question, expected, raw)
-    except Exception as e:
-        logger.error(f"AI 判题失败: {e}")
-        is_correct = _simple_match(expected, raw)
-        reason = "简单匹配"
-
     from .humanizer import send_human_like
     at_seg = f"[CQ:at,qq={user_id}]"
 
-    if is_correct:
+    # 本地快速识别寒暄 → 不消耗尝试机会，提示后等真正作答
+    if _looks_like_smalltalk(raw):
+        logger.info(f"💬 验证忽略寒暄: {user_name}({user_id}) → \"{raw[:20]}\"")
+        try:
+            await send_human_like(
+                bot, group_id,
+                f"{at_seg} 请直接回答验证题哦~ 📝 {question}",
+            )
+        except Exception:
+            pass
+        return True
+
+    # AI 判题
+    try:
+        verdict, reason = await _judge_answer(question, expected, raw)
+    except Exception as e:
+        logger.error(f"AI 判题失败: {e}")
+        verdict = "correct" if _simple_match(expected, raw) else "wrong"
+        reason = "简单匹配"
+
+    if verdict == "correct":
         logger.info(f"✅ 验证通过: {user_name}({user_id}) → 群{group_id} ({reason})")
         _log_verification(user_id, user_name, group_id, "approved", question, raw, reason)
         try:
@@ -269,8 +285,36 @@ async def handle_group_verify_answer(bot, event: dict) -> bool:
             _welcome.add_points(user_id, group_id, user_name, 10, "通过加群验证")
         except Exception as e:
             logger.debug(f"加积分失败: {e}")
-    else:
-        logger.info(f"❌ 验证失败: {user_name}({user_id}) → 踢出 ({reason})")
+
+    elif verdict == "invalid":
+        # 不是答题（寒暄/闲聊/提问），不消耗尝试，温和提示
+        logger.info(f"💬 验证忽略非答案: {user_name}({user_id}) → \"{raw[:20]}\" ({reason})")
+        try:
+            await send_human_like(
+                bot, group_id,
+                f"{at_seg} 请回答验证题~ 📝 {question}",
+            )
+        except Exception:
+            pass
+        return True
+
+    else:  # wrong
+        pending["wrong_attempts"] = pending.get("wrong_attempts", 0) + 1
+        attempts = pending["wrong_attempts"]
+
+        if attempts < MAX_WRONG_ATTEMPTS:
+            remaining = MAX_WRONG_ATTEMPTS - attempts
+            logger.info(f"❌ 验证答错({attempts}/{MAX_WRONG_ATTEMPTS}): {user_name}({user_id}) → \"{raw[:20]}\"")
+            try:
+                await send_human_like(
+                    bot, group_id,
+                    f"❌ {at_seg} 答错啦，还有 {remaining} 次机会~ 📝 {question}",
+                )
+            except Exception:
+                pass
+            return True  # 继续等待重试
+
+        logger.info(f"❌ 验证失败: {user_name}({user_id}) → 踢出 ({reason}, {attempts}次错)")
         _log_verification(user_id, user_name, group_id, "rejected", question, raw, reason)
         try:
             await send_human_like(
@@ -307,14 +351,22 @@ async def _generate_question() -> tuple[str, str]:
         used_hint = "\n\n【已出过的题目，不要重复】\n" + "\n".join(f"  - {q}" for q in recent)
 
     system_prompt = (
-        "你是一个QQ群加群验证的出题助手。你需要生成一道简单的问题来验证申请人是否是真人。\n\n"
-        "要求：\n"
-        "- 题目简单，普通人5秒内能答对\n"
-        "- 答案明确，不超过5个字\n"
-        "- 不能问个人信息（名字、年龄、性别等）\n"
-        "- 可以是：常识、简单计算、成语补全、猜谜、脑筋急转弯等\n"
-        "- 题目用中文\n"
-        "- 不要出太难的题目，目的只是过滤机器人\n"
+        "你是QQ群加群验证的出题助手。生成一道题验证申请人是否真人。\n\n"
+        "硬性要求（违反就是bug）：\n"
+        "- 答案必须唯一且明确，全宇宙只有一种正确表述\n"
+        "- 答案不超过5个字\n"
+        "- 普通人5秒内能答对\n"
+        "- 只允许以下题型：\n"
+        "    * 简单算术（如 7+8、12-5）\n"
+        "    * 公认常识（如首都、季节、一周几天、太阳升起方向）\n"
+        "    * 常识性事实（动物的叫声、常见物品颜色）\n"
+        "- 题目用中文\n\n"
+        "严禁出现（这些会导致用户答对却被误判踢出）：\n"
+        "- 脑筋急转弯、谜语、歇后语\n"
+        "- 文学/影视/历史/神话人物相关问题（如猪八戒、李白相关）\n"
+        "- 答案有多个合理表述的题（如\"水中月/倒影/影子\"）\n"
+        "- 主观题、开放题、需要解释的题\n"
+        "- 个人信息题（名字、年龄等）\n"
         f"{used_hint}\n\n"
         '返回纯JSON，不要Markdown代码块: {"question": "题目", "answer": "答案"}'
     )
@@ -322,7 +374,7 @@ async def _generate_question() -> tuple[str, str]:
     response = await llm_call.llm_create(
         model=ms.get("model", "glm-5.2-free"),
         max_tokens=150,
-        temperature=1.0,
+        temperature=0.6,
         system=system_prompt,
         messages=[{"role": "user", "content": "出一道验证题"}],
     )
@@ -342,21 +394,30 @@ async def _generate_question() -> tuple[str, str]:
     return question, answer
 
 
-async def _judge_answer(question: str, expected: str, user_answer: str) -> tuple[bool, str]:
-    """AI 判题（语义匹配，不要求字面完全一致）。"""
+async def _judge_answer(question: str, expected: str, user_answer: str) -> tuple[str, str]:
+    """
+    AI 判题。返回 (verdict, reason)。
+    verdict ∈ {"correct", "wrong", "invalid"}
+      - correct: 答案正确
+      - wrong:   是在答题，但答错了
+      - invalid: 根本不是在答题（寒暄、闲聊、表情、提问等），不应消耗尝试机会
+    """
     client = _get_client()
     if client is None:
-        return _simple_match(expected, user_answer), "简单匹配"
+        # 兜底：无法判别时用简单匹配，匹配不上算 wrong（保守踢人由重试次数兜底）
+        return ("correct" if _simple_match(expected, user_answer) else "wrong"), "简单匹配"
 
     from .memory import load_model_settings
     ms = load_model_settings()
 
     system_prompt = (
-        "判断用户的回答是否与正确答案语义一致。"
-        "答案的表述方式可以不同，只要意思对就算正确。"
-        "比如正确答案是\"4\"，回答\"四\"也算对。"
-        "比如正确答案是\"李白\"，回答\"诗仙李白\"也算对。"
-        '返回纯JSON: {"correct": true/false, "reason": "一句话说明理由"}'
+        "你在判QQ群加群验证的答题。分三步：\n"
+        "1. 先判断用户是否真的在回答这道题。如果是寒暄（你好/哈喽/大家好/谢谢）、"
+        "闲聊、提问、求助、表情符号、与题目无关的话，verdict=\"invalid\"。\n"
+        "2. 如果是在答题，判断答案是否与正确答案语义一致（表述可不同，如\"4\"和\"四\"都算对）。\n"
+        "   对 → verdict=\"correct\"，错 → verdict=\"wrong\"。\n"
+        "3. 不确定时倾向判 invalid（给用户重试机会），不要轻易判 wrong。\n\n"
+        '返回纯JSON: {"verdict": "correct|wrong|invalid", "reason": "一句话说明"}'
     )
 
     response = await llm_call.llm_create(
@@ -366,7 +427,7 @@ async def _judge_answer(question: str, expected: str, user_answer: str) -> tuple
         system=system_prompt,
         messages=[{
             "role": "user",
-            "content": f"问题: {question}\n正确答案: {expected}\n用户回答: {user_answer}"
+            "content": f"题目: {question}\n正确答案: {expected}\n用户说的: {user_answer}"
         }],
     )
 
@@ -376,7 +437,28 @@ async def _judge_answer(question: str, expected: str, user_answer: str) -> tuple
     text = text.strip()
 
     result = json.loads(text)
-    return result.get("correct", False), result.get("reason", "")
+    verdict = result.get("verdict", "wrong").strip().lower()
+    if verdict not in ("correct", "wrong", "invalid"):
+        verdict = "wrong"
+    return verdict, result.get("reason", "")
+
+
+def _looks_like_smalltalk(text: str) -> bool:
+    """本地快速识别明显寒暄，避免每条都打 AI（省钱+省时）"""
+    t = re.sub(r"\s", "", text).lower()
+    if not t or len(t) > 12:
+        return False
+    # 纯表情/CQ 码
+    if re.fullmatch(r"(\[cq:[^\]]+\]|:\d+:|[\U0001F300-\U0001FAFF\U00002600-\U000027BF])+", text, re.I):
+        return True
+    smalltalk = {
+        "你好", "您好", "哈喽", "hello", "hi", "嗨", "大家好", "各位好",
+        "谢谢", "感谢", "thanks", "thx", "多谢",
+        "在吗", "有人吗", "有人", "在",
+        "好的", " ok", "ok", "嗯", "哦", "额", "嗨喽",
+        "新人", "报到", "冒泡", "进群了",
+    }
+    return t in smalltalk
 
 
 def _simple_match(expected: str, user_answer: str) -> bool:
