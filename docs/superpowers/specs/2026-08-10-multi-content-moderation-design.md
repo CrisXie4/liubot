@@ -93,11 +93,13 @@ async def extract_full_content(
     返回:
     {
       "text": str,                                  # 本条消息可见文本
-      "images": [{"url": str, "file_id": str}],     # 本条消息直带的图片
+      "images": [{"url": str, "file_id": str}],     # 本条消息直带的图片（含 GIF）
+      "stickers": [{"url": str, "summary": str}],   # 本条消息的 mface 商城表情
       "has_forward": bool,
       "forward": {                                  # 仅当存在合并转发
         "text": str,                                # 所有子消息文本拍平拼接
-        "images": [{"url": str}],                   # 所有子消息里的图片
+        "images": [{"url": str}],                   # 所有子消息里的图片（含 GIF）
+        "stickers": [{"url": str, "summary": str}], # 所有子消息里的 mface
         "count": int,                               # 子消息条数
         "nested": bool,                             # 是否含嵌套转发
       } | None,
@@ -105,6 +107,11 @@ async def extract_full_content(
     }
     """
 ```
+
+**注意 — 不审核的内容类型**：
+- `face`（QQ 基础小表情如 😊，只有 id 无 url，不可能含广告）→ 提取器跳过。
+- `record`（语音）→ 本期不审（API 不支持音频，未来可考虑 ASR）。
+- `video`（视频）→ 沿用现有 `analyze_video` 走缩略图审核，不在本期扩展。
 
 **转发解析逻辑**：
 1. 用正则识别 `[CQ:forward,id=<resId>]`，可能多条。
@@ -135,49 +142,63 @@ if content["has_forward"]:
     fwd = content["forward"]
     effective_text += "\n[合并转发]\n" + fwd["text"]
 
-# 并行跑：文本审核 + 图片 Vision 审核
-all_images = content["images"] + (
-    content["forward"]["images"] if content["has_forward"] else []
-)
+# 并行跑：文本审核 + 全量图片/表情/GIF 审核
+# 收集所有待审媒体：本条消息的 + 合并转发包内的
+all_images = list(content["images"])                       # 普通 image（含 GIF）
+all_stickers = list(content["stickers"])                   # mface 商城表情
+if content["has_forward"]:
+    all_images += content["forward"]["images"]
+    all_stickers += content["forward"]["stickers"]
 
-async def _no_image() -> Optional[dict]:
-    return None
+# mface（商城表情）按图片处理（带 summary 作为 caption）
+for s in all_stickers:
+    if s.get("url"):
+        all_images.append({
+            "url": s["url"], "file_id": "",
+            "caption_hint": s.get("summary", ""),  # 表情自带的文字标签
+            "is_sticker": True,
+        })
 
-async def _audit_first_image() -> Optional[dict]:
-    """自动审核路径只审第一张图（延迟预算紧）。失败返回 None。"""
-    if not all_images or _is_owner(user_id) or _is_official_account(user_id):
-        return None
-    return await image_mod.review_image_with_fallback(
-        bot, all_images[0]["file_id"], all_images[0]["url"], caption=effective_text
-    )
+# 排除主人和官方账号
+owner_or_official = _is_owner(user_id) or _is_official_account(user_id)
 
 text_task = llm_mod.llm_moderate(
     effective_text, group_id=group_id, user_id=user_id,
     force_llm=should_recall,
 )
-text_result, image_result = await asyncio.gather(
-    text_task, _audit_first_image(), return_exceptions=True
+image_task = _audit_all_media(all_images) if (all_images and not owner_or_official) else _no_media()
+text_result, image_results = await asyncio.gather(
+    text_task, image_task, return_exceptions=True
 )
 ```
 
-> **图数策略的对称性说明**：自动审核只审第一张图（消息处理路径紧延迟），手动标记审最多 3 张（owner 主动触发可放宽延迟）。这是有意的非对称设计。
+**`_audit_all_media` 行为（新增辅助函数，定义在 `content_reader.py` 或 `image_mod.py`）**：
+- 把所有图片当作独立审核单元，**全部都审**（无"只审第一张"的偷工）。
+- 用 `asyncio.Semaphore(5)` 控并发，避免一条消息 10 张图打爆 API。
+- 单条消息媒体单元硬上限 20（极端刷屏保护）。超出按出现顺序取前 20 个，记日志。
+- 每个单元返回 `Optional[dict]`；最终过滤 `None`，得 `list[dict]`（可能为空）。
+- GIF 在 `review_image_with_fallback` 内部拆关键帧（见 4.3.GIF），对调用方透明。
+- 每个媒体结果独立缓存（按 URL），同一张广告图 24h 内不重审。
 
 ```python
-# 图片 Vision 结果融合
-if isinstance(image_result, dict) and image_result:
-    img_is_v = image_result.get("is_violation", False)
-    img_conf = float(image_result.get("confidence", 0))
-    if img_is_v and img_conf >= 0.7:
-        final_violation = True
-        final_confidence = max(final_confidence, img_conf)
-        final_source = "image_vision"
-        final_reason = image_result.get("reason", "") or final_reason
-        # 把图片违规类型 + OCR 文字并入特征词，让撤回公告有词可显示
-        img_keywords = [image_result.get("violation_type", "")]
-        ocr_text = image_result.get("ocr_text", "")
-        if ocr_text:
-            ocr_keywords = violation.extract_keywords(ocr_text, top_n=5)
-            combined_hits = list(set(combined_hits + img_keywords + ocr_keywords))
+# 图片 Vision 结果融合（image_results 是 list[dict]）
+if isinstance(image_results, list):
+    for image_result in image_results:
+        if not image_result:
+            continue
+        img_is_v = image_result.get("is_violation", False)
+        img_conf = float(image_result.get("confidence", 0))
+        if img_is_v and img_conf >= 0.7:
+            final_violation = True
+            final_confidence = max(final_confidence, img_conf)
+            final_source = "image_vision"
+            final_reason = image_result.get("reason", "") or final_reason
+            img_keywords = [image_result.get("violation_type", "")]
+            ocr_text = image_result.get("ocr_text", "")
+            if ocr_text:
+                ocr_keywords = violation.extract_keywords(ocr_text, top_n=5)
+                combined_hits = list(set(combined_hits + img_keywords + ocr_keywords))
+            break  # 任一媒体判违规即整体撤回，不再叠加
 ```
 
 **撤回策略**：
@@ -219,6 +240,45 @@ async def review_image_with_fallback(
 
 **集成**：4.2 节的 `image_task` 改调 `review_image_with_fallback` 而非 `review_image_with_ai`。
 
+**GIF 动图关键帧提取（新增）**：
+
+OneBot 把 GIF 当 `[CQ:image,file=xxx.gif,url=...]` 下发，无法从 CQ 码区分静态图与动图。`review_image_with_fallback` 在下载图片后用 PIL 探测：
+
+```python
+from PIL import Image
+import io
+
+async def _extract_gif_frames(raw_bytes: bytes) -> list[bytes]:
+    """GIF → 多帧 PNG bytes。非 GIF 返回 [raw_bytes]。
+    帧数策略：≤3 帧全提；>3 帧取首帧 + 中间帧 + 末帧（覆盖率高、API 调用克制）。
+    """
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        n = getattr(img, "n_frames", 1)
+        if n <= 1:
+            return [raw_bytes]  # 静态图
+        picks = [0] if n <= 3 else [0, n // 2, n - 1]
+        frames = []
+        for idx in picks:
+            img.seek(idx)
+            png = io.BytesIO()
+            img.convert("RGB").save(png, format="PNG")
+            frames.append(png.getvalue())
+        return frames
+    except Exception:
+        return [raw_bytes]
+```
+
+**GIF 审核策略**：
+- 每帧独立送 Vision；任一帧判违规 → 整张 GIF 判违规（取最高 confidence）。
+- 多帧结果按 OR 聚合（`is_violation` 任一 True 即 True，`ocr_text` 拼接，`reason` 取违规帧的）。
+- 关键帧 ≤ 3，避免一个 50 帧 GIF 烧 50 次 API。
+- 探测失败（PIL 无法解码）→ 降级走静态图路径（直接送原始 bytes 给 Vision）。
+
+**mface（商城表情）审核**：
+- `mface` 的 `url` 指向表情图（PNG/WebP），直接当图片审。
+- `summary`（表情文字标签，如 "[委屈]"）作为 caption 喂给 Vision，帮助识别"文字+图"组合的广告。
+
 **24h 缓存**：
 - 新增 `IMAGE_MOD_CACHE_PATH = data/image_mod_cache.json`，key = image_url，value = `{result, analyzed_at, source}`。
 - TTL 24 小时，避免对同一张被反复传播的广告图重复调 Vision。
@@ -237,21 +297,27 @@ effective_text = content["text"]
 if content["has_forward"]:
     effective_text += "\n[合并转发]\n" + content["forward"]["text"]
 
-# --- 图片+转发图：走 Vision（三级降级） ---
-all_images = content["images"] + (
-    content["forward"]["images"] if content["has_forward"] else []
-)
+# --- 图片+转发图+表情：走 Vision（三级降级），全审 ---
+all_images = list(content["images"])
+all_stickers = list(content["stickers"])
+if content["has_forward"]:
+    all_images += content["forward"]["images"]
+    all_stickers += content["forward"]["stickers"]
+for s in all_stickers:
+    if s.get("url"):
+        all_images.append({"url": s["url"], "file_id": "",
+                           "caption_hint": s.get("summary", "")})
+
 if all_images:
-    vision_results = []
-    for img in all_images[:3]:  # 最多 3 张，避免超时
-        vision = await image_mod.review_image_with_fallback(
-            bot, img.get("file_id", ""), img.get("url", ""), caption=effective_text
-        )
-        if vision:
-            vision_results.append(vision)
-            ocr = vision.get("ocr_text", "")
-            if ocr:
-                effective_text += "\n[图片内容] " + ocr
+    # 复用自动审核路径的 _audit_all_media（同 semaphore + 同缓存）
+    from .image_mod import _audit_all_media
+    vision_results = await _audit_all_media(all_images) or []
+    for vr in vision_results:
+        if not vr:
+            continue
+        ocr = vr.get("ocr_text", "")
+        if ocr:
+            effective_text += "\n[图片内容] " + ocr
 
 # --- 分析特征 ---
 analysis = analyze_violation_message(effective_text)
@@ -370,10 +436,10 @@ if is_whitelisted(user_id, group_id):
 
 | 测试文件 | 覆盖点 |
 |---------|--------|
-| `tests/test_content_reader.py` | 1. 从 `[CQ:forward,id=xxx]` 能拿到子消息（mock `bot.get_forward_msg`）<br>2. 嵌套 forward 深度上限 3（构造 5 层嵌套的 mock 数据，验证到第 3 层停止）<br>3. 子消息条数上限 50（mock 60 条子消息）<br>4. resId 过期时返回 `errors` 且 `forward.text` 含占位符<br>5. 图片 URL 提取正确<br>6. 多 forward 包混合文本的正确拼接 |
+| `tests/test_content_reader.py` | 1. 从 `[CQ:forward,id=xxx]` 能拿到子消息（mock `bot.get_forward_msg`）<br>2. 嵌套 forward 深度上限 3（构造 5 层嵌套的 mock 数据，验证到第 3 层停止）<br>3. 子消息条数上限 50（mock 60 条子消息）<br>4. resId 过期时返回 `errors` 且 `forward.text` 含占位符<br>5. 图片 URL 提取正确<br>6. 多 forward 包混合文本的正确拼接<br>7. mface 表情被归入 `stickers`（含 url + summary）<br>8. `face` 类型被跳过（不出现在 images/stickers） |
 | `tests/test_verify_whitelist.py` | 1. `is_whitelisted` global / by_group 两层匹配<br>2. `add_whitelist(group_id=0)` 写 global<br>3. `add_whitelist(group_id=N)` 写 by_group<br>4. `remove_whitelist` 后查询返回 False<br>5. 持久化文件格式符合 schema |
-| `tests/test_image_fallback.py` | 1. Vision 成功 → 直接返回，不调 OCR<br>2. Vision 抛超时 → 触发 OCR（mock）<br>3. OCR 拿到文字 → 触发 llm_moderate<br>4. 全失败 → 返回 None<br>5. 缓存命中 → 不重复调 API |
-| `tests/test_handler_integration.py` | 1. 图片消息走并行审核路径（gather 被调用）<br>2. Vision 判违规 → `final_violation` 被覆盖为 True<br>3. 转发消息 effective_text 含子消息文本 |
+| `tests/test_image_fallback.py` | 1. Vision 成功 → 直接返回，不调 OCR<br>2. Vision 抛超时 → 触发 OCR（mock）<br>3. OCR 拿到文字 → 触发 llm_moderate<br>4. 全失败 → 返回 None<br>5. 缓存命中 → 不重复调 API<br>6. **GIF 5 帧时只抽 3 帧**（首/中/末）；**GIF 2 帧时全抽**<br>7. **`_audit_all_media` 11 张图时并发上限 5**（用 mock 验证同时 in-flight ≤ 5）<br>8. **`_audit_all_media` 25 张图时截到前 20**（防刷屏保护） |
+| `tests/test_handler_integration.py` | 1. 图片消息走并行审核路径（gather 被调用）<br>2. **多图消息：所有图都被审**（mock 验证 review_image_with_fallback 被调 N 次）<br>3. **任一图判违规 → `final_violation` 被覆盖为 True**<br>4. **mface 消息：url 被当作图片送审**<br>5. 转发消息 effective_text 含子消息文本 |
 
 **手动验证脚本**：`scripts/smoke_test.py`（新增，可选）— 用真实事件样本（脱敏后的 raw_message + segments）跑一遍 `extract_full_content`，打印输出供人工核对。
 
@@ -403,7 +469,9 @@ if is_whitelisted(user_id, group_id):
 | GLM-5.2 的 Anthropic 端点不支持图片输入透传 | 中 | 高 | 阶段 2 第一步先用一张测试图验证；若不行则在该处切到 GLM 原生图片格式，不影响整体架构 |
 | Tesseract 在 Windows 找不到中文语言包 | 中 | 中 | 检测时同时查 `chi_sim.traineddata`；缺失时降级用英文 OCR + 记日志告警 |
 | 合并转发 resId 过期导致大量"无法解析" | 低 | 中 | 5 分钟缓存 + 错误日志；过期属正常情况，不阻塞主流程 |
-| 图片审核延迟叠加（多图 + 串行） | 中 | 中 | 单次最多审 3 张图；单条消息内多图改并行；24h 缓存降低重复成本 |
+| **多图消息审 N 张导致延迟堆积** | 中 | 中 | `Semaphore(5)` 并发；24h URL 缓存去重；单条消息媒体上限 20；GIF 仅取 ≤3 关键帧；并行 `gather` 与文本审核同时跑 |
+| **GIF 关键帧漏判（违规只在中间某帧）** | 低 | 中 | 取首+中+末三帧覆盖绝大多数情况；命中即整体违规，不再细化 |
+| **mface url 失效或防盗链** | 中 | 低 | 下载失败 → 记日志降级；不阻塞其他图审核；不影响文本审核 |
 | 现有"同意 <审批ID>"命令被误用为"同意入群" | 低 | 低 | 命令分叉：`同意 <ID>` 走 guardian 审批，`同意入群 <QQ>` 走放行；文档明确区分 |
 | 白名单 JSON 文件损坏 | 低 | 低 | 读取时 try/except，损坏时重建空文件 + 日志告警 |
 
@@ -427,12 +495,16 @@ if is_whitelisted(user_id, group_id):
 2. 群里发合并转发包含广告图片 → 自动撤回（图片走 Vision）
 3. 群里发广告图片（纯图无文字）→ 自动撤回
 4. Vision API 故障时发广告图片 → OCR 拿到文字 → 文本审核撤回
-5. 手动 `@bot 违规` 回复一条合并转发 → 特征词列表非空，存库成功
-6. 手动 `@bot 违规` 回复一条广告图片 → 特征词含图片识别的类型，存库成功
-7. `@bot 免验证 <QQ号>` → 该 QQ 重新入群时不被出题，直接欢迎
-8. 新人正在待验证时 `@bot 同意入群 <QQ号>` → 立即放行，不再触发超时踢人
-9. `@bot 免验证列表` → 正确显示全局 + 本群白名单
-10. 所有新增功能失败时不影响主消息流（已有聊天/审核命令照常工作）
+5. **群里发一条消息含多张广告图（如 5 张）→ 5 张都被审，至少一张命中即撤回**（不能只审第一张）
+6. **群里发 GIF 动图广告（违规内容在中间帧）→ 首中末关键帧抽帧审核能命中**
+7. **群里发广告类 mface 商城表情 → url 当图片送审，命中即撤回**
+8. 手动 `@bot 违规` 回复一条合并转发 → 特征词列表非空，存库成功
+9. 手动 `@bot 违规` 回复一条广告图片 → 特征词含图片识别的类型，存库成功
+10. **手动 `@bot 违规` 回复一条多图消息 → 所有图的 OCR/识别文字并入存库内容**
+11. `@bot 免验证 <QQ号>` → 该 QQ 重新入群时不被出题，直接欢迎
+12. 新人正在待验证时 `@bot 同意入群 <QQ号>` → 立即放行，不再触发超时踢人
+13. `@bot 免验证列表` → 正确显示全局 + 本群白名单
+14. 所有新增功能失败时不影响主消息流（已有聊天/审核命令照常工作）
 
 ---
 
