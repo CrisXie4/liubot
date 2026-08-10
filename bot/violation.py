@@ -253,23 +253,49 @@ async def handle_violation(
     if not violator_name:
         violator_name = msg_data.get("sender", {}).get("card", "")
 
-    # --- 图片消息: 尝试 OCR ---
-    is_image = False
-    if not raw_message or raw_message == "[图片]":
-        is_image = any(seg.get("type") == "image" for seg in message_segments)
-        if not is_image:
-            is_image = any(seg.get("type") == "image" for seg in msg_data.get("message", []))
+    # --- 统一内容提取（合并转发 + 图片 + 表情）---
+    from . import content_reader, image_mod
+    try:
+        content = await content_reader.extract_full_content(bot, raw_message, message_segments)
+    except Exception as e:
+        logger.warning(f"content_reader 提取失败，降级: {e}")
+        content = {"text": raw_message if isinstance(raw_message, str) else "",
+                   "images": [], "stickers": [], "has_forward": False,
+                   "forward": None, "errors": []}
 
-    if is_image:
-        from . import image_mod
-        file_id, img_url = image_mod.extract_image_info(
-            message_segments or msg_data.get("message", [])
-        )
-        ocr_text = await image_mod.extract_text_from_image(bot, file_id, img_url)
-        if ocr_text:
-            raw_message = f"[图片广告 OCR] {ocr_text}"
-        else:
-            raw_message = "[图片广告] (OCR未识别到文字)"
+    # 构造 effective_text（含合并转发子消息）
+    effective_text = content["text"]
+    if content["has_forward"] and content["forward"]:
+        effective_text = (effective_text + "\n[合并转发]\n" + content["forward"]["text"]).strip()
+
+    # 收集所有图片（本条 + 转发包内 + 表情）
+    all_images = list(content["images"])
+    for _s in content["stickers"]:
+        if _s.get("url"):
+            all_images.append({"url": _s["url"], "file_id": "", "caption_hint": _s.get("summary", "")})
+    if content["has_forward"] and content["forward"]:
+        all_images += content["forward"]["images"]
+        for _s in content["forward"]["stickers"]:
+            if _s.get("url"):
+                all_images.append({"url": _s["url"], "file_id": "", "caption_hint": _s.get("summary", "")})
+
+    # 走 Vision 三级降级（全审）
+    vision_results = []
+    if all_images:
+        try:
+            vision_results = await image_mod._audit_all_media(bot, all_images, caption=effective_text) or []
+        except Exception as e:
+            logger.warning(f"手动标记图片审核异常: {e}")
+            vision_results = []
+        for vr in vision_results:
+            if not vr:
+                continue
+            ocr = vr.get("ocr_text", "")
+            if ocr:
+                effective_text = effective_text + "\n[图片内容] " + ocr
+
+    # 用 effective_text 替代 raw_message 做后续分析
+    raw_message = effective_text
 
     if not raw_message:
         await bot.send_group_msg(group_id, "❌ 消息内容为空")
@@ -283,6 +309,13 @@ async def handle_violation(
 
     # --- 3. 分析特征 ---
     analysis = analyze_violation_message(raw_message)
+
+    # 把图片 Vision 违规类型并入 keywords（Task 4）
+    for vr in vision_results:
+        if vr and vr.get("violation_type") not in ("none", None, ""):
+            analysis["keywords"] = list(set(
+                analysis["keywords"] + [vr.get("violation_type", "")]
+            ))[:10]
 
     # --- 4. 存入数据库 ---
     vid = db.add_violation(
