@@ -113,6 +113,22 @@ async def handle_member_increase(bot, event: dict):
     if not group_id or not user_id or user_id == bot_qq:
         return
 
+    # 免验证白名单 → 直接放行（Task 5 新增）
+    if is_whitelisted(user_id, group_id):
+        _log_verification(user_id, str(user_id), group_id, "auto_whitelist",
+                          "", "", "免验证白名单")
+        logger.info(f"免验证白名单: {user_id} 群{group_id} → 直接放行")
+        try:
+            from .humanizer import send_human_like
+            from . import welcome as _welcome
+            welcome_msg = _welcome.get_welcome_message(group_id, str(user_id), user_id)
+            if welcome_msg:
+                await send_human_like(bot, group_id, welcome_msg)
+            _welcome.add_points(user_id, group_id, str(user_id), 10, "免验证入群")
+        except Exception as e:
+            logger.debug(f"白名单放行发欢迎失败: {e}")
+        return  # 不出题、不踢
+
     # 已经在验证中？跳过（防重复触发）
     if _pending.get(group_id, {}).get(user_id):
         return
@@ -572,3 +588,150 @@ def get_verification_history(limit: int = 50) -> list[dict]:
         return history[:limit]
     except Exception:
         return []
+
+
+# ═══════════════════════════════════════════════════════════
+#  免验证白名单 + 立即放行（Task 5 新增）
+# ═══════════════════════════════════════════════════════════
+
+# 白名单持久化文件（沿用 data/ 目录）
+_WHITELIST_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "verify_whitelist.json"
+)
+
+# 内存缓存: {"global": [int], "by_group": {str(group_id): [int]}}
+_whitelist_cache: dict | None = None
+
+
+def _load_whitelist() -> dict:
+    """加载白名单（懒加载，损坏时重建）"""
+    global _whitelist_cache
+    if _whitelist_cache is not None:
+        return _whitelist_cache
+    default = {"global": [], "by_group": {}}
+    if not os.path.exists(_WHITELIST_FILE):
+        _whitelist_cache = default
+        return _whitelist_cache
+    try:
+        with open(_WHITELIST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = default
+        data.setdefault("global", [])
+        data.setdefault("by_group", {})
+        _whitelist_cache = data
+    except Exception as e:
+        logger.warning(f"白名单文件损坏，重建: {e}")
+        _whitelist_cache = default
+        try:
+            _save_whitelist()
+        except Exception:
+            pass
+    return _whitelist_cache
+
+
+def _save_whitelist():
+    """写盘"""
+    global _whitelist_cache
+    if _whitelist_cache is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(_WHITELIST_FILE), exist_ok=True)
+        with open(_WHITELIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(_whitelist_cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"白名单写入失败: {e}")
+
+
+def is_whitelisted(user_id: int, group_id: int) -> bool:
+    """检查是否在免验证白名单（global 或 by_group[group_id]）"""
+    data = _load_whitelist()
+    if user_id in data.get("global", []):
+        return True
+    return user_id in data.get("by_group", {}).get(str(group_id), [])
+
+
+def add_whitelist(user_id: int, group_id: int = 0) -> bool:
+    """
+    加入白名单。group_id=0 表示全局；非 0 表示指定群。
+    Returns: True 表示新增；False 表示已存在。
+    """
+    data = _load_whitelist()
+    if group_id == 0:
+        gl = data.setdefault("global", [])
+        if user_id in gl:
+            return False
+        gl.append(user_id)
+    else:
+        key = str(group_id)
+        lst = data.setdefault("by_group", {}).setdefault(key, [])
+        if user_id in lst:
+            return False
+        lst.append(user_id)
+    _save_whitelist()
+    logger.info(f"免验证白名单 += {user_id} (group={group_id})")
+    return True
+
+
+def remove_whitelist(user_id: int, group_id: int = 0) -> bool:
+    """从白名单移除。Returns: True 表示有移除；False 表示本来就不在。"""
+    data = _load_whitelist()
+    removed = False
+    if group_id == 0:
+        # 从 global 移除 + 所有 by_group 移除（彻底清）
+        if user_id in data.get("global", []):
+            data["global"].remove(user_id)
+            removed = True
+        for k, lst in data.get("by_group", {}).items():
+            if user_id in lst:
+                lst.remove(user_id)
+                removed = True
+    else:
+        key = str(group_id)
+        lst = data.get("by_group", {}).get(key, [])
+        if user_id in lst:
+            lst.remove(user_id)
+            removed = True
+    if removed:
+        _save_whitelist()
+        logger.info(f"免验证白名单 -= {user_id} (group={group_id})")
+    return removed
+
+
+def list_whitelist(group_id: int = 0) -> dict:
+    """返回白名单字典。group_id 非 0 时附加该群的列表。"""
+    data = _load_whitelist()
+    result = {"global": list(data.get("global", [])),
+              "by_group": dict(data.get("by_group", {}))}
+    if group_id:
+        result["current_group"] = list(data.get("by_group", {}).get(str(group_id), []))
+    return result
+
+
+async def approve_pending(bot, group_id: int, user_id: int) -> bool:
+    """
+    立即放行某个正在待验证的用户。
+    清理 _pending，记录 manual_approved，发欢迎消息 + 加积分。
+    Returns: True 表示该用户在待验证中并已被放行；False 表示没找到。
+    """
+    pending = _pending.get(group_id, {}).get(user_id)
+    if not pending:
+        return False
+    user_name = pending.get("user_name", str(user_id))
+    question = pending.get("question", "")
+    _cleanup_user(group_id, user_id)
+    _log_verification(user_id, user_name, group_id, "manual_approved",
+                      question, "", "主人手动放行")
+    logger.info(f"主人放行: {user_name}({user_id}) 群{group_id}")
+    try:
+        from .humanizer import send_human_like
+        from . import welcome as _welcome
+        await send_human_like(bot, group_id, f"✅ [CQ:at,qq={user_id}] 主人已放行，欢迎入群~ :96:")
+        welcome_msg = _welcome.get_welcome_message(group_id, user_name, user_id)
+        if welcome_msg:
+            await send_human_like(bot, group_id, welcome_msg)
+        _welcome.add_points(user_id, group_id, user_name, 10, "主人放行")
+    except Exception as e:
+        logger.warning(f"放行后发欢迎/加积分失败: {e}")
+    return True

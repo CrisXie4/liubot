@@ -1743,6 +1743,69 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                 await bot.send_group_msg(group_id, f"审批 ID {arg} 不存在或已过期")
             return
 
+        # --- 同意入群（立即放行待验证者）Task 5 ---
+        if cmd in ("同意入群", "approvejoin"):
+            if not arg or not arg.strip().isdigit():
+                await bot.send_group_msg(group_id, "用法: @我 同意入群 <QQ号>")
+                return
+            target_qq = int(arg.strip())
+            from . import verify as _verify
+            ok = await _verify.approve_pending(bot, group_id, target_qq)
+            if ok:
+                await bot.send_group_msg(group_id, f"✅ 已放行 {target_qq}")
+            else:
+                # 该 QQ 不在待验证 → 顺手加入白名单，下次入群免验证
+                _verify.add_whitelist(target_qq, group_id)
+                await bot.send_group_msg(
+                    group_id,
+                    f"ℹ️ {target_qq} 当前不在待验证列表，已加入本群免验证白名单，下次入群直接通过"
+                )
+            return
+
+        # --- 免验证白名单（Task 5）---
+        if cmd in ("免验证", "whitelist"):
+            if not arg:
+                await bot.send_group_msg(group_id, "用法: @我 免验证 <QQ号>  (或: 取消免验证 <QQ号> / 免验证列表)")
+                return
+            target_qq = int(arg.strip()) if arg.strip().isdigit() else 0
+            if not target_qq:
+                await bot.send_group_msg(group_id, "QQ号必须是数字")
+                return
+            from . import verify as _verify
+            added = _verify.add_whitelist(target_qq, group_id)
+            # 如果当前正在待验证 → 顺带放行
+            await _verify.approve_pending(bot, group_id, target_qq)
+            await bot.send_group_msg(
+                group_id,
+                f"✅ {target_qq} 已加入本群免验证白名单" + ("" if added else "（原本就在白名单）")
+            )
+            return
+
+        if cmd in ("取消免验证", "unwhitelist"):
+            if not arg or not arg.strip().isdigit():
+                await bot.send_group_msg(group_id, "用法: @我 取消免验证 <QQ号>")
+                return
+            target_qq = int(arg.strip())
+            from . import verify as _verify
+            removed = _verify.remove_whitelist(target_qq, group_id)
+            await bot.send_group_msg(
+                group_id,
+                f"✅ {target_qq} 已从免验证白名单移除" if removed
+                else f"ℹ️ {target_qq} 本来就不在白名单"
+            )
+            return
+
+        if cmd in ("免验证列表", "whitelistlist"):
+            from . import verify as _verify
+            data = _verify.list_whitelist(group_id)
+            lines = ["📋 **免验证白名单**"]
+            gl = data.get("global", [])
+            lines.append(f"🌐 全局 ({len(gl)}): {', '.join(str(x) for x in gl) or '无'}")
+            cg = data.get("current_group", [])
+            lines.append(f"👥 本群 ({len(cg)}): {', '.join(str(x) for x in cg) or '无'}")
+            await bot.send_group_msg(group_id, "\n".join(lines))
+            return
+
         # --- 发布公告 ---
         if cmd in ("公告", "notice", "announce"):
             if not arg:
