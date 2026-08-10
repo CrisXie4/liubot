@@ -17,6 +17,7 @@ from . import learner
 from . import memory
 from . import sticker
 from . import media_reader
+from . import content_reader
 from . import quote_handler
 from . import group_personality
 from . import decision_engine
