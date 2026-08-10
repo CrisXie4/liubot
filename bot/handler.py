@@ -913,6 +913,16 @@ async def handle_group_message(bot: OneBotClient, event: dict):
         quoted_context = await quote_handler.get_quoted_context(bot, reply_msg_id)
 
     # ── 提取消息中的媒体内容（用于 AI 上下文）──
+    # 新增：统一内容提取（合并转发 + 图片 + 表情）
+    try:
+        from . import content_reader
+        content = await content_reader.extract_full_content(bot, raw_message, message)
+    except Exception as e:
+        logger.debug(f"content_reader 异常: {e}")
+        content = {"text": _extract_text(message), "images": [], "stickers": [],
+                   "has_forward": False, "forward": None, "errors": []}
+
+    # 保留旧 media_ctx 给"自动收藏表情"/影响力追踪用（不破坏现有功能）
     media_ctx = []
     try:
         media_ctx = await media_reader.extract_media_context(raw_message) if raw_message else []
@@ -921,6 +931,37 @@ async def handle_group_message(bot: OneBotClient, event: dict):
     has_image = any(m.get("type") == "image" for m in media_ctx)
     has_video = any(m.get("type") == "video" for m in media_ctx)
     has_sticker_code = any(m.get("type") == "sticker" for m in media_ctx)
+
+    # ── 并行审核：文本 + 全量图片/表情/GIF ──
+    # 构造 effective_text（含合并转发子消息）
+    effective_text = content["text"]
+    if content["has_forward"] and content["forward"]:
+        effective_text = (effective_text + "\n[合并转发]\n" + content["forward"]["text"]).strip()
+
+    # 收集所有待审媒体（本条 + 转发包内）
+    audit_images = list(content["images"])
+    for _s in content["stickers"]:
+        if _s.get("url"):
+            audit_images.append({"url": _s["url"], "file_id": "", "caption_hint": _s.get("summary", "")})
+    if content["has_forward"] and content["forward"]:
+        audit_images += content["forward"]["images"]
+        for _s in content["forward"]["stickers"]:
+            if _s.get("url"):
+                audit_images.append({"url": _s["url"], "file_id": "", "caption_hint": _s.get("summary", "")})
+
+    # 异步并行：文本审核 + 图片审核（仅非主人/非官方）
+    _owner_or_official = _is_owner(user_id) or _is_official_account(user_id)
+
+    async def _audit_media() -> list:
+        from . import image_mod
+        try:
+            return await image_mod._audit_all_media(bot, audit_images, caption=effective_text)
+        except Exception as e:
+            logger.warning(f"图片审核异常: {e}")
+            return []
+
+    # 用 create_task 让图片审核与下方文本审核并行
+    image_audit_task = asyncio.create_task(_audit_media()) if (audit_images and not _owner_or_official) else None
 
     # ── 自动收藏表情（直接扫描 raw_message，图片/mface 走 AI 评估）──
     if raw_message and "[CQ:" in raw_message:
@@ -1001,6 +1042,34 @@ async def handle_group_message(bot: OneBotClient, event: dict):
         final_source = "keyword"
         final_reason = "关键词引擎判定"
 
+    # ── 图片审核结果融合（Task 3 新增）──
+    image_results = []
+    if image_audit_task is not None:
+        try:
+            image_results = await image_audit_task
+        except Exception as e:
+            logger.warning(f"图片审核 await 异常: {e}")
+            image_results = []
+    _image_hits = []  # 收集图片维度命中词，后面并入 combined_hits
+    for image_result in (image_results or []):
+        if not image_result or not isinstance(image_result, dict):
+            continue
+        img_is_v = image_result.get("is_violation", False)
+        img_conf = float(image_result.get("confidence", 0))
+        if img_is_v and img_conf >= 0.7:
+            final_violation = True
+            final_confidence = max(final_confidence, img_conf)
+            final_source = "image_vision"
+            final_reason = image_result.get("reason", "") or final_reason
+            _image_hits.append(image_result.get("violation_type", ""))
+            ocr_text = image_result.get("ocr_text", "")
+            if ocr_text:
+                try:
+                    _image_hits.extend(violation.extract_keywords(ocr_text, top_n=5))
+                except Exception:
+                    pass
+            break  # 任一媒体判违规即整体撤回，不再叠加
+
     if final_violation and raw_message:
         bl = blacklist.is_blacklisted(user_id, group_id)
         if bl:
@@ -1013,6 +1082,8 @@ async def handle_group_message(bot: OneBotClient, event: dict):
         learner_hits = [h["keyword"] for h in score_info.get("details", {}).get("keyword_hits", [])]
         pattern_hits = [p.get("description", "") for p in score_info.get("details", {}).get("pattern_hits", [])]
         combined_hits = list(set(all_hits + learner_hits + pattern_hits))
+        if _image_hits:
+            combined_hits = list(set(combined_hits + [h for h in _image_hits if h]))
         clean_hits = [h.replace("re:", "")[:20] for h in combined_hits if h and len(h) >= 2][:8]
 
         if friend_mode:
