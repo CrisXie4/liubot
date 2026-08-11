@@ -59,6 +59,9 @@ DEFAULT_STATE = {
         "ignored_count": 0,      # 被忽视次数（发消息没人理）
         "interesting_topics": [],# 今天聊过的有趣话题
         "highlights": [],        # 今天的高光时刻
+        # ★ Volition 追踪：被忽视事实（不改情绪数值，只作为事实喂给 LLM）
+        "proactive_messages": [],     # bot 最近主动发言时间戳（滑动窗口，最多 5 条）
+        "consecutive_ignored": 0,     # 连续被忽视次数
     },
 
     # ── 长期人格特质（从 personality.json 抽象出来的数值化版本）──
@@ -373,21 +376,25 @@ def should_idle_think(state: dict) -> bool:
     return True
 
 
-async def generate_idle_thought(state: dict) -> str | None:
+async def generate_idle_thought(state: dict) -> tuple[str | None, str | None]:
     """
-    调用 LLM 让 AI 根据自己的真实状态产生一条内心戏。
+    调用 LLM 让 AI 根据自己的真实状态产生一条内心戏，并自主决定要不要说出来。
 
-    输入给 LLM 的：当前时间、心情、今天的经历、最近日记、学到的事、
-    跟群友的关系——让模型真的"想"，而不是填空。
+    合并 Volition 协议：一次调用同时产出"内心想法 + 要不要说出来"。
+    输出协议：
+        THOUGHT: <内心想法，写日记用，≤30字>
+        SPEAK: <要在群里说的话，20字以内；不想说就写 NONE>
 
-    Returns: 思考文本（已写入日记），失败返回 None
+    Returns: (thought, speak_text)
+        thought: 内心想法文本（已写入日记），失败返回 None
+        speak_text: 想在群里说的话（未写入日记，由调用方发送后再记），不想说返回 None
     """
     try:
         from . import memory as _mem
         ms = _mem.load_model_settings()
         api_key = ms.get("api_key", "")
         if not api_key:
-            return None
+            return None, None
 
         from . import llm_call
 
@@ -403,6 +410,7 @@ async def generate_idle_thought(state: dict) -> str | None:
         today = state.get("today", {})
         topics = today.get("interesting_topics", [])[-5:]
         highlights = today.get("highlights", [])[-3:]
+        consecutive_ignored = today.get("consecutive_ignored", 0)
 
         # 关系感知
         rels = state.get("relationships", {})
@@ -412,6 +420,14 @@ async def generate_idle_thought(state: dict) -> str | None:
             rel_text = "\n".join(
                 f"  {name}: 亲密度{r.get('closeness', 0.5):.0%}，最近互动: {r.get('last_interaction', '无')}"
                 for name, r in sorted_rels
+            )
+
+        # ★ 被忽视事实（不改情绪数值，只告诉 LLM）
+        ignored_fact = ""
+        if consecutive_ignored > 0:
+            ignored_fact = (
+                f"\n⚠️ 事实：你已经连续 {consecutive_ignored} 次主动发话没人接。"
+                "（不是必须闭嘴——你自己判断）"
             )
 
         prompt = (
@@ -429,31 +445,57 @@ async def generate_idle_thought(state: dict) -> str | None:
         if rel_text:
             prompt += f"跟群友的关系:\n{rel_text}\n"
         prompt += (
-            f"\n你最近的日记（最近的想法和经历）:\n{diary_text}\n\n"
+            f"\n你最近的日记（最近的想法和经历）:\n{diary_text}\n"
+            f"{ignored_fact}\n\n"
             f"——\n"
             f"你现在脑子里闪过一个念头。像真人发呆时突然想到什么似的，"
             f"自然地写下来。可以是对某件事的感受、一个突然的想法、"
-            f"回忆起什么、或者单纯发呆。不超过30个字。"
-            f"要真实，不要刻意，不要模板化。如果今天学到了什么新鲜事，"
-            f"可能会回味一下；如果被夸了，可能会暗自开心；"
-            f"如果被怼了，可能还有点不爽。就像你真的是一个有情绪的人。"
+            f"回忆起什么、或者单纯发呆。\n\n"
+            f"同时你自己决定：要不要把想到的（或其中一部分）发到群里？"
+            f"没人逼你，想发就发，不想发就不发。\n\n"
+            f"严格按以下两行格式回复（不要加别的）：\n"
+            f"THOUGHT: <内心想法，≤30字，写日记给自己看的，不是发给群友的>\n"
+            f"SPEAK: <要在群里说的话，20字以内，要跟当前时间/心情对得上；"
+            f"不想说就写 NONE>"
         )
 
         response = await llm_call.llm_create(
+            priority="P2",
             model=ms.get("model", "gemini-3.5-flash-free"),
-            max_tokens=60,
+            max_tokens=100,
             temperature=0.95,
             messages=[{"role": "user", "content": prompt}],
         )
 
-        thought = response.content[0].text.strip().strip('"').strip("'").strip()
-        if thought and 2 <= len(thought) <= 50:
+        raw = response.content[0].text.strip()
+        thought = None
+        speak_text = None
+
+        for line in raw.split("\n"):
+            ls = line.strip()
+            upper = ls.upper()
+            if upper.startswith("THOUGHT:"):
+                t = ls.split(":", 1)[1].strip().strip('"').strip("'").strip()
+                if t and 2 <= len(t) <= 50:
+                    thought = t
+            elif upper.startswith("SPEAK:"):
+                s = ls.split(":", 1)[1].strip().strip('"').strip("'").strip()
+                if s and s.upper() != "NONE" and 2 <= len(s) <= 30:
+                    speak_text = s
+
+        if thought:
             add_diary(state, thought, mood)
             logger.info(f"💭 空闲思考: {thought}")
-            return thought
+        if speak_text:
+            logger.info(f"🎙️ 空闲思考→想发言: {speak_text}")
+            record_proactive_message(state)
+
+        return thought, speak_text
 
     except Exception as e:
         logger.debug(f"空闲思考生成失败: {e}")
+
+    return None, None
 
     return None
 
@@ -476,7 +518,19 @@ DECAY_RATES = {
     "sadness": 0.006,    # 难过会慢慢平复（比烦躁慢一点）
 }
 
-# 情绪最小值/最大值
+EMOTION_BASELINE = {
+    "joy": 0.55,
+    "calm": 0.60,
+    "energy": 0.55,
+    "curiosity": 0.55,
+    "social": 0.55,
+    "satisfaction": 0.55,
+    "irritation": 0.12,
+    "sadness": 0.12,
+    "boredom": 0.25,
+    "loneliness": 0.25,
+}
+
 EMOTION_MIN = 0.0
 EMOTION_MAX = 1.0
 
@@ -519,22 +573,22 @@ def apply_circadian(state: dict):
 
 
 def apply_natural_decay(state: dict, elapsed_minutes: float):
-    """自然情绪衰减"""
+    """自然情绪衰减 — 正向情绪向各自基线靠拢，负向情绪向低基线衰减"""
     for emotion, rate in DECAY_RATES.items():
         decay = rate * elapsed_minutes
+        target = EMOTION_BASELINE.get(emotion, 0.5)
         if decay > 0:
-            # 正向情绪 → 趋向 0.5 中性
             current = state["emotions"][emotion]
-            target = 0.5
             if abs(current - target) < 0.01:
                 continue
             half_life_factor = 1 - min(decay * 2, 0.5)
             new_val = target + (current - target) * half_life_factor
             state["emotions"][emotion] = max(EMOTION_MIN, min(EMOTION_MAX, new_val))
         else:
-            # 负向速率 → boredom/loneliness 自然增长
             growth = abs(decay)
-            state["emotions"][emotion] = min(EMOTION_MAX, state["emotions"][emotion] + growth)
+            cap = EMOTION_BASELINE.get(emotion, 0.25) + 0.6
+            cap = min(cap, EMOTION_MAX)
+            state["emotions"][emotion] = min(cap, state["emotions"][emotion] + growth)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -600,6 +654,75 @@ def on_ignored(state: dict):
     apply_emotion_delta(state, "irritation", 0.03)
     apply_emotion_delta(state, "social", -0.04)
     apply_emotion_delta(state, "satisfaction", -0.03)
+
+
+# ═══════════════════════════════════════════════════════════
+#  Volition 被忽视追踪
+#  =========================================================
+#  注意：这里不改情绪数值（"人格不能自己改"）。
+#  只记录事实——bot 主动发了消息，等 15 分钟没人接话就算"被忽视一次"。
+#  这些事实会原样喂给 LLM，由它自己决定"那算了不发了"。
+# ═══════════════════════════════════════════════════════════
+
+# bot 主动发言后等待回应的窗口（超过则算被忽视）
+PROACTIVE_IGNORE_WINDOW = 15 * 60   # 15 分钟（秒）
+PROACTIVE_MESSAGES_MAX = 5          # 滑动窗口最多保留 5 条
+
+
+def record_proactive_message(state: dict):
+    """记录 bot 发了一条主动消息。
+    在 ai_brain.decide_and_speak 返回 SPEAK 并实际发送后调用。
+    """
+    today = state.setdefault("today", {})
+    msgs = today.setdefault("proactive_messages", [])
+    msgs.append(time.time())
+    # 滑动窗口：只保留最近 N 条
+    if len(msgs) > PROACTIVE_MESSAGES_MAX:
+        today["proactive_messages"] = msgs[-PROACTIVE_MESSAGES_MAX:]
+
+
+def check_and_update_ignored(state: dict) -> int:
+    """在 consciousness_loop 每个 tick 调用。
+    检查 proactive_messages 中是否有超过窗口期未得到回应的条目，
+    有则 consecutive_ignored += 1 并移除该条目（避免重复计数）。
+
+    返回当前 consecutive_ignored 值。
+    """
+    today = state.setdefault("today", {})
+    msgs = today.get("proactive_messages", [])
+    if not msgs:
+        return today.get("consecutive_ignored", 0)
+
+    now = time.time()
+    kept = []
+    ignored_now = 0
+    for ts in msgs:
+        if now - ts >= PROACTIVE_IGNORE_WINDOW:
+            # 这条主动发言等了足够久还没人理 → 算一次被忽视
+            ignored_now += 1
+        else:
+            kept.append(ts)
+
+    if ignored_now > 0:
+        today["consecutive_ignored"] = today.get("consecutive_ignored", 0) + ignored_now
+        today["proactive_messages"] = kept
+        # ★ 不改情绪数值，只记事实
+        logger.info(
+            f"🔇 Volition: {ignored_now} 条主动发言超过 {PROACTIVE_IGNORE_WINDOW//60} 分钟无人回应，"
+            f"consecutive_ignored={today['consecutive_ignored']}"
+        )
+
+    return today["consecutive_ignored"]
+
+
+def reset_ignored_counter(state: dict):
+    """被 @ / 被回复时调用，consecutive_ignored 清零。
+    在 handler.py 的 on_bot_mentioned / on_bot_replied_to 钩子中调用。
+    """
+    today = state.setdefault("today", {})
+    if today.get("consecutive_ignored", 0) > 0:
+        today["consecutive_ignored"] = 0
+        logger.debug("Volition: 被回应了，consecutive_ignored 清零")
 
 
 def on_new_friend(state: dict, user_name: str):
@@ -995,6 +1118,8 @@ def check_daily_reset(state: dict):
             "ignored_count": 0,
             "interesting_topics": [],
             "highlights": [],
+            "proactive_messages": [],
+            "consecutive_ignored": 0,
         }
         # 重置空闲思考计数
         state["idle_minutes_today"] = 0
