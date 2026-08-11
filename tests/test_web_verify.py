@@ -218,5 +218,44 @@ class TestWebChallengeLifecycle(unittest.TestCase):
         self.assertNotIn(token, self.verify._web_pending)
 
 
+class TestLogVerificationFields(unittest.TestCase):
+
+    def setUp(self):
+        from bot import verify
+        self.verify = verify
+        import tempfile
+        self._orig = verify._HISTORY_FILE
+        self.tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        self.tmp.close()
+        verify._HISTORY_FILE = self.tmp.name
+
+    def tearDown(self):
+        import os
+        self.verify._HISTORY_FILE = self._orig
+        try:
+            os.unlink(self.tmp.name)
+        except Exception:
+            pass
+
+    def test_log_with_method_attempts(self):
+        """新参数写入历史 entry"""
+        self.verify._log_verification(
+            123, "alice", 456, "approved_web", "星空", "星空", "ok",
+            method="web", attempts=1,
+        )
+        items = self.verify.get_verification_history()
+        self.assertEqual(items[0]["method"], "web")
+        self.assertEqual(items[0]["attempts"], 1)
+
+    def test_log_backward_compat(self):
+        """老调用（不传新参数）依然能写，字段带默认值"""
+        self.verify._log_verification(
+            123, "alice", 456, "approved", "1+1=?", "2", "ok",
+        )
+        items = self.verify.get_verification_history()
+        self.assertEqual(items[0]["method"], "quiz")
+        self.assertEqual(items[0]["attempts"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -793,18 +793,25 @@ _MAX_HISTORY = 500
 
 
 def _log_verification(user_id: int, user_name: str, group_id: int,
-                      result: str, question: str, answer: str, reason: str):
-    """记录一条验证历史"""
+                      result: str, question: str, answer: str, reason: str,
+                      method: str = "quiz", attempts: int = 1):
+    """记录一条验证历史。
+
+    method: "quiz"（AI出题）/ "web"（网站认证）/ "whitelist"（白名单放行）
+    attempts: 尝试次数（通过=第几次对，踢出=总错次）
+    """
     from datetime import datetime
     entry = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "user_id": user_id,
         "user_name": user_name,
         "group_id": group_id,
-        "result": result,       # "approved" | "rejected" | "timeout"
+        "result": result,       # "approved" | "rejected" | "timeout" | *_web / manual_approved
         "question": question[:50],
         "answer": answer[:30],
         "reason": reason[:100],
+        "method": method,
+        "attempts": attempts,
     }
 
     history = []
