@@ -19,6 +19,7 @@ import time
 from typing import Optional
 
 from . import llm_call
+from .config import config
 
 logger = logging.getLogger("qqbot")
 
@@ -164,6 +165,133 @@ def _fallback_web_code() -> str:
     code = random.choice(available)
     _used_web_codes.add(code)
     return code
+
+
+# ═══════════════════════════════════════════════════════════
+#  网站认证 — token 生命周期
+# ═══════════════════════════════════════════════════════════
+
+async def _verify_turnstile(cf_token: str, remote_ip: str = "") -> bool:
+    """调 Cloudflare siteverify 校验。成功/降级返回 True，校验明确失败返回 False。"""
+    from .config import config
+    secret = config.TURNSTILE_SECRET_KEY
+    if not secret:
+        logger.warning("Turnstile secret 未配置，降级放行（生产环境应配置）")
+        return True
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            payload = {"secret": secret, "response": cf_token}
+            if remote_ip:
+                payload["remoteip"] = remote_ip
+            async with session.post(
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                data=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                result = await resp.json()
+                return bool(result.get("success", False))
+    except Exception as e:
+        logger.warning(f"Turnstile 校验异常: {e} → 降级放行")
+        return True
+
+
+async def create_web_challenge(group_id: int, user_id: int, user_name: str) -> str:
+    """为新人生成一个 web 验证挑战。返回 token。"""
+    import secrets
+    code = await _generate_web_code()
+    token = secrets.token_urlsafe(16)  # 22 字符
+    _web_pending[token] = {
+        "group_id": group_id,
+        "user_id": user_id,
+        "user_name": user_name,
+        "code": code,
+        "created_at": time.time(),
+        "wrong_attempts": 0,
+        "revealed": False,
+    }
+    logger.info(f"🌐 网站验证挑战: {user_name}({user_id}) 群{group_id} 词={code} token={token[:_TOKEN_LOG_LEN]}...")
+    return token
+
+
+async def reveal_web_code(token: str, cf_token: str, remote_ip: str = "") -> dict:
+    """新人点完 Turnstile 后调，校验通过返回词。"""
+    # 1. token 存在？
+    entry = _web_pending.get(token)
+    if not entry:
+        return {"ok": False, "error": "token_not_found", "message": "验证码已失效，请联系管理员"}
+    # 2. token 过期？
+    if time.time() - entry["created_at"] > VERIFY_TIMEOUT:
+        _cleanup_web_token(token)
+        return {"ok": False, "error": "token_expired", "message": "验证码已过期，请重新触发"}
+    # 3. Turnstile 校验
+    if not await _verify_turnstile(cf_token, remote_ip):
+        return {"ok": False, "error": "captcha_failed", "message": "人机验证未通过，请重试"}
+    # 4. 标记已 reveal，返回词
+    entry["revealed"] = True
+    return {"ok": True, "code": entry["code"]}
+
+
+async def consume_web_challenge(group_id: int, user_id: int, user_answer: str) -> dict:
+    """新人群里发词时调，本地比对。返回 verdict + 元信息。
+
+    verdict:
+      - correct: 答对（token 已清理）
+      - wrong: 答错，attempts 累加；若 attempts >= max 则 final=True 且 token 清理
+      - smalltalk: 寒暄，不消耗次数
+      - not_found: 该用户不在 _web_pending
+    """
+    # 按 (group, user) 找 token
+    token = None
+    entry = None
+    for t, e in _web_pending.items():
+        if e["group_id"] == group_id and e["user_id"] == user_id:
+            token = t
+            entry = e
+            break
+    if not entry:
+        return {"verdict": "not_found"}
+
+    # 过期兜底
+    if time.time() - entry["created_at"] > VERIFY_TIMEOUT:
+        _cleanup_web_token(token)
+        return {"verdict": "not_found"}
+
+    expected = entry["code"]
+    # 寒暄识别（不消耗次数）
+    if _looks_like_smalltalk(user_answer):
+        return {"verdict": "smalltalk", "expected": expected}
+
+    user_norm = _normalize_code(user_answer)
+    expected_norm = _normalize_code(expected)
+
+    if user_norm and user_norm == expected_norm:
+        attempts = entry["wrong_attempts"] + 1
+        _cleanup_web_token(token)
+        return {"verdict": "correct", "expected": expected, "attempts": attempts}
+
+    # 答错
+    entry["wrong_attempts"] += 1
+    attempts = entry["wrong_attempts"]
+    if attempts >= MAX_WRONG_ATTEMPTS_WEB:
+        _cleanup_web_token(token)
+        return {"verdict": "wrong", "expected": expected, "attempts": attempts,
+                "max": MAX_WRONG_ATTEMPTS_WEB, "final": True}
+    return {"verdict": "wrong", "expected": expected, "attempts": attempts,
+            "max": MAX_WRONG_ATTEMPTS_WEB}
+
+
+def _cleanup_web_token(token: str) -> None:
+    """删一个 token"""
+    _web_pending.pop(token, None)
+
+
+def _cleanup_web_user(group_id: int, user_id: int) -> None:
+    """按 (group, user) 删 token"""
+    to_drop = [t for t, e in _web_pending.items()
+               if e["group_id"] == group_id and e["user_id"] == user_id]
+    for t in to_drop:
+        _web_pending.pop(t, None)
 
 
 # ═══════════════════════════════════════════════════════════
