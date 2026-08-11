@@ -876,19 +876,19 @@ def get_relationship_prompt(state: dict) -> str:
 def get_dominant_mood(state: dict) -> str:
     """获取当前主导情绪标签"""
     e = state["emotions"]
-    # 睡眠检查
     if state.get("sleeping"):
         return "sleeping"
 
-    # 复合情绪判断
-    if e["irritation"] > 0.5:
-        return "grumpy"
+    if e["joy"] > 0.7 and e["energy"] > 0.6 and e.get("irritation", 0) < 0.5:
+        return "excited"
+    if e["joy"] > 0.55 and e["joy"] > e.get("irritation", 0) + 0.05:
+        return "happy"
+
     if e.get("sadness", 0) > 0.55:
         return "sad"
-    if e["joy"] > 0.7 and e["energy"] > 0.6:
-        return "excited"
-    if e["joy"] > 0.55:
-        return "happy"
+    if e["irritation"] > 0.6:
+        return "grumpy"
+
     if e["boredom"] > 0.6:
         return "bored"
     if e["loneliness"] > 0.6:
@@ -902,7 +902,6 @@ def get_dominant_mood(state: dict) -> str:
     if e["irritation"] > 0.3:
         return "irritated"
 
-    # 默认
     if e["joy"] >= 0.45:
         return "neutral_happy"
     elif e["energy"] >= 0.4:
