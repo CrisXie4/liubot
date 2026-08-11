@@ -34,34 +34,48 @@ SEARCH_TOOL = {
 }
 
 
-async def search(query: str, max_results: int = 5) -> list[dict]:
+async def search(query: str, max_results: int = 5,
+                 time_range: str = None, max_age_days: int = None) -> list[dict]:
     """
     调用 SearXNG 搜索。优先 JSON API，回退 HTML 解析。
 
+    Args:
+        time_range: SearXNG 时间过滤，取值 day/week/month/year/None
+        max_age_days: 二次过滤，丢弃 publishedDate 早于 N 天前的结果。
+                      None = 不做二次过滤。
     Returns:
-        [{"title": "...", "url": "...", "content": "...", "engine": "..."}, ...]
+        [{"title": "...", "url": "...", "content": "...", "engine": "...",
+          "published": "YYYY-MM-DD"}, ...]
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # 方式 1: JSON API
+            params = {"q": query, "format": "json", "language": "zh-CN", "categories": "general"}
+            if time_range:
+                params["time_range"] = time_range
+
             resp = await client.get(
                 f"{SEARXNG_URL}/search",
-                params={"q": query, "format": "json", "language": "zh-CN", "categories": "general"},
+                params=params,
                 headers={"User-Agent": "QQBot/5.0"},
             )
             if resp.status_code == 200:
                 try:
                     data = resp.json()
                     results = data.get("results", [])[:max_results]
-                    logger.info(f"SearXNG JSON: '{query}' → {len(results)} 条")
-                    return _format_results(results)
+                    formatted = _format_results(results)
+                    if max_age_days is not None:
+                        formatted = _filter_by_age(formatted, max_age_days)
+                    logger.info(f"SearXNG JSON: '{query}' → {len(formatted)} 条")
+                    return formatted
                 except Exception:
-                    pass  # 回退到 HTML
+                    pass
 
-            # 方式 2: HTML 解析回退
+            params_html = {"q": query, "language": "zh-CN", "categories": "general"}
+            if time_range:
+                params_html["time_range"] = time_range
             resp2 = await client.get(
                 f"{SEARXNG_URL}/search",
-                params={"q": query, "language": "zh-CN", "categories": "general"},
+                params=params_html,
                 headers={"User-Agent": "QQBot/5.0", "Accept": "text/html"},
             )
             if resp2.status_code == 200:
@@ -79,15 +93,44 @@ async def search(query: str, max_results: int = 5) -> list[dict]:
         return []
 
 
+def _filter_by_age(results: list[dict], max_age_days: int) -> list[dict]:
+    """丢弃 publishedDate 早于 max_age_days 的结果。无日期的保留。"""
+    from datetime import datetime, timedelta
+    cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+    kept = []
+    for r in results:
+        pub = r.get("published", "")
+        if not pub:
+            kept.append(r)
+            continue
+        try:
+            pub_dt = datetime.fromisoformat(pub[:10])
+            if pub_dt >= cutoff:
+                kept.append(r)
+            else:
+                logger.debug(f"旧闻过滤: «{r.get('title','')[:30]}» published={pub[:10]}")
+        except Exception:
+            kept.append(r)
+    return kept
+
+
 def _format_results(results: list[dict]) -> list[dict]:
     """格式化 JSON API 结果"""
     formatted = []
     for r in results:
+        pub_raw = r.get("publishedDate", "") or ""
+        published = ""
+        if pub_raw:
+            try:
+                published = pub_raw[:10]
+            except Exception:
+                published = ""
         formatted.append({
             "title": r.get("title", ""),
             "url": r.get("url", ""),
             "content": (r.get("content", "") or r.get("snippet", ""))[:300],
             "engine": ", ".join(r.get("engines", [])) if isinstance(r.get("engines"), list) else r.get("engine", ""),
+            "published": published,
         })
     return formatted
 
@@ -147,7 +190,9 @@ def format_search_results(results: list[dict]) -> str:
 
     lines = ["【联网搜索结果】"]
     for i, r in enumerate(results, 1):
-        lines.append(f"{i}. {r['title']}")
+        pub = r.get("published", "")
+        pub_str = f" (发布:{pub})" if pub else ""
+        lines.append(f"{i}. {r['title']}{pub_str}")
         lines.append(f"   链接: {r['url']}")
         lines.append(f"   摘要: {r['content']}")
         lines.append("")
@@ -158,6 +203,12 @@ async def search_and_format(query: str, max_results: int = 5) -> str:
     """搜索并返回格式化文本"""
     results = await search(query, max_results)
     return format_search_results(results)
+
+
+async def search_recent(query: str, max_age_days: int = 7, max_results: int = 5) -> list[dict]:
+    """便捷封装：默认只搜最近一周"""
+    return await search(query, max_results=max_results,
+                        time_range="week", max_age_days=max_age_days)
 
 
 # ─── 搜索结果缓存 ───
