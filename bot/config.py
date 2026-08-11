@@ -45,6 +45,11 @@ class Config:
         ip.strip() for ip in os.getenv("WEB_ALLOWED_IPS", "").split(",") if ip.strip()
     ]  # IP 白名单（逗号分隔）
 
+    # --- 网站认证（加群验证网站模式）---
+    TURNSTILE_SITE_KEY: str = os.getenv("TURNSTILE_SITE_KEY", "")
+    TURNSTILE_SECRET_KEY: str = os.getenv("TURNSTILE_SECRET_KEY", "")
+    WEB_VERIFY_RATIO: int = max(0, min(100, int(os.getenv("WEB_VERIFY_RATIO", "50"))))
+
     # --- Bot 行为 ---
     BOT_NAME: str = os.getenv("BOT_NAME", "小Q")
     AUTO_ACCEPT_INVITE: bool = os.getenv("AUTO_ACCEPT_INVITE", "false").lower() == "true"
