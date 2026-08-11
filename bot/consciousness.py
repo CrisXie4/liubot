@@ -612,6 +612,7 @@ def on_mentioned(state: dict, user_name: str, group_id: int):
     apply_emotion_delta(state, "loneliness", -0.05)
     apply_emotion_delta(state, "boredom", -0.05)
     apply_emotion_delta(state, "curiosity", 0.03)
+    apply_emotion_delta(state, "irritation", -0.04)
     update_relationship(state, user_name, 0.03, "互动")
 
 
@@ -621,6 +622,7 @@ def on_replied_to_bot(state: dict, user_name: str):
     apply_emotion_delta(state, "joy", 0.03)
     apply_emotion_delta(state, "satisfaction", 0.04)
     apply_emotion_delta(state, "loneliness", -0.03)
+    apply_emotion_delta(state, "irritation", -0.04)
     update_relationship(state, user_name, 0.02, "回复")
 
 
@@ -629,6 +631,7 @@ def on_praised(state: dict, user_name: str):
     state["today"]["praised"] += 1
     apply_emotion_delta(state, "joy", 0.08)
     apply_emotion_delta(state, "satisfaction", 0.06)
+    apply_emotion_delta(state, "irritation", -0.08)
     if state["today"]["highlights"] is not None:
         state["today"]["highlights"].append(f"被{user_name}夸了 :96:")
     update_relationship(state, user_name, 0.05, "被夸")
