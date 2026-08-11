@@ -63,6 +63,9 @@ PUBLIC_PATHS = {
     "/api/auth", "/api/auth/login", "/api/auth/status",
     "/static", "/chart.min.js",
     "/login.html", "/assets",
+    "/v",  # 网站认证公开页
+    "/api/verify/code",  # 网站认证拉词接口
+    "/api/verify/config",  # 网站认证公开配置（sitekey）
 }
 
 
@@ -71,8 +74,13 @@ async def auth_middleware(request: Request, call_next):
     """JWT 鉴权：除了公开路径和静态资源，都需要 token"""
     path = request.url.path
 
-    # 公开路径放行
-    if path in PUBLIC_PATHS or path.startswith("/static") or path.endswith((".js", ".css", ".png", ".svg", ".ico", ".woff2", ".map", ".html")):
+    # 公开路径放行（含网站认证的 /v/<token> 和 /api/verify/code/<token>）
+    if (path in PUBLIC_PATHS
+            or path.startswith("/static")
+            or path.startswith("/v/")
+            or path.startswith("/api/verify/code/")
+            or path.startswith("/api/verify/config")
+            or path.endswith((".js", ".css", ".png", ".svg", ".ico", ".woff2", ".map", ".html"))):
         return await call_next(request)
 
     # API 鉴权

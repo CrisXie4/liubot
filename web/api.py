@@ -1571,6 +1571,9 @@ async def get_verify_history(limit: int = 50):
     approved = sum(1 for i in items if i["result"] == "approved")
     rejected = sum(1 for i in items if i["result"] == "rejected")
     timeout = sum(1 for i in items if i["result"] == "timeout")
+    approved_web = sum(1 for i in items if i["result"] == "approved_web")
+    rejected_web = sum(1 for i in items if i["result"] == "rejected_web")
+    timeout_web = sum(1 for i in items if i["result"] == "timeout_web")
 
     return {
         "items": items,
@@ -1579,8 +1582,83 @@ async def get_verify_history(limit: int = 50):
             "approved": approved,
             "rejected": rejected,
             "timeout": timeout,
+            "approved_web": approved_web,
+            "rejected_web": rejected_web,
+            "timeout_web": timeout_web,
         },
     }
+
+
+# ==================== 网站认证 — 公开接口 ====================
+
+@router.post("/verify/code/{token}")
+async def reveal_web_code(token: str, data: dict, request: Request):
+    """
+    网站认证：新人点完 Turnstile 后调，校验通过返回词。
+    公开接口（无需 JWT），但 token 一次性绑定 (group, user)。
+    """
+    from bot import verify as _verify
+    cf_token = (data or {}).get("cf_token", "")
+    if not cf_token:
+        raise HTTPException(400, "缺少人机验证 token")
+    remote_ip = request.client.host if request.client else ""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        remote_ip = forwarded.split(",")[0].strip()
+
+    result = await _verify.reveal_web_code(token, cf_token, remote_ip)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("message", "验证失败"))
+    return {"ok": True, "code": result["code"]}
+
+
+@router.get("/verify/config")
+async def verify_public_config():
+    """网站认证公开页需要的配置（sitekey）。公开接口。"""
+    from bot.config import config
+    return {"sitekey": config.TURNSTILE_SITE_KEY}
+
+
+# ==================== 网站认证 — 比例配置（需 JWT）====================
+
+@router.get("/verify/ratio")
+async def get_verify_ratio():
+    """获取网站认证模式概率（0-100）。复用 bot.verify._get_web_ratio()（DRY）。"""
+    from bot import verify as _verify
+    return {"ratio": _verify._get_web_ratio()}
+
+
+@router.post("/verify/ratio")
+async def set_verify_ratio(data: dict):
+    """保存网站认证模式概率（0-100）"""
+    ratio = data.get("ratio")
+    if ratio is None or not isinstance(ratio, int):
+        try:
+            ratio = int(ratio)
+        except Exception:
+            raise HTTPException(400, "ratio 必须是 0-100 的整数")
+    if not (0 <= ratio <= 100):
+        raise HTTPException(400, "ratio 必须是 0-100")
+
+    import os as _os, json as _json
+    from bot.config import config
+    path = _os.path.join(config.DATA_DIR, "bot_settings.json")
+    settings = {}
+    try:
+        if _os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                settings = _json.load(f)
+    except Exception:
+        settings = {}
+    settings["web_verify_ratio"] = ratio
+    try:
+        _os.makedirs(config.DATA_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(settings, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise HTTPException(500, f"保存失败: {e}")
+    logger.info(f"网站认证比例 → {ratio}%")
+    return {"ok": True, "ratio": ratio}
 
 
 # ==================== 日志查看 ====================
