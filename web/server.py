@@ -13,7 +13,7 @@ import time
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 
 from bot.config import config
 from bot.security import (
@@ -162,6 +162,19 @@ async def request_logging(request: Request, call_next):
     if path.startswith("/api/") and path not in ("/api/auth/status",):
         logger.debug(f"API {request.method} {path} → {response.status_code} ({elapsed_ms:.0f}ms)")
     return response
+
+
+# ─── 网站认证公开页（必须在 api router 和静态 mount 之前注册）───
+@app.get("/v", response_class=HTMLResponse)
+@app.get("/v/", response_class=HTMLResponse)
+@app.get("/v/{token}", response_class=HTMLResponse)
+async def verify_page(token: str = ""):
+    """网站认证公开页（无 token 访问显示已失效提示）。"""
+    v_html_path = os.path.join(STATIC_DIR, "v.html")
+    if not os.path.exists(v_html_path):
+        return HTMLResponse("页面不存在", status_code=404)
+    with open(v_html_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
 
 
 # ─── 引入路由 ───
