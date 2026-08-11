@@ -111,6 +111,7 @@ select {
   padding-right: 30px;
 }
 input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+input[type=range] { accent-color: var(--accent); cursor: pointer; }
 
 /* ─── 按钮 ─── */
 .btn {
