@@ -257,5 +257,72 @@ class TestLogVerificationFields(unittest.TestCase):
         self.assertEqual(items[0]["attempts"], 1)
 
 
+class TestMemberIncreaseDispatch(unittest.TestCase):
+
+    def setUp(self):
+        from bot import verify
+        self.verify = verify
+        verify._web_pending.clear()
+        verify._pending.clear()
+        verify._used_web_codes.clear()
+        verify._used_questions.clear()
+
+    def _make_bot(self):
+        bot = AsyncMock()
+        bot.bot_qq = 999
+        bot.get_group_member_info = AsyncMock(return_value={"card": "alice", "nickname": "A"})
+        return bot
+
+    def _patch_humanizer(self):
+        """mock send_human_like，避免拟人延迟。返回 patcher。"""
+        async def fake_send(bot, group_id, msg, **kw):
+            await bot.send_group_msg(group_id, msg)
+        return patch('bot.verify.send_human_like' if hasattr(self.verify, 'send_human_like')
+                     else 'bot.humanizer.send_human_like', new=fake_send)
+
+    def test_dispatch_to_web_mode(self):
+        """ratio=100 → 进群走网站模式"""
+        bot = self._make_bot()
+        async def fake_create(g, u, n):
+            import secrets
+            t = secrets.token_urlsafe(16)
+            self.verify._web_pending[t] = {
+                "group_id": g, "user_id": u, "user_name": n,
+                "code": "星空", "created_at": __import__('time').time(),
+                "wrong_attempts": 0, "revealed": False,
+            }
+            return t
+        # send_human_like 在函数内局部 import，patch bot.humanizer.send_human_like
+        async def fake_send(bot, group_id, msg, **kw):
+            await bot.send_group_msg(group_id, msg)
+        with patch.object(self.verify, '_pick_web_mode', return_value=True), \
+             patch.object(self.verify, 'create_web_challenge', new=fake_create), \
+             patch('bot.humanizer.send_human_like', new=fake_send):
+            _run(self.verify.handle_member_increase(bot, {
+                "group_id": 100, "user_id": 1001, "operator_id": 999,
+            }))
+        self.assertTrue(bot.send_group_msg.called)
+        all_msgs = []
+        for call in bot.send_group_msg.call_args_list:
+            all_msgs.append(call.args[1] if len(call.args) > 1 else call.kwargs.get('message', ''))
+        joined = '\n'.join(all_msgs)
+        self.assertIn("/v/", joined)
+        self.assertEqual(len(self.verify._web_pending), 1)
+
+    def test_dispatch_to_quiz_mode(self):
+        """ratio=0 → 进群走出题模式"""
+        bot = self._make_bot()
+        async def fake_send(bot, group_id, msg, **kw):
+            await bot.send_group_msg(group_id, msg)
+        with patch.object(self.verify, '_pick_web_mode', return_value=False), \
+             patch.object(self.verify, '_generate_question', new=AsyncMock(return_value=("1+1=?", "2"))), \
+             patch('bot.humanizer.send_human_like', new=fake_send):
+            _run(self.verify.handle_member_increase(bot, {
+                "group_id": 100, "user_id": 1001, "operator_id": 999,
+            }))
+        self.assertIn(1001, self.verify._pending.get(100, {}))
+        self.assertEqual(len(self.verify._web_pending), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -379,12 +379,15 @@ async def handle_member_increase(bot, event: dict):
             logger.debug(f"白名单放行发欢迎失败: {e}")
         return  # 不出题、不踢
 
-    # 已经在验证中？跳过（防重复触发）
+    # 已经在验证中？跳过（防重复触发，两种模式都查）
     if _pending.get(group_id, {}).get(user_id):
         return
+    if any(e["group_id"] == group_id and e["user_id"] == user_id for e in _web_pending.values()):
+        return
 
-    # 验证队列满了 → 直接踢掉，避免群里堆一堆未验证的人
-    if len(_pending.get(group_id, {})) >= MAX_PER_GROUP:
+    # 验证队列满了（两种模式合计）→ 直接踢掉，避免群里堆一堆未验证的人
+    web_count = sum(1 for e in _web_pending.values() if e["group_id"] == group_id)
+    if len(_pending.get(group_id, {})) + web_count >= MAX_PER_GROUP:
         logger.info(f"加群验证: 群{group_id} 队列已满，踢出 {user_id}")
         try:
             await bot._call("set_group_kick", {"group_id": group_id, "user_id": user_id})
@@ -403,6 +406,38 @@ async def handle_member_increase(bot, event: dict):
             user_name = card or nick or user_name
     except Exception:
         pass
+
+    # ── 模式分流：网站认证 or AI 出题 ──
+    if _pick_web_mode():
+        # ── 网站认证模式 ──
+        try:
+            token = await create_web_challenge(group_id, user_id, user_name)
+        except Exception as e:
+            logger.error(f"创建网站验证挑战失败: {e} → 回落出题模式")
+            token = None
+
+        if token:
+            from .humanizer import send_human_like
+            at_seg = f"[CQ:at,qq={user_id}]"
+            site_url = _build_site_url(token)
+            msg = (
+                f"{at_seg} 欢迎入群~\n"
+                f"请打开下面的链接完成验证（5分钟内）：\n\n"
+                f"🌐 {site_url}\n\n"
+                f"打开后点击「我是人类」按钮，\n"
+                f"把看到的词发到群里告诉我\n"
+                f"答对留下 :96:\n"
+                f"答错3次踢出 :178:"
+            )
+            try:
+                await send_human_like(bot, group_id, msg)
+                logger.info(f"网站验证: 已向 {user_name}({user_id}) 群{group_id} 发链接 token={token[:_TOKEN_LOG_LEN]}...")
+            except Exception as e:
+                logger.error(f"群内发送网站验证链接失败: {e}")
+                _cleanup_web_user(group_id, user_id)
+                return
+            asyncio.create_task(_timeout_kick_web(bot, group_id, user_id, user_name, token))
+            return  # 网站模式已处理，不走下面出题
 
     # AI 出题
     try:
@@ -468,6 +503,38 @@ async def _timeout_kick(bot, group_id: int, user_id: int, user_name: str):
     except Exception:
         pass
     _cleanup_user(group_id, user_id)
+
+
+async def _timeout_kick_web(bot, group_id: int, user_id: int, user_name: str, token: str):
+    """网站认证超时自动踢出"""
+    await asyncio.sleep(VERIFY_TIMEOUT)
+    if not _web_pending.get(token):
+        return  # 已处理
+    logger.info(f"🌐 网站验证超时: {user_name}({user_id}) → 自动踢出")
+    _log_verification(user_id, user_name, group_id, "timeout_web",
+                      "", "", "超时未完成", method="web", attempts=0)
+    try:
+        await bot._call("set_group_kick", {"group_id": group_id, "user_id": user_id})
+    except Exception as e:
+        logger.error(f"超时踢人失败: {e}")
+    try:
+        from .humanizer import send_human_like
+        await send_human_like(
+            bot, group_id,
+            f"⏰ [CQ:at,qq={user_id}] 验证超时，已请出群聊~",
+        )
+    except Exception:
+        pass
+    _cleanup_web_token(token)
+
+
+def _build_site_url(token: str) -> str:
+    """构造新人验证链接。
+
+    优先用环境变量 WEB_VERIFY_SITE；否则回退到固定域名 qqbot.crisxie.top。
+    """
+    site = os.getenv("WEB_VERIFY_SITE", "https://qqbot.crisxie.top")
+    return f"{site.rstrip('/')}/v/{token}"
 
 
 # ═══════════════════════════════════════════════════════════
