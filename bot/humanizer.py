@@ -136,7 +136,7 @@ def split_bubbles(text: str, max_bubbles: int = MAX_BUBBLES) -> list[str]:
 
     # 整体很短（<60字 且 ≤3行）→ 不拆，合并为一条
     total_visible = sum(_visible_len(p) for p in parts)
-    if total_visible < 60 and len(parts) <= 3:
+    if total_visible < 35 and len(parts) <= 2:
         return [_tidy_bubble(" ".join(parts))]
 
     pieces: list[str] = []

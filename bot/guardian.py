@@ -405,6 +405,24 @@ def check_essence_rate(group_id: int) -> bool:
     )
 
 
+def check_proactive_rate(group_id: int) -> bool:
+    """主动消息（volition SPEAK + 新闻分享）软限速：每群每小时最多 8 条"""
+    cfg = load_config().get("thresholds", {})
+    return _check_rate(
+        group_id, "proactive", 1,
+        cfg.get("proactive_hourly_per_group", 8),
+    )
+
+
+def check_auto_emoji_rate(group_id: int) -> bool:
+    """自动表情表态限速：每群每小时最多 8 次"""
+    cfg = load_config().get("thresholds", {})
+    return _check_rate(
+        group_id, "auto_emoji", 1,
+        cfg.get("auto_emoji_hourly_per_group", 8),
+    )
+
+
 def pick_placeholder() -> str:
     """随机选一条占位文案（重度动作触发时群里先发）"""
     msgs = load_config().get("judge", {}).get(

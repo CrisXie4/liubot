@@ -242,10 +242,13 @@ async def main():
     # 设为 time.time() - 590，让 consciousness_loop 启动后 10 秒内触发首次 QQ 状态同步
     # 必须在 bot.connect() 之后（WS 已连接）才能调 API
     _last_status_sync = time.time() - 590
+    # ★ Volition 询问节奏：8-12 分钟带随机抖动（不是"不让发"，是"不每分钟都打扰它思考"）
+    # 启动后 8-12 分钟再首次询问（给它一点观察群里情况的时间）
+    _next_volition_check = time.time() + random.uniform(480, 720)
 
     async def consciousness_loop():
         """意识主循环 — 每分钟 tick 一次"""
-        nonlocal _last_summary_date, _last_reflection_hour, _last_status_sync
+        nonlocal _last_summary_date, _last_reflection_hour, _last_status_sync, _next_volition_check
         # 播报醒来（只记内心状态，不要写成问候语——日记会被喂给模型当上下文）
         state = cs.get_state()
         if not state.get("sleeping"):
@@ -269,9 +272,24 @@ async def main():
             except Exception as e:
                 logger.debug(f"补发队列扫描跳过: {e}")
 
-            # ── 1.5 空闲思考（群安静时 LLM 自主产生内心戏）──
+            # ── 1.5 空闲思考（群安静时 LLM 自主产生内心戏 + 可能说出口）──
             if cs.should_idle_think(state):
-                asyncio.create_task(cs.generate_idle_thought(state))
+                async def _idle_think_and_maybe_speak():
+                    """合并 Volition：思考后如果 LLM 想说就发到群里。"""
+                    try:
+                        _thought, speak_text = await cs.generate_idle_thought(state)
+                        if speak_text:
+                            # LLM 决定要说话 → 发到所有群
+                            r = await bot._call("get_group_list", {})
+                            groups = r.get("data", []) if r.get("status") == "ok" else []
+                            for g in groups:
+                                gid = g.get("group_id", 0)
+                                if gid:
+                                    await send_human_like(bot, gid, speak_text)
+                                    await asyncio.sleep(random.uniform(4, 7))
+                    except Exception as e:
+                        logger.debug(f"空闲思考+发言失败: {e}")
+                asyncio.create_task(_idle_think_and_maybe_speak())
 
             # ── 2. QQ 状态同步（每 10 分钟检查一次）──
             if time.time() - _last_status_sync > 600:
@@ -285,20 +303,27 @@ async def main():
             if current_hour % 6 == 0 and now.minute == 0:
                 asyncio.create_task(bot_mod.memory.compress_memories())
 
-            # ── 4. 主动行为（意识驱动：无聊找人聊天、好奇心学习等）──
-            if not state.get("sleeping") and cs.should_be_active(state):
-                try:
-                    proactive_msg = await maybe_proactive_action(bot)
-                    if proactive_msg:
-                        r = await bot._call("get_group_list", {})
-                        groups = r.get("data", []) if r.get("status") == "ok" else []
-                        for g in groups:
-                            gid = g.get("group_id", 0)
-                            if gid:
-                                await bot.send_group_msg(gid, proactive_msg)
-                                await asyncio.sleep(random.uniform(4, 7))
-                except Exception as e:
-                    logger.debug(f"主动行为跳过: {e}")
+            # ── 4. 主动行为（volition 驱动：LLM 自主决定说不说话）──
+            # ★ 先检查被忽视状态（不改情绪，只更新 consecutive_ignored 事实）
+            cs.check_and_update_ignored(state)
+
+            # ★ 询问节奏：8-12 分钟带抖动（不是不让发，是不每分钟都打扰它思考）
+            # 只要 LLM 说 SPEAK 就立即发，没有任何上限
+            if time.time() >= _next_volition_check:
+                _next_volition_check = time.time() + random.uniform(480, 720)
+                if not state.get("sleeping") and cs.should_be_active(state):
+                    try:
+                        proactive_msg = await maybe_proactive_action(bot)
+                        if proactive_msg:
+                            r = await bot._call("get_group_list", {})
+                            groups = r.get("data", []) if r.get("status") == "ok" else []
+                            for g in groups:
+                                gid = g.get("group_id", 0)
+                                if gid and guardian.check_proactive_rate(gid):
+                                    await send_human_like(bot, gid, proactive_msg)
+                                    await asyncio.sleep(random.uniform(4, 7))
+                    except Exception as e:
+                        logger.debug(f"volition 跳过: {e}")
 
             # ── 5. 新闻分享（每 2 小时）──
             try:
@@ -327,7 +352,10 @@ async def main():
                                     msg_to_send = "[CQ:at,qq=all] " + msg_to_send
                                 elif isinstance(msg_to_send, list):
                                     msg_to_send = [{"type": "at", "data": {"qq": "all"}}] + msg_to_send
-                        await bot.send_group_msg(gid, msg_to_send)
+                        if isinstance(msg_to_send, str) and guardian.check_proactive_rate(gid):
+                            await send_human_like(bot, gid, msg_to_send)
+                        else:
+                            await bot.send_group_msg(gid, msg_to_send)
                         await asyncio.sleep(random.uniform(5, 8))
             except Exception as e:
                 logger.debug(f"新闻分享跳过: {e}")
