@@ -128,6 +128,9 @@ def get_mood_prompt() -> str:
 def on_bot_mentioned(user_name: str, group_id: int):
     """被人 @ 了"""
     state = cs.get_state()
+    if state.get("sleeping"):
+        cs.wake_up(state, cranky=True)
+        logger.info(f"💤 被 {user_name} 叫醒，带起床气")
     cs.on_mentioned(state, user_name, group_id)
     _check_mood_change(state, "被@")
 
@@ -747,6 +750,7 @@ async def decide_and_speak(bot):
             "你想说话就说，不想说就不说。没人逼你。\n"
             "想说 → 回复：SPEAK: <内容，20字以内，要跟当前时间/心情对得上>\n"
             "不想说 → 回复：SILENT: <一句话原因，写给自己看>\n"
+            f"想睡觉 → 回复：SLEEP: <分钟数，30-480>（你现在困意 {state.get('sleepiness', 0):.0%}）\n"
             "格式必须严格按上面来，不要加别的。"
         )
 
@@ -779,6 +783,15 @@ async def decide_and_speak(bot):
             reason = raw.split(":", 1)[1].strip()[:50]
             cs.add_diary(state, f"选择沉默：{reason}", mood)
             logger.info(f"🤫 Volition SILENT [{mood}]: {reason}")
+            return None
+        elif upper.startswith("SLEEP:"):
+            minutes_str = raw.split(":", 1)[1].strip()
+            try:
+                minutes = int("".join(c for c in minutes_str if c.isdigit()))
+            except Exception:
+                minutes = 90
+            cs.go_to_sleep(state, minutes)
+            logger.info(f"😴 Volition SLEEP: 自主决定睡 {minutes} 分钟")
             return None
         else:
             # 格式不符 → 默认按 SILENT 处理

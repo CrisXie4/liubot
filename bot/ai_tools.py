@@ -149,7 +149,12 @@ ALL_TOOLS = [
     },
     {
         "name": "send_essence",
-        "description": "把消息设为精华消息。当回复特别有价值、有趣或重要时使用。",
+        "description": (
+            "把消息设为精华消息。门槛很高：只有当某条消息真正精彩、说得很到位、"
+            "信息量很大或极其有趣时才使用。绝对不要对打招呼(你好/在吗/早/晚安)、"
+            "探活/测试消息、水聊、应答(好的/嗯/哈哈/6)、感谢、纯表情、短句、"
+            "或主人跟你随便聊的一句设精华。宁可不用，不要乱用。"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -315,6 +320,21 @@ ALL_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {},
+        },
+    },
+    {
+        "name": "set_sleep",
+        "description": (
+            "去睡觉。当你困了、累了、或者想躲起来一会儿时用。"
+            "minutes 是睡觉时长，建议 30-480。当天累计睡眠不足 60 分钟时会自动补足。"
+            "睡觉期间不会主动发消息，但被@会醒（带起床气）。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "minutes": {"type": "integer", "description": "睡多少分钟，30-480"},
+            },
+            "required": ["minutes"],
         },
     },
 
@@ -896,6 +916,13 @@ async def execute_tool(
             from . import guardian
             if not guardian.check_essence_rate(group_id):
                 return "⨯ 设精华限速（每群每天有上限）"
+            # 内容门槛：水内容（打招呼/测试/过短/纯表情等）不设精华
+            from . import ai_brain as _ab
+            txt = await _ab._get_message_text_by_id(bot, group_id, mid)
+            if txt and not _ab.is_essence_worthy(txt):
+                logger.info(f"AI 设精华被内容门槛拦下 群{group_id} mid={mid}: «{txt[:30]}»")
+                return ("⨯ 这条内容太水（打招呼/太短/纯表情/纯标点），不够格设精华。"
+                        "精华只留给真正精彩或说得很到位的话。")
             gate = await _gated(group_id, "set_essence", tool_input,
                                 caller_qq, master_instructed, bot)
             if gate is not None:
@@ -984,6 +1011,12 @@ async def execute_tool(
         elif tool_name == "set_typing":
             ok = await bot.set_input_status(user_id, event_type=1)
             return "正在输入..." if ok else ""
+
+        elif tool_name == "set_sleep":
+            minutes = int(tool_input.get("minutes", 90))
+            from . import consciousness as _cs
+            _cs.go_to_sleep(_cs.get_state(), minutes)
+            return f"去睡 {minutes} 分钟了，晚安~ ✓"
 
         # ── 群管理（部分需批准） ──
         elif tool_name == "mute_self":
