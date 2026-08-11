@@ -5,12 +5,21 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>加群验证</title>
 <style>
+  :root {
+    --accent: #2f6f57;
+    --accent3: #5fa286;
+    --accent-soft: #eaf3ee;
+    --red: #c2363d;
+    --fg: #1c1d22;
+    --fg2: #5b5d68;
+    --fg3: #8d8f99;
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent3) 100%);
     min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    padding: 20px; color: #333;
+    padding: 20px; color: var(--fg);
   }
   .card {
     background: #fff; border-radius: 16px; padding: 32px 24px;
@@ -19,17 +28,17 @@
   }
   .brand { font-size: 40px; margin-bottom: 8px; }
   h1 { font-size: 20px; margin-bottom: 6px; }
-  .sub { font-size: 13px; color: #888; margin-bottom: 24px; }
+  .sub { font-size: 13px; color: var(--fg3); margin-bottom: 24px; }
   #step-captcha { margin-bottom: 20px; display: flex; justify-content: center; min-height: 65px; }
   #step-code { display: none; }
   .code-word {
     font-size: 48px; font-weight: 700; letter-spacing: 8px;
-    color: #764ba2; margin: 16px 0; padding: 16px;
-    background: #f5f3ff; border-radius: 12px;
+    color: var(--accent); margin: 16px 0; padding: 16px;
+    background: var(--accent-soft); border-radius: 12px;
   }
-  .hint { font-size: 13px; color: #666; line-height: 1.6; margin-top: 12px; }
-  .err { color: #e53e3e; font-size: 14px; margin-top: 12px; }
-  .loading { color: #888; font-size: 13px; }
+  .hint { font-size: 13px; color: var(--fg2); line-height: 1.6; margin-top: 12px; }
+  .err { color: var(--red); font-size: 14px; margin-top: 12px; }
+  .loading { color: var(--fg3); font-size: 13px; }
 </style>
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
@@ -48,7 +57,7 @@
     <div class="code-word" id="code-display" style="display:none"></div>
     <div class="hint" id="code-hint" style="display:none">
       请把上方的词 <strong>@机器人</strong> 发到群里完成验证<br>
-      <span style="color:#e53e3e">词必须完全一致（空格标点可忽略）</span>
+      <span style="color:var(--red)">词必须完全一致（空格标点可忽略）</span>
     </div>
   </div>
 
