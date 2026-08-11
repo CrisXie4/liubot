@@ -32,16 +32,17 @@ STATE_PATH = os.path.join(config.DATA_DIR, "consciousness.json")
 DEFAULT_STATE = {
     # ── 核心情绪（0-1，各维度独立）──
     "emotions": {
-        "joy": 0.65,        # 快乐
-        "calm": 0.60,       # 平静
-        "energy": 0.70,     # 精力
-        "curiosity": 0.55,  # 好奇心
-        "social": 0.60,     # 社交欲
-        "irritation": 0.15, # 烦躁度
-        "boredom": 0.30,    # 无聊度
-        "loneliness": 0.25, # 孤独感
-        "satisfaction": 0.60, # 满足感
-        "sadness": 0.15,    # 难过（对群聊内容的共情反应，非自恋情绪）
+        "joy": 0.65,
+        "calm": 0.60,
+        "energy": 0.70,
+        "curiosity": 0.55,
+        "social": 0.60,
+        "irritation": 0.15,
+        "boredom": 0.30,
+        "loneliness": 0.25,
+        "satisfaction": 0.60,
+        "sadness": 0.15,
+        "sleepiness": 0.0,
     },
 
     # ── 当前"在想"的东西 ──
@@ -85,6 +86,10 @@ DEFAULT_STATE = {
     "sleeping": False,
     "last_sleep_time": "",
     "last_wake_time": "",
+    "sleepiness": 0.0,
+    "sleeping_until": "",
+    "last_24h_sleep_minutes": 0,
+    "last_wake_ts": 0.0,
 
     # ── 群活跃感知 ──
     "last_group_activity": "",       # 最后一次群里有消息的时间
@@ -131,6 +136,16 @@ def _migrate_v1_to_v2(state: dict):
         e["loneliness"] = 0.85
     if e.get("boredom", 0) > 0.9:
         e["boredom"] = 0.85
+    if "sleepiness" not in state:
+        state["sleepiness"] = 0.0
+    if "sleeping_until" not in state:
+        state["sleeping_until"] = ""
+    if "last_24h_sleep_minutes" not in state:
+        state["last_24h_sleep_minutes"] = 0
+    if "last_wake_ts" not in state:
+        state["last_wake_ts"] = 0.0
+    if "sleepiness" not in e:
+        e["sleepiness"] = 0.0
     state["version"] = 2
 
 
@@ -566,31 +581,18 @@ def apply_emotion_delta(state: dict, emotion: str, delta: float):
 
 
 def apply_circadian(state: dict):
-    """应用昼夜节律修正"""
+    """应用昼夜节律修正 — 不再硬触发 sleeping，改为影响情绪"""
     mods = get_circadian_modifiers()
     for emotion, delta in mods.items():
         if emotion in state["emotions"]:
-            # 昼夜节律的影响是渐进的、温和的
             apply_emotion_delta(state, emotion, delta * 0.02)
 
-    # 睡觉/醒来
-    if mods.get("sleeping") and not state.get("sleeping"):
-        # 很晚了 → 可能去睡觉
-        if state["emotions"]["energy"] < 0.25:
-            state["sleeping"] = True
-            state["last_sleep_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-            add_diary(state, "撑不住了，睡了", "tired")
-            logger.info("😴 进入睡眠状态")
-    elif not mods.get("sleeping") and state.get("sleeping"):
-        # 该醒了 —— 日记只记状态，不写问候语。
-        # 写成"早上好"之类的话会被当成"最近在想"喂给模型，
-        # 结果就是它跑去群里复读一句问候（哪怕当时根本不是打招呼的场合）。
+    if state.get("sleeping") and not mods.get("sleeping"):
         state["sleeping"] = False
-        state["last_wake_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        state["last_wake_ts"] = timeutil.now_shanghai().timestamp()
         state["emotions"]["energy"] = max(state["emotions"]["energy"], 0.5)
-        state["emotions"]["curiosity"] = max(state["emotions"]["curiosity"], 0.3)
         add_diary(state, f"醒了，现在{datetime.now().strftime('%H点')}", "refreshed")
-        logger.info("🌅 醒来")
+        logger.info("🌅 醒来（昼夜节律）")
 
 
 def apply_natural_decay(state: dict, elapsed_minutes: float):
@@ -610,6 +612,123 @@ def apply_natural_decay(state: dict, elapsed_minutes: float):
             cap = EMOTION_BASELINE.get(emotion, 0.25) + 0.6
             cap = min(cap, EMOTION_MAX)
             state["emotions"][emotion] = min(cap, state["emotions"][emotion] + growth)
+
+
+SLEEPINESS_RATES = {
+    "deep_night": (0, 6, 0.015),
+    "late_night": (23, 24, 0.010),
+    "food_coma": (13, 14, 0.003),
+    "default": (0, 0, 0.001),
+}
+
+
+def update_sleepiness(state: dict, elapsed_minutes: float):
+    """根据时段 + 连续清醒时长累积困意"""
+    now = timeutil.now_shanghai()
+    hour = now.hour
+
+    rate = SLEEPINESS_RATES["default"][2]
+    for label, (start, end, r) in SLEEPINESS_RATES.items():
+        if label == "default":
+            continue
+        if start <= hour < end:
+            rate = r
+            break
+
+    awake_boost = 1.0
+    last_wake = state.get("last_wake_ts", 0)
+    if last_wake:
+        awake_hours = (now.timestamp() - last_wake) / 3600
+        if awake_hours > 1:
+            awake_boost = 1.0 + min(awake_hours * 0.2, 2.0)
+
+    delta = rate * elapsed_minutes * awake_boost
+    state["sleepiness"] = min(1.0, state.get("sleepiness", 0.0) + delta)
+    state.setdefault("emotions", {})["sleepiness"] = state["sleepiness"]
+
+
+SLEEP_MIN_MINUTES = 20
+SLEEP_MAX_MINUTES = 480
+DAILY_SLEEP_FLOOR = 60
+
+
+def go_to_sleep(state: dict, minutes: int):
+    """执行入睡。强制补齐当日睡眠底线。"""
+    minutes = max(SLEEP_MIN_MINUTES, min(SLEEP_MAX_MINUTES, minutes))
+
+    already = state.get("last_24h_sleep_minutes", 0)
+    if already + minutes < DAILY_SLEEP_FLOOR:
+        minutes = DAILY_SLEEP_FLOOR - already
+        logger.info(f"睡眠补齐到 {minutes} 分钟（满足 60 分钟底线）")
+
+    from datetime import timedelta
+    wake_at = timeutil.now_shanghai() + timedelta(minutes=minutes)
+    state["sleeping"] = True
+    state["sleeping_until"] = wake_at.strftime("%Y-%m-%dT%H:%M:%S")
+    state["sleepiness"] = min(state.get("sleepiness", 0.5), 0.3)
+    state.setdefault("emotions", {})["sleepiness"] = state["sleepiness"]
+    state["_sleep_start_ts"] = time.time()
+    add_diary(state, f"困了，去睡 {minutes} 分钟", "tired")
+    logger.info(f"😴 入睡 {minutes} 分钟，醒于 {state['sleeping_until']}")
+
+
+def wake_up(state: dict, cranky: bool = False):
+    """执行醒来。cranky=True 时带起床气（被吵醒）。"""
+    minutes_slept = 0
+    sleep_start = state.pop("_sleep_start_ts", 0)
+    if sleep_start:
+        minutes_slept = max(0, int((time.time() - sleep_start) / 60))
+
+    state["sleeping"] = False
+    state["sleeping_until"] = ""
+    state["sleepiness"] = 0.0
+    state.setdefault("emotions", {})["sleepiness"] = 0.0
+    state["last_wake_ts"] = timeutil.now_shanghai().timestamp()
+    state["last_24h_sleep_minutes"] = state.get("last_24h_sleep_minutes", 0) + max(0, minutes_slept)
+
+    energy_gain = min(0.5, minutes_slept * 0.005)
+    apply_emotion_delta(state, "energy", energy_gain)
+
+    if cranky:
+        apply_emotion_delta(state, "irritation", 0.10)
+        state["sleepiness"] = 0.3
+        add_diary(state, "被叫醒了…有点烦", "grumpy")
+    else:
+        if minutes_slept >= 30:
+            add_diary(state, f"睡了 {minutes_slept} 分钟，精神多了", "refreshed")
+    logger.info(f"🌅 醒来（睡了约 {minutes_slept} 分钟{'，带起床气' if cranky else ''}）")
+
+
+MAX_AWAKE_HOURS = 23
+FORCED_SLEEP_MINUTES = 90
+
+
+def _check_wake_up(state: dict):
+    """检查是否到该醒来的时间"""
+    wake_str = state.get("sleeping_until", "")
+    if not wake_str:
+        return
+    try:
+        from datetime import datetime as _dt
+        wake_at = _dt.fromisoformat(wake_str)
+        if timeutil.now_shanghai() >= wake_at:
+            wake_up(state, cranky=False)
+    except Exception:
+        pass
+
+
+def _check_forced_sleep(state: dict):
+    """连续清醒 > 23h 或 sleepiness >= 0.98 → 强制睡"""
+    sleepiness = state.get("sleepiness", 0)
+    if sleepiness >= 0.98:
+        go_to_sleep(state, FORCED_SLEEP_MINUTES)
+        return
+    last_wake = state.get("last_wake_ts", 0)
+    if last_wake:
+        awake_hours = (timeutil.now_shanghai().timestamp() - last_wake) / 3600
+        if awake_hours >= MAX_AWAKE_HOURS:
+            logger.warning(f"连续清醒 {awake_hours:.1f}h，强制入睡")
+            go_to_sleep(state, FORCED_SLEEP_MINUTES)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1171,14 +1290,16 @@ def tick(state: dict):
     _last_tick_time = now
     _tick_count += 1
 
-    # 情绪衰减
     elapsed_minutes = max(elapsed / 60, 1)
     apply_natural_decay(state, elapsed_minutes)
-
-    # 昼夜节律
     apply_circadian(state)
+    update_sleepiness(state, elapsed_minutes)
 
-    # 每日重置
+    if state.get("sleeping"):
+        _check_wake_up(state)
+    else:
+        _check_forced_sleep(state)
+
     check_daily_reset(state)
 
     # 每 15 分钟保存一次
