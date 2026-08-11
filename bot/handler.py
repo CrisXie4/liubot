@@ -1270,6 +1270,14 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             except Exception:
                 pass
 
+            try:
+                from .auto_emoji import maybe_react
+                import re as _re_emoji
+                clean_for_emoji = _re_emoji.sub(r"\[CQ:[^\]]+\]", "", raw_message or "").strip()
+                asyncio.create_task(maybe_react(bot, group_id, message_id, clean_for_emoji))
+            except Exception:
+                pass
+
         # ★ 短期上下文：把每条群消息都记进回复上下文，让小六被 @ 时能"看到"
         # 刚才群里在聊什么（修复"聊着聊着就忘了话题"）。小六自己的消息不记——
         # 它的回复由 chat_reply / try_proactive_chat 以 assistant 身份记录。
@@ -2080,6 +2088,9 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             _set_followup(group_id, user_id, user_name)  # 被 @ → 记住对话者
             # 🧠 意识：被 @ 了 → 开心
             ai_brain.on_bot_mentioned(user_name, group_id)
+            # ★ Volition: 被回应了 → 被忽视计数清零（不改情绪，只清事实计数）
+            from .consciousness import reset_ignored_counter as _reset_ig, get_state as _cs_state
+            _reset_ig(_cs_state())
             # 🧠 简单情感检测：被夸/被怼
             _detect_sentiment_and_react(chat_text, user_name)
         elif kw_trigger:
@@ -2176,6 +2187,9 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             memory.window_add_message(group_id, int(bot.bot_qq), group_personality.get_group_bot_name(group_id), clean_text or reply)
             # 🧠 意识：成功回复了
             ai_brain.on_bot_replied_to(user_name)
+            # ★ Volition: 被回应了 → 被忽视计数清零（不改情绪，只清事实计数）
+            from .consciousness import reset_ignored_counter as _reset_ig, get_state as _cs_state
+            _reset_ig(_cs_state())
         else:
             await humanizer.send_human_like(
                 bot, group_id,
