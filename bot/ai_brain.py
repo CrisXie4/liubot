@@ -12,6 +12,7 @@ v3.0: 全面接入自我意识引擎 (bot/consciousness.py)
 import asyncio
 import logging
 import random
+import re
 import time
 from datetime import datetime
 from typing import Optional
@@ -193,11 +194,21 @@ def _check_mood_change(state: dict, trigger: str):
 #  自主学习 + 新闻分享
 # ═══════════════════════════════════════════════════════════
 
-LEARN_INTERVAL = 1800  # 30 分钟
+LEARN_INTERVAL = 60  # 防同一秒内连调
 _last_learn_time = 0
 
-NEWS_SHARE_INTERVAL = 7200  # 2 小时
-_last_news_share = 0
+
+def _is_news_too_old(published: str, max_age_days: int = 30) -> bool:
+    """判断新闻发布日期是否太旧。空日期返回 False（放行让 LLM 判断）。"""
+    if not published:
+        return False
+    try:
+        from datetime import datetime, timedelta
+        pub = datetime.fromisoformat(published[:10])
+        cutoff = datetime.utcnow() - timedelta(days=max_age_days)
+        return pub < cutoff
+    except Exception:
+        return False
 
 
 async def _fetch_image_segment(image_url: str) -> Optional[dict]:
@@ -260,8 +271,8 @@ async def autonomous_learn(bot) -> Optional[dict]:
         return None
 
     # 选一个感兴趣的方向 — 偶尔参考群友兴趣
-    topics_pool = ["AI 最新进展", "科技新闻", "编程技术", "游戏资讯", "动漫资讯",
-                   "有趣的冷知识", "互联网热点", "数码产品"]
+    topics_pool = ["AI 最新进展", "本周科技新闻", "编程技术", "本周游戏发布", "本周新番动画",
+                   "有趣的冷知识", "本周互联网热点", "本周数码产品"]
     # 30% 概率根据群友兴趣选题
     if random.random() < 0.3:
         try:
@@ -282,7 +293,7 @@ async def autonomous_learn(bot) -> Optional[dict]:
             pass
     topic = random.choice(topics_pool)
     # 好奇心越强，搜索越认真
-    angles = ["最新消息", "今日新闻", "有趣的事", "热门话题", "重大突破"]
+    angles = ["最新", "今天", "本周", "最近", "2026"]
     query = f"{topic} {random.choice(angles)}"
 
     ms = memory.load_model_settings()
@@ -291,14 +302,15 @@ async def autonomous_learn(bot) -> Optional[dict]:
 
     try:
         from . import web_search
-        text_results = await web_search.search(query, max_results=5)
+        text_results = await web_search.search_recent(query, max_age_days=7, max_results=5)
         image_results = await web_search.search_images(query, max_results=3)
 
         if not text_results:
             return None
 
         search_text = "\n".join(
-            f"{i+1}. {r['title']}: {r['content'][:150]}" for i, r in enumerate(text_results[:3])
+            f"{i+1}. {r['title']} (发布:{r.get('published','未知')}): {r['content'][:150]}"
+            for i, r in enumerate(text_results[:3])
         )
 
         response = await llm_call.llm_create(
@@ -308,6 +320,8 @@ async def autonomous_learn(bot) -> Optional[dict]:
             system=f"你现在{cs.get_dominant_mood(state)}。根据搜索结果做两件事：\n"
                    "1. 判断这些新闻是否值得分享给群友（够新鲜、够有趣、与群友兴趣相关）\n"
                    "2. 用一句话（50字内）总结其中最值得分享的一条，要有你的个人态度\n\n"
+                   "⚠️ 新鲜度硬约束：任何一条发布日期早于 7 天前都不能算\"够新鲜\"，必须 DECISION: no。\n"
+                   "只有发布日期在 7 天内的才算新。没有日期的可以放宽。\n\n"
                    "输出格式:\n"
                    "DECISION: yes 或 no\n"
                    "SUMMARY: 你的总结（50字内）",
@@ -375,7 +389,13 @@ async def autonomous_learn(bot) -> Optional[dict]:
         cs.add_diary(state, f"学到了「{news_text[:40]}」，准备分享给群友", "curious")
 
         logger.info(f"AI 学习: {query} → {news_text[:60]}" + (" [图]" if image_url else ""))
-        return {"text": news_text, "image_url": image_url, "decision": "yes", "topic": topic}
+        latest_pub = ""
+        if text_results:
+            pubs = [r.get("published", "") for r in text_results if r.get("published")]
+            if pubs:
+                latest_pub = max(pubs)
+        return {"text": news_text, "image_url": image_url, "decision": "yes",
+                "topic": topic, "latest_published": latest_pub}
 
     except Exception as e:
         logger.debug(f"自主学习失败: {e}")
@@ -383,29 +403,25 @@ async def autonomous_learn(bot) -> Optional[dict]:
 
 
 async def share_news_if_ready(bot):
-    """如果到时间了而且心情不错，分享新闻。返回消息(str 或消息段 list)或 None"""
-    global _last_news_share
-    now = time.time()
-    if now - _last_news_share < NEWS_SHARE_INTERVAL:
-        return None
-
+    """分享新闻（无冷却硬限制，由软限速兜底）。返回消息(str 或消息段 list)或 None"""
     state = cs.get_state()
 
-    # 睡觉/深夜静默/极度烦躁 → 不分享
     ok, why = cs.can_speak_proactively(state)
     if not ok:
         logger.debug(f"新闻分享跳过: {why}")
-        return None
-    if state["emotions"]["irritation"] > 0.6:
         return None
 
     result = await autonomous_learn(bot)
     if not result:
         return None
 
-    _last_news_share = now
-
     if result.get("decision") == "no":
+        return None
+
+    latest_published = result.get("latest_published", "")
+    if _is_news_too_old(latest_published, max_age_days=30):
+        logger.info(f"新闻太旧，放弃分享: published={latest_published}")
+        cs.add_diary(state, f"查到的都是旧闻（{latest_published}），算了", "meh")
         return None
 
     text = result.get("text", "")
@@ -432,10 +448,84 @@ _BIG_NEWS_KEYWORDS = (
 
 
 def is_big_news(text: str) -> bool:
-    """判断一段新闻文本是否属于"重大"（值得 @全体）。"""
+    """判断一段新闻文本是否属于“重大”（值得 @全体）。"""
     if not text:
         return False
     return any(kw in text for kw in _BIG_NEWS_KEYWORDS)
+
+
+# 明显不够格设精华的整句 token（去空白后精确匹配，大小写不敏感）
+_TRIVIAL_ESSENCE_TOKENS = {
+    # 打招呼 / 问候
+    "你好", "您好", "你们好", "你们好吗", "大家早", "大家早上好", "大家晚上好",
+    "早上好", "早", "早安", "早呀", "中午好", "下午好", "晚上好", "晚安", "哈喽",
+    "哈罗", "嗨", "嗨呀", "hi", "hello", "hey", "yo",
+    # 应答 / 水
+    "在吗", "在么", "在不在", "在", "嗯", "嗯嗯", "哦", "额", "啊", "哈", "唉",
+    "哎", "哎呀", "好的", "好", "好呀", "ok", "okay", "okk", "yes", "收到",
+    "了解", "知道", "知道啦", "明白", "行", "可以", "对的", "是的", "没问题",
+    # 感谢 / 客套
+    "谢谢", "谢了", "thanks", "thx", "多谢", "辛苦了", "麻烦你了",
+    # 笑 / 语气 / 称赞（太短的）
+    "哈哈", "哈哈哈", "哈哈哈哈", "呵呵", "嘻嘻", "嘿", "嘿嘿", "666", "6666",
+    "6", "牛", "牛逼", "厉害", "瑞思拜", "卧槽", "我操", "草", "绝了",
+    # 测试 / 探活
+    "测试", "test", "1", "111", "？", "?", "你是谁", "你是机器人吗", "你是ai吗",
+    "你是真的吗", "你是人吗", "你在吗", "活着吗", "在吗在吗", "你是活的吗",
+}
+
+# 纯笑声 / 纯标点 / 纯表情 的整句模式
+_TRIVIAL_ESSENCE_RE = re.compile(
+    r"^(哈+|呵+|嘻+|嘿+|啊+|哦+|嗯+|哎+|唉+|嘤+|噢+|呜+|嘿+"
+    r"|！+|!+|\?+|？+|。+|,+|，+|~+|～+|＝+|=>+|>+|<+|6+"
+    r"|🎉+|🔥+|👍+|💯+|✨+|😍+|😂+|🤣+|❤+|💕+|🐶+|狗头+|滑稽+|草+|卧槽+|牛+|哔+)+$",
+    re.UNICODE,
+)
+
+
+def is_essence_worthy(text: str) -> bool:
+    """判断一条消息内容是否「够格」被设为精华。
+
+    只拦截明显的水内容：空、纯 CQ 码小表情、过短（≤4 个硬字符）、
+    纯打招呼/应答/客套/称赞、纯笑声/标点/表情。其余一律放行，
+    交给 AI 自己判断是否真的精彩。
+    """
+    if not text:
+        return False
+    # 剥掉所有 CQ 码（图片/表情/引用/@ 等），只看纯文本
+    clean = re.sub(r"\[CQ:[^\]]+\]", "", text).strip()
+    if not clean:
+        # 整条没文字：图片/合并转发可能值得精华，放行；纯小表情/戳一戳不放行
+        return ("[CQ:image" in text) or ("[CQ:forward" in text)
+    # 去掉所有空白后的硬字符长度
+    hard = re.sub(r"\s+", "", clean)
+    if len(hard) <= 4:
+        return False
+    if hard.lower() in _TRIVIAL_ESSENCE_TOKENS:
+        return False
+    if _TRIVIAL_ESSENCE_RE.match(clean):
+        return False
+    return True
+
+
+async def _get_message_text_by_id(bot, group_id: int, message_id: int) -> str:
+    """尽量取出某条消息的文本，供精华门槛判断。先查内存窗口，再回 OneBot 查。"""
+    try:
+        from . import memory
+        win = memory._group_message_window.get(group_id, [])
+        for m in reversed(win):
+            if m.get("message_id") == int(message_id):
+                return m.get("message", "") or ""
+    except Exception:
+        pass
+    try:
+        data = await bot.get_msg(int(message_id))
+        if data:
+            # raw_message 是含 CQ 码的字符串，is_essence_worthy 会自动剥
+            return data.get("raw_message", "") or ""
+    except Exception:
+        pass
+    return ""
 
 
 async def maybe_auto_essence(bot) -> int:
@@ -493,6 +583,14 @@ async def maybe_auto_essence(bot) -> int:
                 )
                 author_score = influence.get_influence(gid, best.get("user_qq", 0))
                 if author_score < min_influence:
+                    continue
+
+                # 内容门槛：水内容（打招呼/过短/纯表情等）不设精华
+                best_text = best.get("message", "") or ""
+                if not is_essence_worthy(best_text):
+                    logger.debug(
+                        f"自主设精华跳过 群{gid}: 内容不够格 «{best_text[:20]}»"
+                    )
                     continue
 
                 try:
@@ -584,9 +682,170 @@ async def _push_personalized_news(bot, topic: str, news_text: str, image_url: st
 #  主动行为（由意识驱动）
 # ═══════════════════════════════════════════════════════════
 
+async def decide_and_speak(bot):
+    """LLM 自主决定要不要主动发言（Volition 系统）。
+
+    替换旧的"情绪阈值过就自动发"逻辑。一次 LLM 调用同时产出
+    "内心想法 + 要不要说出来"，输出严格 SPEAK/SILENT 协议。
+
+    喂给 LLM 的"事实包"（只读，不改情绪数值）：
+      - 当前心情 + 各情绪数值（原样读 consciousness.emotions）
+      - 时间事实（防穿帮）
+      - 最近 2-3 条日记
+      - "你已经连续 N 次发话没人接"（关键事实）
+      - 群活跃度（最近 X 分钟没动静 / 群里正在聊 Y）
+
+    只要 LLM 说 SPEAK 就立即发，无任何上限/冷却。
+    返回消息(str 或消息段 list)或 None（SILENT）。
+    """
+    state = cs.get_state()
+
+    # 睡觉/深夜静默时段/精力耗尽 → 什么都不发
+    ok, why = cs.can_speak_proactively(state)
+    if not ok:
+        logger.debug(f"volition 跳过: {why}")
+        return None
+
+    ms = memory.load_model_settings()
+    if not ms.get("api_key"):
+        return None
+
+    try:
+        mood = cs.get_dominant_mood(state)
+        e = state["emotions"]
+        today = state.get("today", {})
+        consecutive_ignored = today.get("consecutive_ignored", 0)
+        diary = state.get("diary", [])[:3]
+        diary_text = " | ".join(
+            f"({d.get('mood', '')}) {d.get('thought', '')[:40]}" for d in diary
+        ) if diary else "（今天还没写过日记）"
+
+        # 群活跃度事实
+        from . import memory as _mem
+        group_activity_fact = _build_group_activity_fact()
+
+        # ★ 关键：被忽视事实（不改情绪，只告诉 LLM）
+        ignored_fact = ""
+        if consecutive_ignored > 0:
+            ignored_fact = (
+                f"\n⚠️ 事实：你已经连续 {consecutive_ignored} 次主动发话没人接。"
+                "（不是说你必须闭嘴——你自己判断要不要再说）"
+            )
+
+        prompt = (
+            "你现在一个人待着，脑子里在想事情。要不要在群里说句话？"
+            "这是你自己的真实决定，不是任务。\n\n"
+            f"【当前心情】{mood}\n"
+            f"【情绪数值】快乐{e['joy']:.0%} 精力{e['energy']:.0%} 社交欲{e['social']:.0%} "
+            f"无聊{e['boredom']:.0%} 孤独{e['loneliness']:.0%}"
+            f"{' 难过'+format(e['sadness'], '.0%') if e.get('sadness', 0) > 0.3 else ''}\n\n"
+            f"{cs.get_time_facts_prompt()}\n\n"
+            f"【你最近的内心活动（只是状态，不要复读）】\n{diary_text}\n\n"
+            f"{group_activity_fact}"
+            f"{ignored_fact}\n\n"
+            "——\n"
+            "你想说话就说，不想说就不说。没人逼你。\n"
+            "想说 → 回复：SPEAK: <内容，20字以内，要跟当前时间/心情对得上>\n"
+            "不想说 → 回复：SILENT: <一句话原因，写给自己看>\n"
+            "格式必须严格按上面来，不要加别的。"
+        )
+
+        response = await llm_call.llm_create(
+            priority="P2",
+            model=ms.get("model", "gemini-3.5-flash-free"),
+            max_tokens=80,
+            temperature=0.9,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+
+        # 解析协议
+        upper = raw.upper()
+        if upper.startswith("SPEAK:"):
+            text = raw.split(":", 1)[1].strip().strip('"').strip("'").strip()
+            # 去掉可能的换行（只取第一行）
+            text = text.split("\n")[0].strip()
+            if text and 2 <= len(text) <= 30:
+                cs.add_diary(state, f"主动说：「{text}」", mood)
+                logger.info(f"🎙️ Volition SPEAK [{mood}]: {text}")
+                # 记录主动发言时间戳（用于被忽视追踪）
+                cs.record_proactive_message(state)
+                return text
+            else:
+                logger.debug(f"Volition SPEAK 内容长度异常: «{text[:30]}»")
+                cs.add_diary(state, "想说什么但没组织好", mood)
+                return None
+        elif upper.startswith("SILENT:"):
+            reason = raw.split(":", 1)[1].strip()[:50]
+            cs.add_diary(state, f"选择沉默：{reason}", mood)
+            logger.info(f"🤫 Volition SILENT [{mood}]: {reason}")
+            return None
+        else:
+            # 格式不符 → 默认按 SILENT 处理
+            logger.debug(f"Volition 输出格式不符，按 SILENT: {raw[:60]}")
+            cs.add_diary(state, "想说话但脑子卡了", mood)
+            return None
+
+    except Exception as exc:
+        logger.debug(f"volition 决策失败: {exc}")
+        return None
+
+
+def _build_group_activity_fact() -> str:
+    """构建"群活跃度事实"——告诉 LLM 现在群里什么情况。
+    只讲事实，不做判断。
+    """
+    try:
+        from . import memory as _mem
+        # 取所有群的最近消息窗口（取第一个有数据的群）
+        windows = getattr(_mem, "_group_message_window", {})
+        for gid, win in windows.items():
+            if not win:
+                continue
+            now = time.time()
+            # 过滤掉 bot 自己的消息
+            recent_human = [
+                m for m in win[-10:]
+                if m.get("user_qq") and not m.get("_is_bot", False)
+            ]
+            if not recent_human:
+                continue
+            last_ts = recent_human[-1].get("ts", 0)
+            minsquiet = (now - last_ts) / 60 if last_ts else 999
+            if minsquiet > 30:
+                return f"【群里情况】已经 {int(minsquiet)} 分钟没人说话了，很安静"
+            elif minsquiet > 10:
+                # 最近几条聊的话题摘要
+                topics = []
+                for m in recent_human[-3:]:
+                    txt = (m.get("message", "") or "").strip()
+                    # 剥 CQ 码
+                    import re as _re
+                    txt = _re.sub(r"\[CQ:[^\]]+\]", "", txt).strip()
+                    if txt and len(txt) >= 2:
+                        topics.append(txt[:15])
+                if topics:
+                    return f"【群里情况】最近在聊：{'、'.join(topics)}"
+                return "【群里情况】最近有人在说话"
+            else:
+                topics = []
+                for m in recent_human[-3:]:
+                    txt = (m.get("message", "") or "").strip()
+                    import re as _re
+                    txt = _re.sub(r"\[CQ:[^\]]+\]", "", txt).strip()
+                    if txt and len(txt) >= 2:
+                        topics.append(txt[:15])
+                if topics:
+                    return f"【群里情况】群里正在聊：{'、'.join(topics)}"
+                return "【群里情况】群里挺热闹"
+        return "【群里情况】（暂无可读的群消息）"
+    except Exception:
+        return ""
+
+
 async def maybe_proactive_action(bot):
     """根据意识状态决定是否主动做点什么。
-    优先级：睡觉 > 学习 > 发动态/刷存在感
+    优先级：睡觉 > 学习（新闻分享）> volition 自主发言
     返回消息(str 或消息段 list)或 None
     """
     state = cs.get_state()
@@ -599,64 +858,21 @@ async def maybe_proactive_action(bot):
 
     behavior = cs.decide_behavior(state)
 
-    # 想学习 → 触发自主学习
+    # 想学习 → 触发自主学习（保留原逻辑）
     if behavior["action"] == "learn_something" and behavior["priority"] > 0.35:
         result = await autonomous_learn(bot)
         if result and result.get("decision") == "yes" and result.get("text"):
-            _last_news_share = time.time()  # 手动分享
+            global _last_news_share
+            _last_news_share = time.time()
             image_url = result.get("image_url", "")
             seg = await _fetch_image_segment(image_url) if image_url else None
             if seg:
                 return [seg, {"type": "text", "data": {"text": f"\n💡 闲来无事刷到一条有意思的：{result['text']}"}}]
             return f"💡 刷到一条：{result['text']}"
 
-    # 想找人聊天 → 发个动态（只在没有新闻分享时触发）
-    if behavior["action"] in ("initiate_chat", "seek_attention") and behavior["priority"] > 0.35:
-        # 生成一条"随手发"的消息
-        try:
-            ms = memory.load_model_settings()
-            if not ms.get("api_key"):
-                return None
-
-            hour = timeutil.now_shanghai().hour
-            mood = cs.get_dominant_mood(state)
-            e = state["emotions"]
-
-            # 根据状态生成合适的动态
-            dynamic_prompts = {
-                "bored": "你感到无聊，发一条随意的话，像朋友间打破沉默。15字以内。",
-                "lonely": "你感到孤独，发一条略带撒娇的话，希望大家理你。15字以内。",
-                "happy": "你心情好，分享一件开心的小事或有趣的观察。15字以内。",
-                "excited": "你非常兴奋，发一条充满能量的话。15字以内。",
-                "curious": "你对某个事情好奇，随口问一句。15字以内。",
-                "tired": "你有点累，发一条犯困的感叹。10字以内。",
-            }
-            prompt = dynamic_prompts.get(mood, "你随意说点什么。15字以内。")
-            # 必须带时间事实，否则模型会编作息（早上说"下班了"之类）
-            prompt += "\n\n" + cs.get_time_facts_prompt()
-
-            response = await llm_call.llm_create(
-                model=ms.get("model", "gemini-3.5-flash-free"),
-                max_tokens=40,
-                temperature=1.0,
-                system=prompt,
-                messages=[{"role": "user", "content": (
-                    f"现在是{hour}点，{'周末' if timeutil.now_shanghai().weekday() >= 5 else '工作日'}，"
-                    "随口发一条，内容要跟这个时间对得上"
-                )}],
-            )
-            text = response.content[0].text.strip().strip('"').strip("'").strip()
-            if text and 2 <= len(text) <= 30:
-                # 发了动态就不那么无聊了
-                cs.apply_emotion_delta(state, "boredom", -0.1)
-                cs.apply_emotion_delta(state, "loneliness", -0.08)
-                cs.add_diary(state, f"忍不住发了条动态：「{text}」", mood)
-                logger.info(f"意识驱动发言 [{mood}]: {text}")
-                return text
-        except Exception as e:
-            logger.debug(f"主动行为生成失败: {e}")
-
-    return None
+    # 其余情况交给 volition（LLM 自主决定说不说话）
+    # 删除了原来"阈值过就自动发"的 initiate_chat / seek_attention 分支
+    return await decide_and_speak(bot)
 
 
 # ═══════════════════════════════════════════════════════════
