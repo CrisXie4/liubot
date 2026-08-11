@@ -28,10 +28,10 @@ async function saveVerifyRatio() {
     await api('/verify/ratio', { method: 'POST', body: JSON.stringify({ ratio }) });
     _verifyRatio = ratio;
     $('verify-ratio-val').textContent = ratio + '%';
-    if (msg) { msg.textContent = '已保存 ✓'; msg.style.color = '#38a169'; }
+    if (msg) { msg.textContent = '已保存 ✓'; msg.className = 'tag ok'; }
     setTimeout(() => { if (msg) msg.textContent = ''; }, 2000);
   } catch (e) {
-    if (msg) { msg.textContent = '保存失败: ' + e.message; msg.style.color = '#e53e3e'; }
+    if (msg) { msg.textContent = '保存失败: ' + e.message; msg.className = 'tag no'; }
   }
 }
 
