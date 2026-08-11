@@ -437,5 +437,109 @@ class TestCleanupAndApprove(unittest.TestCase):
         self.assertEqual(len(self.verify._web_pending), 0)
 
 
+class TestWebVerifyE2E(unittest.TestCase):
+    """端到端：创建挑战 → reveal → consume 通过/失败"""
+
+    def setUp(self):
+        from bot import verify
+        self.verify = verify
+        verify._web_pending.clear()
+        verify._pending.clear()
+        verify._used_web_codes.clear()
+        verify._used_questions.clear()
+        import tempfile
+        self._orig = verify._HISTORY_FILE
+        self.tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        self.tmp.close()
+        verify._HISTORY_FILE = self.tmp.name
+
+    def tearDown(self):
+        import os
+        self.verify._HISTORY_FILE = self._orig
+        try:
+            os.unlink(self.tmp.name)
+        except Exception:
+            pass
+
+    def test_full_flow_web_pass(self):
+        """完整通过流程：创建 → reveal → consume 答对"""
+        async def fake_gen(): return "星空"
+        async def fake_turnstile(*a, **kw): return True
+        with patch.object(self.verify, '_generate_web_code', new=fake_gen), \
+             patch.object(self.verify, '_verify_turnstile', new=fake_turnstile), \
+             patch.object(self.verify, 'config') as mock_cfg:
+            mock_cfg.TURNSTILE_SECRET_KEY = ""
+            # 1. 创建挑战
+            token = _run(self.verify.create_web_challenge(100, 1001, "alice"))
+            # 2. reveal
+            r = _run(self.verify.reveal_web_code(token, "cf"))
+            self.assertTrue(r["ok"])
+            self.assertEqual(r["code"], "星空")
+            # 3. consume 答对
+            r = _run(self.verify.consume_web_challenge(100, 1001, "星空"))
+            self.assertEqual(r["verdict"], "correct")
+            # 4. token 已清
+            self.assertNotIn(token, self.verify._web_pending)
+
+    def test_full_flow_web_fail_3_times(self):
+        """完整失败流程：错 3 次踢"""
+        async def fake_gen(): return "星空"
+        with patch.object(self.verify, '_generate_web_code', new=fake_gen), \
+             patch.object(self.verify, 'config') as mock_cfg:
+            mock_cfg.TURNSTILE_SECRET_KEY = ""
+            token = _run(self.verify.create_web_challenge(100, 1001, "alice"))
+            for i in range(3):
+                r = _run(self.verify.consume_web_challenge(100, 1001, "错"))
+            self.assertTrue(r.get("final"))
+            self.assertNotIn(token, self.verify._web_pending)
+
+    def test_full_flow_handle_answer_pass(self):
+        """完整流程：handle_group_verify_answer 处理通过"""
+        bot = AsyncMock()
+        bot.bot_qq = 999
+        async def fake_gen(): return "星空"
+        async def fake_send(bot, group_id, msg, **kw):
+            await bot.send_group_msg(group_id, msg)
+        with patch.object(self.verify, '_generate_web_code', new=fake_gen), \
+             patch('bot.humanizer.send_human_like', new=fake_send):
+            _run(self.verify.create_web_challenge(100, 1001, "alice"))
+            handled = _run(self.verify.handle_group_verify_answer(bot, {
+                "group_id": 100, "user_id": 1001, "raw_message": "星空",
+            }))
+        self.assertTrue(handled)
+        self.assertEqual(len(self.verify._web_pending), 0)
+        # 历史已记 approved_web
+        items = self.verify.get_verification_history()
+        self.assertEqual(items[0]["result"], "approved_web")
+        self.assertEqual(items[0]["method"], "web")
+
+    def test_full_flow_handle_answer_3_fails_kicks(self):
+        """完整流程：handle_group_verify_answer 错 3 次踢出"""
+        bot = AsyncMock()
+        bot.bot_qq = 999
+        async def fake_gen(): return "星空"
+        async def fake_send(bot, group_id, msg, **kw):
+            await bot.send_group_msg(group_id, msg)
+        with patch.object(self.verify, '_generate_web_code', new=fake_gen), \
+             patch('bot.humanizer.send_human_like', new=fake_send):
+            _run(self.verify.create_web_challenge(100, 1001, "alice"))
+            for i in range(3):
+                handled = _run(self.verify.handle_group_verify_answer(bot, {
+                    "group_id": 100, "user_id": 1001, "raw_message": "错",
+                }))
+            self.assertTrue(handled)
+            # bot.set_group_kick 被调
+            bot._call.assert_called()
+        # token 已清
+        self.assertEqual(len(self.verify._web_pending), 0)
+        items = self.verify.get_verification_history()
+        self.assertEqual(items[0]["result"], "rejected_web")
+        self.assertEqual(items[0]["attempts"], 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
 if __name__ == "__main__":
     unittest.main()
