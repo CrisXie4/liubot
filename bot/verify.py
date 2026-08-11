@@ -29,6 +29,14 @@ _pending: dict[int, dict[int, dict]] = {}
 # ─── 已出过的题目（去重）───
 _used_questions: set[str] = set()
 
+# ─── 网站认证 pending（token → 挑战）───
+# {token: {group_id, user_id, code, created_at, wrong_attempts, user_name, revealed}}
+_web_pending: dict[str, dict] = {}
+
+# ─── 网站认证最近用过的词（去重）───
+_used_web_codes: set[str] = set()
+_WEB_CODE_KEEP = 50  # 超过这个数清掉一半
+
 # ─── 超时时间（秒）───
 VERIFY_TIMEOUT = 300  # 5 分钟
 
@@ -38,10 +46,124 @@ MAX_PER_GROUP = 5
 # ─── 每个新人最多答错次数（第 N+1 次错才踢）───
 MAX_WRONG_ATTEMPTS = 2
 
+# ─── 网站认证错满 3 次才踢（3 次内都给机会）───
+MAX_WRONG_ATTEMPTS_WEB = 3
+# token 短截用于日志（避免泄露）
+_TOKEN_LOG_LEN = 6
+# 内置兜底词库（AI 失败时用，10 个常见双字词）
+_WEB_CODE_FALLBACK = [
+    "星空", "咖啡", "晚风", "远山", "清风",
+    "晚霞", "月光", "晨雾", "海浪", "竹林",
+]
+
 
 def _get_client():
     """获取 Anthropic 客户端（委托给 llm_call 共享客户端）"""
     return llm_call.get_client()
+
+
+# ═══════════════════════════════════════════════════════════
+#  网站认证 — 配置读取 / 概率分流 / 词生成
+# ═══════════════════════════════════════════════════════════
+
+def _get_web_ratio() -> int:
+    """读取当前网站模式概率（0-100）。先 env 后 settings.json。"""
+    from .config import config
+    env_ratio = config.WEB_VERIFY_RATIO  # env 默认 50
+    # settings.json 覆盖（后台改的值）
+    try:
+        import os as _os, json as _json
+        path = _os.path.join(config.DATA_DIR, "bot_settings.json")
+        if _os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            if "web_verify_ratio" in data:
+                env_ratio = int(data["web_verify_ratio"])
+    except Exception:
+        pass
+    return max(0, min(100, env_ratio))
+
+
+def _pick_web_mode() -> bool:
+    """掷骰子：命中网站模式返回 True"""
+    import random
+    return random.randint(1, 100) <= _get_web_ratio()
+
+
+def _normalize_code(s: str) -> str:
+    """normalize 验证词：去所有空白 + 中英文标点 + lower"""
+    if not s:
+        return ""
+    # 去空白
+    t = re.sub(r"\s+", "", s)
+    # 去中英文标点
+    t = re.sub(r"[，。！？、；：\u201c\u201d\u2018\u2019（）【】《》,.!?;:\"'()\[\]<>]", "", t)
+    return t.lower()
+
+
+async def _generate_web_code() -> str:
+    """AI 生成一个 2-4 字中文词作为网站验证码。失败兜底。"""
+    client = _get_client()
+    if client is None:
+        return _fallback_web_code()
+
+    from .memory import load_model_settings
+    ms = load_model_settings()
+
+    used_hint = ""
+    if _used_web_codes:
+        recent = list(_used_web_codes)[-10:]
+        used_hint = "\n\n【最近用过的词，不要重复】\n" + "\n".join(f"  - {c}" for c in recent)
+
+    system_prompt = (
+        "你是加群验证词生成器。生成一个 2-4 字的中文词作为验证码。\n"
+        "硬性要求：\n"
+        "- 常见、正面或中性、无歧义、易输入\n"
+        "- 不要生僻字（必须在中日韩统一汉字常用区）\n"
+        "- 不要数字、英文、标点\n"
+        "- 不要敏感、政治、低俗内容\n"
+        f"{used_hint}\n"
+        '返回纯JSON，不要Markdown代码块: {"code": "星空"}'
+    )
+
+    try:
+        response = await llm_call.llm_create(
+            model=ms.get("model", "gemini-3.5-flash-free"),
+            max_tokens=50,
+            temperature=0.8,
+            system=system_prompt,
+            messages=[{"role": "user", "content": "生成一个验证词"}],
+        )
+        text = response.content[0].text.strip()
+        text = re.sub(r"```(?:json)?\s*", "", text)
+        text = re.sub(r"```", "", text).strip()
+        result = json.loads(text)
+        code = (result.get("code") or "").strip()
+        # 校验：只允许 CJK 汉字 + 长度 2-4
+        if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}", code):
+            logger.warning(f"AI 生成的词不合法: {code!r} → 走兜底")
+            return _fallback_web_code()
+        _used_web_codes.add(code)
+        # 维护 _used_web_codes 不超长
+        if len(_used_web_codes) > _WEB_CODE_KEEP:
+            to_drop = list(_used_web_codes)[:_WEB_CODE_KEEP // 2]
+            for c in to_drop:
+                _used_web_codes.discard(c)
+        return code
+    except Exception as e:
+        logger.warning(f"AI 生成验证词失败: {e} → 走兜底")
+        return _fallback_web_code()
+
+
+def _fallback_web_code() -> str:
+    """内置兜底词库随机"""
+    import random
+    available = [c for c in _WEB_CODE_FALLBACK if c not in _used_web_codes]
+    if not available:
+        available = _WEB_CODE_FALLBACK
+    code = random.choice(available)
+    _used_web_codes.add(code)
+    return code
 
 
 # ═══════════════════════════════════════════════════════════
