@@ -324,5 +324,72 @@ class TestMemberIncreaseDispatch(unittest.TestCase):
         self.assertEqual(len(self.verify._web_pending), 0)
 
 
+class TestGroupVerifyAnswerWebBranch(unittest.TestCase):
+
+    def setUp(self):
+        from bot import verify
+        self.verify = verify
+        verify._web_pending.clear()
+        verify._pending.clear()
+        verify._used_web_codes.clear()
+        import tempfile
+        self._orig = verify._HISTORY_FILE
+        self.tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        self.tmp.close()
+        verify._HISTORY_FILE = self.tmp.name
+
+    def tearDown(self):
+        import os
+        self.verify._HISTORY_FILE = self._orig
+        try:
+            os.unlink(self.tmp.name)
+        except Exception:
+            pass
+
+    def _make_bot(self):
+        bot = AsyncMock()
+        bot.bot_qq = 999
+        return bot
+
+    def _patch_send(self):
+        async def fake_send(bot, group_id, msg, **kw):
+            await bot.send_group_msg(group_id, msg)
+        return patch('bot.humanizer.send_human_like', new=fake_send)
+
+    def test_web_answer_correct(self):
+        """网站模式答对 → 通过，return True"""
+        bot = self._make_bot()
+        async def fake_gen(): return "星空"
+        with patch.object(self.verify, '_generate_web_code', new=fake_gen), \
+             self._patch_send():
+            _run(self.verify.create_web_challenge(100, 1001, "alice"))
+        handled = _run(self.verify.handle_group_verify_answer(bot, {
+            "group_id": 100, "user_id": 1001, "raw_message": "星空",
+        }))
+        self.assertTrue(handled)
+        self.assertEqual(len(self.verify._web_pending), 0)
+
+    def test_web_answer_wrong_stays(self):
+        """网站模式答错 → 警告，return True，token 还在"""
+        bot = self._make_bot()
+        async def fake_gen(): return "星空"
+        with patch.object(self.verify, '_generate_web_code', new=fake_gen), \
+             self._patch_send():
+            _run(self.verify.create_web_challenge(100, 1001, "alice"))
+        handled = _run(self.verify.handle_group_verify_answer(bot, {
+            "group_id": 100, "user_id": 1001, "raw_message": "错词",
+        }))
+        self.assertTrue(handled)
+        self.assertEqual(len(self.verify._web_pending), 1)
+
+    def test_quiz_mode_unchanged(self):
+        """没在 web_pending → 走现有出题流程"""
+        bot = self._make_bot()
+        handled = _run(self.verify.handle_group_verify_answer(bot, {
+            "group_id": 100, "user_id": 1001, "raw_message": "你好",
+        }))
+        self.assertFalse(handled)
+
+
 if __name__ == "__main__":
     unittest.main()

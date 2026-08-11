@@ -294,6 +294,106 @@ def _cleanup_web_user(group_id: int, user_id: int) -> None:
         _web_pending.pop(t, None)
 
 
+async def _handle_web_answer(bot, event: dict, group_id: int, user_id: int, raw: str) -> bool:
+    """网站认证模式的答题处理。返回 True（已处理）。"""
+    from .humanizer import send_human_like
+    at_seg = f"[CQ:at,qq={user_id}]"
+
+    # 查用户名（从 entry 拿）
+    user_name = str(user_id)
+    for e in _web_pending.values():
+        if e["group_id"] == group_id and e["user_id"] == user_id:
+            user_name = e.get("user_name", user_name)
+            break
+
+    logger.info(f"🌐 网站验证回答: {user_name}({user_id}) → \"{raw[:30]}\"")
+
+    try:
+        result = await consume_web_challenge(group_id, user_id, raw)
+    except Exception as e:
+        logger.error(f"网站判题异常: {e}")
+        result = {"verdict": "not_found"}
+
+    verdict = result.get("verdict")
+
+    if verdict == "not_found":
+        return False  # 兜底：异常时回落到出题流程（实际几乎不会发生）
+
+    if verdict == "smalltalk":
+        try:
+            await send_human_like(
+                bot, group_id,
+                f"{at_seg} 请把网站上的词发到群里哦~ 📝",
+            )
+        except Exception:
+            pass
+        return True
+
+    if verdict == "correct":
+        attempts = result.get("attempts", 1)
+        logger.info(f"✅ 网站验证通过: {user_name}({user_id}) 群{group_id} (第{attempts}次)")
+        _log_verification(user_id, user_name, group_id, "approved_web",
+                          result.get("expected", ""), raw, f"第{attempts}次答对",
+                          method="web", attempts=attempts)
+        try:
+            await send_human_like(
+                bot, group_id,
+                f"✅ {at_seg} 回答正确，欢迎入群~ :96:",
+            )
+        except Exception:
+            pass
+        # 补发欢迎 + 加积分（与出题模式一致）
+        try:
+            from . import welcome as _welcome
+            welcome_msg = _welcome.get_welcome_message(group_id, user_name, user_id)
+            if welcome_msg:
+                await send_human_like(bot, group_id, welcome_msg)
+        except Exception as e:
+            logger.debug(f"补发欢迎消息失败: {e}")
+        try:
+            from . import welcome as _welcome
+            _welcome.add_points(user_id, group_id, user_name, 10, "通过加群验证（网站）")
+        except Exception as e:
+            logger.debug(f"加积分失败: {e}")
+        return True
+
+    if verdict == "wrong":
+        attempts = result.get("attempts", 1)
+        max_a = result.get("max", MAX_WRONG_ATTEMPTS_WEB)
+        is_final = result.get("final", False)
+        expected = result.get("expected", "")
+
+        if is_final:
+            logger.info(f"❌ 网站验证失败: {user_name}({user_id}) → 踢出 ({attempts}次错)")
+            _log_verification(user_id, user_name, group_id, "rejected_web",
+                              expected, raw, f"{attempts}次全错",
+                              method="web", attempts=attempts)
+            try:
+                await send_human_like(
+                    bot, group_id,
+                    f"❌ {at_seg} 答错了，再见~ :178:",
+                )
+            except Exception:
+                pass
+            try:
+                await bot._call("set_group_kick", {"group_id": group_id, "user_id": user_id})
+            except Exception as e:
+                logger.error(f"踢人失败: {e}")
+        else:
+            remaining = max_a - attempts
+            logger.info(f"❌ 网站验证答错({attempts}/{max_a}): {user_name}({user_id})")
+            try:
+                await send_human_like(
+                    bot, group_id,
+                    f"❌ {at_seg} 码不对哦，再去网站仔细看看~ 还有 {remaining} 次机会",
+                )
+            except Exception:
+                pass
+        return True
+
+    return False
+
+
 # ═══════════════════════════════════════════════════════════
 #  入口 1: 加群请求 → 直接同意（验证在群内做）
 # ═══════════════════════════════════════════════════════════
@@ -555,6 +655,14 @@ async def handle_group_verify_answer(bot, event: dict) -> bool:
 
     if not user_id or not group_id or not raw:
         return False
+
+    # ── 先查网站认证 ──
+    web_entry_exists = any(
+        e["group_id"] == group_id and e["user_id"] == user_id
+        for e in _web_pending.values()
+    )
+    if web_entry_exists:
+        return await _handle_web_answer(bot, event, group_id, user_id, raw)
 
     pending = _pending.get(group_id, {}).get(user_id)
     if not pending:
