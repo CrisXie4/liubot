@@ -943,8 +943,9 @@ def _cleanup_user(group_id: int, user_id: int):
 
 
 def cleanup_expired():
-    """清理超时的待验证记录（周期调用）"""
+    """清理超时的待验证记录（周期调用）。同时清两个 pending。"""
     now = time.time()
+    # ── 出题模式 pending ──
     expired_groups: list[int] = []
     for gid, users in list(_pending.items()):
         expired_users = [uid for uid, v in users.items() if now - v.get("created_at", 0) > VERIFY_TIMEOUT]
@@ -954,6 +955,14 @@ def cleanup_expired():
             expired_groups.append(gid)
     for gid in expired_groups:
         _pending.pop(gid, None)
+
+    # ── 网站模式 pending ──
+    expired_tokens = [
+        t for t, e in _web_pending.items()
+        if now - e.get("created_at", 0) > VERIFY_TIMEOUT
+    ]
+    for t in expired_tokens:
+        _web_pending.pop(t, None)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1143,19 +1152,38 @@ def list_whitelist(group_id: int = 0) -> dict:
 
 async def approve_pending(bot, group_id: int, user_id: int) -> bool:
     """
-    立即放行某个正在待验证的用户。
-    清理 _pending，记录 manual_approved，发欢迎消息 + 加积分。
+    立即放行某个正在待验证的用户（两种模式都支持）。
+    清理 _pending 和 _web_pending，记录 manual_approved，发欢迎消息 + 加积分。
     Returns: True 表示该用户在待验证中并已被放行；False 表示没找到。
     """
+    # ── 先查网站模式 ──
+    web_token = None
+    web_entry = None
+    for t, e in _web_pending.items():
+        if e["group_id"] == group_id and e["user_id"] == user_id:
+            web_token = t
+            web_entry = e
+            break
+
+    # ── 再查出题模式 ──
     pending = _pending.get(group_id, {}).get(user_id)
-    if not pending:
+
+    if not web_entry and not pending:
         return False
-    user_name = pending.get("user_name", str(user_id))
-    question = pending.get("question", "")
-    _cleanup_user(group_id, user_id)
+
+    user_name = (web_entry or pending).get("user_name", str(user_id))
+    question = (pending or {}).get("question", "") or (web_entry or {}).get("code", "")
+
+    # 清两边
+    if web_token:
+        _cleanup_web_token(web_token)
+    if pending:
+        _cleanup_user(group_id, user_id)
+
+    method = "web" if web_entry else "quiz"
     _log_verification(user_id, user_name, group_id, "manual_approved",
-                      question, "", "主人手动放行")
-    logger.info(f"主人放行: {user_name}({user_id}) 群{group_id}")
+                      question, "", "主人手动放行", method=method, attempts=0)
+    logger.info(f"主人放行: {user_name}({user_id}) 群{group_id} ({method})")
     try:
         from .humanizer import send_human_like
         from . import welcome as _welcome

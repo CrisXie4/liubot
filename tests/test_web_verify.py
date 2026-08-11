@@ -391,5 +391,51 @@ class TestGroupVerifyAnswerWebBranch(unittest.TestCase):
         self.assertFalse(handled)
 
 
+class TestCleanupAndApprove(unittest.TestCase):
+
+    def setUp(self):
+        from bot import verify
+        self.verify = verify
+        verify._web_pending.clear()
+        verify._pending.clear()
+        verify._used_web_codes.clear()
+        import tempfile
+        self._orig = verify._HISTORY_FILE
+        self.tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        self.tmp.close()
+        verify._HISTORY_FILE = self.tmp.name
+
+    def tearDown(self):
+        import os
+        self.verify._HISTORY_FILE = self._orig
+        try:
+            os.unlink(self.tmp.name)
+        except Exception:
+            pass
+
+    def test_cleanup_expired_clears_web_pending(self):
+        """cleanup_expired 同时清 _web_pending"""
+        async def fake_gen(): return "星空"
+        with patch.object(self.verify, '_generate_web_code', new=fake_gen):
+            token = _run(self.verify.create_web_challenge(100, 1001, "alice"))
+        # 模拟过期
+        self.verify._web_pending[token]["created_at"] = 0
+        self.verify.cleanup_expired()
+        self.assertEqual(len(self.verify._web_pending), 0)
+
+    def test_approve_pending_clears_web(self):
+        """主人放行 → 同时清 _web_pending"""
+        bot = AsyncMock()
+        async def fake_gen(): return "星空"
+        async def fake_send(bot, group_id, msg, **kw):
+            await bot.send_group_msg(group_id, msg)
+        with patch.object(self.verify, '_generate_web_code', new=fake_gen), \
+             patch('bot.humanizer.send_human_like', new=fake_send):
+            _run(self.verify.create_web_challenge(100, 1001, "alice"))
+            ok = _run(self.verify.approve_pending(bot, 100, 1001))
+        self.assertTrue(ok)
+        self.assertEqual(len(self.verify._web_pending), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
