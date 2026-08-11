@@ -446,7 +446,7 @@ async def handle_group_add_request(bot, event: dict):
 #  入口 2: 成员入群通知 → 群里 @ 出题
 # ═══════════════════════════════════════════════════════════
 
-async def handle_member_increase(bot, event: dict):
+async def handle_member_increase(bot, event: dict) -> bool:
     """
     新人入群 → 群里 @ 出题。
 
@@ -455,13 +455,18 @@ async def handle_member_increase(bot, event: dict):
       notice_type: "group_increase"
       sub_type: "approve" / "invite"
       group_id, user_id, operator_id
+
+    Returns:
+        True  — verify 已接管（出题/发链接/白名单放行/队列满踢人/重复触发）。
+                handler.py 收到 True 后不会再发"回退欢迎"，避免双发。
+        False — 事件无效（user_id=0 或 bot 自己），handler 应走普通欢迎回退。
     """
     group_id = event.get("group_id", 0)
     user_id = event.get("user_id", 0)
     bot_qq = getattr(bot, "bot_qq", 0) or 0
 
     if not group_id or not user_id or user_id == bot_qq:
-        return
+        return False
 
     # 免验证白名单 → 直接放行（Task 5 新增）
     if is_whitelisted(user_id, group_id):
@@ -477,13 +482,13 @@ async def handle_member_increase(bot, event: dict):
             _welcome.add_points(user_id, group_id, str(user_id), 10, "免验证入群")
         except Exception as e:
             logger.debug(f"白名单放行发欢迎失败: {e}")
-        return  # 不出题、不踢
+        return True  # 已发欢迎，阻止 handler 重复发
 
     # 已经在验证中？跳过（防重复触发，两种模式都查）
     if _pending.get(group_id, {}).get(user_id):
-        return
+        return True  # 已接管，防重复
     if any(e["group_id"] == group_id and e["user_id"] == user_id for e in _web_pending.values()):
-        return
+        return True  # 已接管，防重复
 
     # 验证队列满了（两种模式合计）→ 直接踢掉，避免群里堆一堆未验证的人
     web_count = sum(1 for e in _web_pending.values() if e["group_id"] == group_id)
@@ -494,7 +499,7 @@ async def handle_member_increase(bot, event: dict):
             await bot.send_group_msg(group_id, f"⏳ 验证队列繁忙，请稍后再申请~")
         except Exception:
             pass
-        return
+        return True  # 已踢，阻止 handler 发欢迎
 
     # 取昵称
     user_name = str(user_id)
@@ -535,9 +540,9 @@ async def handle_member_increase(bot, event: dict):
             except Exception as e:
                 logger.error(f"群内发送网站验证链接失败: {e}")
                 _cleanup_web_user(group_id, user_id)
-                return
+                return True  # 已尝试接管（虽失败），避免再发欢迎制造噪音
             asyncio.create_task(_timeout_kick_web(bot, group_id, user_id, user_name, token))
-            return  # 网站模式已处理，不走下面出题
+            return True  # 网站模式已发链接，阻止 handler 发欢迎
 
     # AI 出题
     try:
@@ -549,7 +554,7 @@ async def handle_member_increase(bot, event: dict):
     if not question:
         # 连备用题库都没了 —— 保守起见放人进群，不踢
         logger.warning(f"出题失败且无备用，{user_name}({user_id}) 直接放行")
-        return
+        return True  # 已决策放行，handler 不应插手
 
     # 记录待验证
     _pending.setdefault(group_id, {})[user_id] = {
@@ -577,10 +582,11 @@ async def handle_member_increase(bot, event: dict):
     except Exception as e:
         logger.error(f"群内发送验证题失败: {e}")
         _cleanup_user(group_id, user_id)
-        return
+        return True  # 已尝试接管（虽失败），避免再发欢迎
 
     # 启动超时任务
     asyncio.create_task(_timeout_kick(bot, group_id, user_id, user_name))
+    return True  # 已出题，阻止 handler 发欢迎
 
 
 async def _timeout_kick(bot, group_id: int, user_id: int, user_name: str):

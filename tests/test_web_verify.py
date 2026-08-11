@@ -324,6 +324,84 @@ class TestMemberIncreaseDispatch(unittest.TestCase):
         self.assertEqual(len(self.verify._web_pending), 0)
 
 
+class TestHandleMemberIncreaseReturnContract(unittest.TestCase):
+    """handle_member_increase 必须返回 True 当 verify 接管了入群流程，
+    否则 handler.py:402-404 的 if handled: 死代码会导致重复欢迎。
+    """
+
+    def setUp(self):
+        from bot import verify
+        self.verify = verify
+        verify._web_pending.clear()
+        verify._pending.clear()
+        verify._used_web_codes.clear()
+
+    def _make_bot(self, bot_qq=999):
+        bot = MagicMock()
+        bot.bot_qq = bot_qq
+        bot.send_group_msg = AsyncMock()
+        bot.get_group_member_info = AsyncMock(return_value={"card": "", "nickname": "T"})
+        return bot
+
+    def test_invalid_event_returns_falsy(self):
+        """无效事件 (user_id=0 或 bot 自己) 应返回 falsy，让 handler 走回退欢迎"""
+        bot = self._make_bot(bot_qq=1001)
+        # user_id == bot_qq → 应早退
+        result = _run(self.verify.handle_member_increase(bot, {
+            "group_id": 100, "user_id": 1001, "operator_id": 999,
+        }))
+        self.assertFalse(result, "无效事件应返回 falsy，让 handler 接管")
+
+    def test_quiz_success_returns_true(self):
+        """出题模式成功发题应返回 True，阻止 handler 重复发欢迎"""
+        bot = self._make_bot()
+        async def fake_send(b, g, msg, **kw):
+            await b.send_group_msg(g, msg)
+        with patch.object(self.verify, '_pick_web_mode', return_value=False), \
+             patch.object(self.verify, '_generate_question',
+                          new=AsyncMock(return_value=("1+1=?", "2"))), \
+             patch('bot.humanizer.send_human_like', new=fake_send):
+            result = _run(self.verify.handle_member_increase(bot, {
+                "group_id": 100, "user_id": 1001, "operator_id": 999,
+            }))
+        self.assertTrue(result, "出题成功必须返回 True，否则 handler 会重复发欢迎")
+        self.assertIn(1001, self.verify._pending.get(100, {}))
+
+    def test_web_success_returns_true(self):
+        """网站模式成功发链接应返回 True"""
+        bot = self._make_bot()
+        async def fake_create(g, u, n):
+            import secrets, time
+            t = secrets.token_urlsafe(16)
+            self.verify._web_pending[t] = {
+                "group_id": g, "user_id": u, "user_name": n,
+                "code": "星空", "created_at": time.time(),
+                "wrong_attempts": 0, "revealed": False,
+            }
+            return t
+        async def fake_send(b, g, msg, **kw):
+            await b.send_group_msg(g, msg)
+        with patch.object(self.verify, '_pick_web_mode', return_value=True), \
+             patch.object(self.verify, 'create_web_challenge', new=fake_create), \
+             patch('bot.humanizer.send_human_like', new=fake_send):
+            result = _run(self.verify.handle_member_increase(bot, {
+                "group_id": 100, "user_id": 1001, "operator_id": 999,
+            }))
+        self.assertTrue(result, "网站模式成功必须返回 True")
+
+    def test_whitelist_returns_true(self):
+        """白名单放行（已经发了欢迎）应返回 True，阻止 handler 再发一条"""
+        bot = self._make_bot()
+        async def fake_send(b, g, msg, **kw):
+            await b.send_group_msg(g, msg)
+        with patch.object(self.verify, 'is_whitelisted', return_value=True), \
+             patch('bot.humanizer.send_human_like', new=fake_send):
+            result = _run(self.verify.handle_member_increase(bot, {
+                "group_id": 100, "user_id": 1001, "operator_id": 999,
+            }))
+        self.assertTrue(result, "白名单放行必须返回 True，否则 handler 会重复发欢迎")
+
+
 class TestGroupVerifyAnswerWebBranch(unittest.TestCase):
 
     def setUp(self):
