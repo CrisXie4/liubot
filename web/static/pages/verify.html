@@ -1,8 +1,27 @@
 <!-- VERIFY (加群验证) -->
+<!-- 网站认证比例配置 -->
+<div class="card panel" style="margin-bottom:12px;padding:16px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <strong>🌐 网站认证模式比例</strong>
+    <span id="verify-ratio-val" style="font-weight:700;color:#764ba2">--%</span>
+  </div>
+  <input type="range" id="verify-ratio-slider" min="0" max="100" value="50"
+         style="width:100%;accent-color:#764ba2">
+  <div style="display:flex;justify-content:space-between;font-size:12px;color:#888;margin-top:4px">
+    <span>全出题 (0%)</span>
+    <span>全网站 (100%)</span>
+  </div>
+  <div style="margin-top:8px">
+    <button class="btn pri" id="verify-ratio-save" onclick="saveVerifyRatio()"
+            style="padding:6px 16px">保存</button>
+    <span id="verify-ratio-msg" style="margin-left:12px;font-size:12px"></span>
+  </div>
+</div>
+
 <div class="stat-row" id="verify-stats"></div>
 <div class="card panel">
   <div class="panel-b np"><div class="tw"><table class="tbl" id="verify-tbl">
-    <thead><tr><th>时间</th><th>申请人</th><th class="num">QQ</th><th class="num">群</th><th>结果</th><th>题目</th><th>回答</th></tr></thead>
+    <thead><tr><th>时间</th><th>申请人</th><th class="num">QQ</th><th class="num">群</th><th>方式</th><th>结果</th><th>题目</th><th>回答</th><th class="num">次数</th></tr></thead>
     <tbody></tbody>
   </table></div></div>
 </div>
