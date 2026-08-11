@@ -105,12 +105,33 @@ def load_state() -> dict:
         try:
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 s = json.load(f)
-            # 合并缺失的默认值
             _deep_merge(DEFAULT_STATE, s)
+            _migrate_v1_to_v2(s)
             return s
         except Exception:
             pass
     return json.loads(json.dumps(DEFAULT_STATE))
+
+
+def _migrate_v1_to_v2(state: dict):
+    """v1 → v2 迁移：修复卡死的边缘情绪值。
+
+    如果 irritation 在 0.4-0.6 边缘但 joy 明显更高（积极状态），
+    说明是卡死 bug 的产物，重置到低基线。真正烦躁（joy 低）保留。
+    """
+    if state.get("version", 1) >= 2:
+        return
+    e = state.get("emotions", {})
+    irritation = e.get("irritation", 0)
+    joy = e.get("joy", 0.5)
+    if irritation > 0.4 and joy > irritation + 0.05:
+        e["irritation"] = EMOTION_BASELINE["irritation"]
+        logger.info(f"迁移 v1→v2: 重置卡死的 irritation {irritation:.2f} → {e['irritation']}")
+    if e.get("loneliness", 0) > 0.9:
+        e["loneliness"] = 0.85
+    if e.get("boredom", 0) > 0.9:
+        e["boredom"] = 0.85
+    state["version"] = 2
 
 
 def _deep_merge(default: dict, target: dict):
