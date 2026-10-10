@@ -1,9 +1,9 @@
-"""send_sticker 工具结果纯净性测试。
+"""send_sticker 工具直接发送契约测试。
 
-背景：旧实现返回「{cq}（把上面的 CQ 码直接放进你的回复文本里发出去）」，
-normalize_face_tags 只删裸 [表情] 占位，AI 照抄整串会把中文括号说明发进群。
-锁定：返回值是纯 CQ 码、不含任何括号说明；使用说明固定在 ALL_TOOLS 的
-description 里而不是工具结果里。
+2026-10-10 改版：工具不再返回 CQ 码让模型拼进回复（下一轮 LLM 空响应时
+表情整个丢失），改为工具直接发消息、返回给模型的只是「已发出」的说明。
+锁定：真发了消息、返回值不含 CQ 码也不含括号说明；使用说明固定在
+ALL_TOOLS 的 description 里。
 """
 import asyncio
 import os
@@ -24,24 +24,40 @@ class TestSendStickerToolResult(unittest.TestCase):
     def tearDown(self):
         ai_tools._STICKER_RATE.clear()
 
-    def _call(self, emotion: str = "开心") -> str:
-        return asyncio.run(ai_tools.execute_tool(
-            mock.MagicMock(), 0, 123, "send_sticker", {"emotion": emotion}))
+    def _call(self, emotion: str = "开心", group_id: int = 0):
+        bot = mock.MagicMock()
+        bot.send_group_msg = mock.AsyncMock(return_value=12345)
+        bot.send_private_msg = mock.AsyncMock(return_value=12345)
+        bot.last_fail_msg = mock.MagicMock(return_value="")
+        r = asyncio.run(ai_tools.execute_tool(
+            bot, group_id, 123, "send_sticker", {"emotion": emotion}))
+        return r, bot
 
-    def test_result_is_pure_cq(self):
-        """返回值以 [CQ: 开头，且不再携带中文括号注释"""
+    def test_sent_directly_not_returned(self):
+        """群聊：真调 send_group_msg 发出，返回值是「已发出」说明而非 CQ 码"""
         for emotion in ("开心", "无奈", ""):
-            r = self._call(emotion)
-            self.assertTrue(r.startswith("[CQ:"), f"emotion={emotion!r} → {r!r}")
-            self.assertNotIn("（", r, f"emotion={emotion!r} 返回值带了括号说明: {r!r}")
-            self.assertNotIn("把上面的", r)
+            r, bot = self._call(emotion, group_id=555)
+            self.assertIn("已直接发出", r, f"emotion={emotion!r} → {r!r}")
+            self.assertNotIn("[CQ:", r, f"返回值不该再带 CQ 码: {r!r}")
+            self.assertNotIn("（", r, f"返回值带了括号说明: {r!r}")
+            sent = bot.send_group_msg.call_args[0]
+            self.assertEqual(sent[0], 555)
+            self.assertTrue(str(sent[1]).startswith("[CQ:face,id="))
+
+    def test_private_chat_sends_private(self):
+        """私聊（group_id=0）：走 send_private_msg"""
+        r, bot = self._call("开心", group_id=0)
+        self.assertIn("已直接发出", r)
+        bot.send_private_msg.assert_called_once()
+        self.assertTrue(str(bot.send_private_msg.call_args[0][1]).startswith("[CQ:face,id="))
 
     def test_description_carries_usage_note(self):
         """使用说明固定在 ALL_TOOLS 的 send_sticker description 里"""
         desc = next(t["description"] for t in ai_tools.ALL_TOOLS
                     if t["name"] == "send_sticker")
-        self.assertIn("放进回复", desc)
-        self.assertIn("不要复述", desc)
+        self.assertIn("直接把一个表情发到群里", desc)
+        self.assertIn("只需配一句话", desc)
+        self.assertNotIn("放进回复文本", desc, "旧契约（返回码拼回复）描述应已移除")
 
 
 if __name__ == "__main__":

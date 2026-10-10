@@ -1082,6 +1082,12 @@ async def chat_reply(
             if block.type == "text":
                 reply += block.text
         reply = reply.strip()
+        # 空回复可见化（2026-10-10 实录：工具轮后 provider 空响应，回复静默
+        # 丢弃，用户点名的表情/回答整个蒸发，日志里却毫无痕迹）
+        if not reply:
+            logger.warning(
+                f"最终回复为空 [群{group_id}]（LLM 空响应或全链路失败），本轮不发送"
+            )
 
         # 修复 AI 可能用的中文括号 CQ 码: （CQ:face,id=14）→ [CQ:face,id=14]
         reply = fixup_cq_brackets(reply)

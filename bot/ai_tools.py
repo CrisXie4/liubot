@@ -295,13 +295,12 @@ ALL_TOOLS = [
     {
         "name": "send_sticker",
         "description": (
-            "返回一个表情的 CQ 码（QQ大黄脸/动图/收藏的GIF），你把它放在回复文本里就能发出去。"
+            "直接把一个表情发到群里（QQ大黄脸/动图/收藏的GIF），发送后你只需配一句话自然收尾。"
             "适用场景：觉得对方可爱、被逗笑、想卖萌、表达情绪但文字不够时。"
             "群友发了表情让你「也来一个/发同款/学一下」时，优先用本工具选相近情绪的，"
             "绝不要自己手写 CQ 码格式（会变成文字露馅）。"
             "emotion 传情绪关键词，工具会优先从你收藏的表情里选合适的，没有就用QQ自带大黄脸兜底。"
             "常用 emotion：开心/大笑/害羞/生气/哭泣/惊讶/喜欢/撒娇/调皮/安慰/无奈/卖萌/赞/鄙视/尴尬/害怕/疑问/无语/庆祝。"
-            "工具返回的 CQ 码原样放进回复文本即可，不要复述码以外的任何说明。"
         ),
         "input_schema": {
             "type": "object",
@@ -332,7 +331,7 @@ ALL_TOOLS = [
     {
         "name": "play_dice",
         "description": (
-            "掷骰子，返回骰子 CQ 码，你把它放进回复文本里就能掷出。"
+            "掷一颗骰子并直接发到群里，发送后你只需配一句话（比如宣布比大小规则）。"
             "时机：群友起哄要赌运气、比大小、抽签做裁决时。别没事乱掷。"
         ),
         "input_schema": {"type": "object", "properties": {}},
@@ -340,7 +339,7 @@ ALL_TOOLS = [
     {
         "name": "play_rps",
         "description": (
-            "出猜拳（石头剪刀布），返回猜拳 CQ 码，你把它放进回复文本里就能出。"
+            "出一记猜拳（石头剪刀布）并直接发到群里，发送后你只需配一句话。"
             "时机：有人要跟你猜拳、或大家起哄玩包剪锤时。"
         ),
         "input_schema": {"type": "object", "properties": {}},
@@ -1019,6 +1018,27 @@ def _check_tool_rate(state: dict, group_id: int, limit: int, window_secs: int) -
     return True
 
 
+async def _send_direct_cq(bot, group_id: int, caller_qq: int, cq: str, label: str) -> str:
+    """把纯 CQ 码消息直接发出去（群发/私聊自适应），返回给模型的说明文本。
+
+    直接发而不是返回码让模型下一轮拼接：下一轮 LLM 一旦空响应/挂掉
+    （2026-10-10 实录：deepseek-flash 空内容，用户点名的表情整个丢失），
+    表情/骰子这类用户当场点名要的东西不该跟着陪葬。
+    """
+    try:
+        if group_id:
+            ok = await bot.send_group_msg(group_id, cq)
+        else:
+            ok = await bot.send_private_msg(caller_qq, cq)
+    except Exception as e:  # NapCat 异常不炸工具链，把失败原因回传 AI
+        ok = False
+        logger.warning(f"{label}直接发送异常: {e}")
+    if ok:
+        return f"{label}已直接发出 ✓。写一句话自然收尾即可，不要再输出任何表情码/CQ 码。"
+    fail = bot.last_fail_msg() if hasattr(bot, "last_fail_msg") else None
+    return f"⨯ {label}发送失败（{fail or 'NapCat 无响应'}），换个方式表达吧"
+
+
 async def _gated(group_id, action, tool_input, caller_qq,
                  master_instructed, bot, member_info=None, mute_seconds=0):
     """对破坏性动作过 guardian 闸门。
@@ -1333,17 +1353,14 @@ async def _execute_tool_impl(
                 return "⨯ 本群表情发送太频繁了，先用 :14: 这类内置黄脸表达吧"
             from . import sticker as _st
             cq = _st.pick_emotion_face(emotion, group_id=group_id)
-            # 只返回纯 CQ 码：不加任何括号说明——normalize_face_tags 只删裸 [表情]
-            # 占位，AI 照抄整串时会把括号里的说明一并发进群
             logger.info(f"AI 选表情: emotion={emotion} → {cq[:40]}")
-            return cq
+            return await _send_direct_cq(bot, group_id, caller_qq, cq, "表情")
 
         elif tool_name == "play_dice":
-            # 仿 send_sticker：返回 CQ 码让 AI 拼进回复（发送侧结果随机，无参数）
-            return "[CQ:dice]"
+            return await _send_direct_cq(bot, group_id, caller_qq, "[CQ:dice]", "骰子")
 
         elif tool_name == "play_rps":
-            return "[CQ:rps]"
+            return await _send_direct_cq(bot, group_id, caller_qq, "[CQ:rps]", "猜拳")
 
         elif tool_name == "send_music":
             platform = str(tool_input.get("platform", "") or "").strip().lower()

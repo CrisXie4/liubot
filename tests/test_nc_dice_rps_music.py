@@ -4,7 +4,7 @@
 和 {"type":"music",...}（平台点歌 + custom 自定义卡，custom 型 url/image 必填）。
 锁定三件事：
 1. CQ 码路径能透传无参码 [CQ:dice]/[CQ:rps] 与 [CQ:music,...]（不被当纯文本剥掉）；
-2. play_dice/play_rps 返回 CQ 码（仿 send_sticker 模式）；
+2. play_dice/play_rps 直接发送（2026-10-10 改版：不再返回码等模型拼接）；
 3. send_music 的平台白名单 / song_id 必填 / custom 型 url+image 必填且 http 开头。
 """
 import asyncio
@@ -34,6 +34,9 @@ def _call_tool(bot, name, tool_input, group_id=123):
 
 def _make_bot():
     bot = mock.MagicMock()
+    bot.send_group_msg = mock.AsyncMock(return_value=12345)
+    bot.send_private_msg = mock.AsyncMock(return_value=12345)
+    bot.last_fail_msg = mock.MagicMock(return_value="")
     bot.send_group_music = mock.AsyncMock(return_value=True)
     bot.last_fail_msg = mock.MagicMock(return_value="")
     return bot
@@ -75,13 +78,29 @@ class TestCqPassthrough(unittest.TestCase):
 
 
 class TestDiceRpsTools(unittest.TestCase):
-    """play_dice / play_rps：返回 CQ 码（send_sticker 同款模式）"""
+    """play_dice / play_rps：直接发送（返回给模型的是「已发出」说明）"""
 
-    def test_play_dice_returns_cq(self):
-        self.assertEqual(_call_tool(_make_bot(), "play_dice", {}), "[CQ:dice]")
+    def test_play_dice_sent_directly(self):
+        bot = _make_bot()
+        r = _call_tool(bot, "play_dice", {})
+        self.assertIn("骰子已直接发出", r)
+        self.assertNotIn("[CQ:", r)
+        bot.send_group_msg.assert_called_once_with(123, "[CQ:dice]")
 
-    def test_play_rps_returns_cq(self):
-        self.assertEqual(_call_tool(_make_bot(), "play_rps", {}), "[CQ:rps]")
+    def test_play_rps_sent_directly(self):
+        bot = _make_bot()
+        r = _call_tool(bot, "play_rps", {})
+        self.assertIn("猜拳已直接发出", r)
+        self.assertNotIn("[CQ:", r)
+        bot.send_group_msg.assert_called_once_with(123, "[CQ:rps]")
+
+    def test_play_dice_send_failure_feedback(self):
+        """发送失败时把原因回传给模型，而不是假装成功"""
+        bot = _make_bot()
+        bot.send_group_msg = mock.AsyncMock(return_value=None)
+        r = _call_tool(bot, "play_dice", {})
+        self.assertIn("⨯", r)
+        self.assertIn("失败", r)
 
     def test_dice_tool_registered(self):
         names = {t["name"] for t in ai_tools.ALL_TOOLS}

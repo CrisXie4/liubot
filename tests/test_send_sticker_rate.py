@@ -1,8 +1,9 @@
 """send_sticker 每群滑动窗口限速测试。
 
 口径：monkeypatch _STICKER_RATE_LIMIT=2，同群（group_id=0，绕开表情库读写）
-连调 3 次——前两次返回 CQ 码、第三次返回限速提示；回填 2 小时前的时间戳
-（超出 3600s 窗口）后恢复可发，验证滚动窗口；不同群互不影响。
+连调 3 次——前两次直接发出（返回「已直接发出」）、第三次返回限速提示；
+回填 2 小时前的时间戳（超出 3600s 窗口）后恢复可发，验证滚动窗口；
+不同群互不影响。
 """
 import asyncio
 import os
@@ -18,6 +19,9 @@ from bot import ai_tools, sticker
 
 def _call_send_sticker(group_id: int, emotion: str = "开心") -> str:
     bot = mock.MagicMock()
+    bot.send_group_msg = mock.AsyncMock(return_value=12345)
+    bot.send_private_msg = mock.AsyncMock(return_value=12345)
+    bot.last_fail_msg = mock.MagicMock(return_value="")
     return asyncio.run(ai_tools.execute_tool(
         bot, group_id, 123, "send_sticker", {"emotion": emotion}))
 
@@ -38,31 +42,31 @@ class TestSendStickerRate(unittest.TestCase):
     def test_third_call_blocked_with_actionable_hint(self):
         r1 = _call_send_sticker(0)
         r2 = _call_send_sticker(0)
-        self.assertTrue(r1.startswith("[CQ:"), r1)
-        self.assertTrue(r2.startswith("[CQ:"), r2)
+        self.assertIn("已直接发出", r1, r1)
+        self.assertIn("已直接发出", r2, r2)
         r3 = _call_send_sticker(0)
-        self.assertNotIn("[CQ:", r3, "第三次应被限速，不得再返回 CQ 码")
+        self.assertNotIn("已直接发出", r3, "第三次应被限速，不得再发")
         self.assertIn("太频繁", r3)
 
     def test_rolling_window_expires_old_timestamps(self):
         _call_send_sticker(0)
         _call_send_sticker(0)
-        self.assertNotIn("[CQ:", _call_send_sticker(0))  # 已达限额
+        self.assertIn("太频繁", _call_send_sticker(0))  # 已达限额
         # 回填 2 小时前的时间戳（远超 3600s 窗口）→ 滚动窗口淘汰 → 恢复可发
         old = time.time() - 7200
         ai_tools._STICKER_RATE[0] = [old, old + 1]
-        self.assertTrue(_call_send_sticker(0).startswith("[CQ:"),
-                        "过期时间戳不计入窗口，应恢复可发")
+        self.assertIn("已直接发出", _call_send_sticker(0),
+                      "过期时间戳不计入窗口，应恢复可发")
 
     def test_different_groups_independent(self):
         # 非 0 群会走表情库，patch 掉选脸函数避免读写 data/ 下的表情库
         with mock.patch.object(sticker, "pick_emotion_face",
                                return_value="[CQ:face,id=14]"):
-            self.assertTrue(_call_send_sticker(555).startswith("[CQ:"))
-            self.assertTrue(_call_send_sticker(555).startswith("[CQ:"))
+            self.assertIn("已直接发出", _call_send_sticker(555))
+            self.assertIn("已直接发出", _call_send_sticker(555))
             self.assertIn("太频繁", _call_send_sticker(555))  # 群 555 超限
-        self.assertTrue(_call_send_sticker(0).startswith("[CQ:"),
-                        "群 0 不应受群 555 影响")
+        self.assertIn("已直接发出", _call_send_sticker(0),
+                      "群 0 不应受群 555 影响")
 
     def test_blocked_call_does_not_consume_quota(self):
         _call_send_sticker(0)
