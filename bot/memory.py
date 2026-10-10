@@ -115,6 +115,15 @@ async def generate_summary(group_id: int) -> Optional[str]:
     if len(buf) < SUMMARY_MIN_MSGS:
         return None
 
+    # ★ 优先走结构化整合（AgentGal 精髓：闭合检测→事件记忆→稳定认知）。
+    # 未收束的话题会留在缓冲区等下次；LLM 失败/满仓无闭合才退回旧窗口摘要。
+    try:
+        from . import episode_memory
+        if await episode_memory.maybe_consolidate(group_id):
+            return None
+    except Exception as e:
+        logger.debug(f"结构化整合不可用，退回旧摘要: {e}")
+
     # 构建对话文本
     lines = []
     participants = set()
@@ -255,6 +264,25 @@ def get_relevant_context_for_chat(group_id: int, message: str) -> str:
     重要性分级：高分记忆给完整摘要（200字），低分记忆只给一行（40字）。
     """
     parts = []
+
+    # 0. 双层记忆（AgentGal 精髓）：结构化事件 + 对群友的稳定认知。
+    # 按词法相关度×重要度×新近度融合检索，命中即"回忆强化"。
+    try:
+        from . import episode_memory as _em
+        episodes = _em.retrieve_relevant_episodes(group_id, message)
+        if episodes:
+            parts.append("🧩 **相关往事:**")
+            parts.append(_em.render_episodes_block(episodes))
+            for ep in episodes:
+                db.touch_episode_recall(ep["id"])
+        understandings = _em.retrieve_relevant_understandings(group_id, message)
+        if understandings:
+            parts.append("💡 **对群友的了解:**")
+            parts.append(_em.render_understandings_block(understandings))
+            for u in understandings:
+                db.touch_understanding_recall(u["id"])
+    except Exception as e:
+        logger.debug(f"双层记忆检索跳过: {e}")
 
     # 1. 重要记忆（按重要性 + 时间衰减排序）—— 注入完整摘要
     important = db.get_important_memories(group_id, limit=5)
@@ -612,19 +640,21 @@ async def decide_proactive_reply(group_id: int, bot_name: str) -> Optional[str]:
         from . import llm_call
 
         proactive_system = (
-            f"你是名叫「{bot_name}」的QQ群机器人，你是你自己，不是群里的任何其他人。\n\n"
-            f"{_time_facts()}\n\n"
-            f"关于这个群和群友的记忆：\n{memory_context}\n\n"
+            "你是QQ群里的一个群友，你是你自己，不是群里的任何其他人。\n\n"
             "规则：\n"
-            "1. 上面这些消息都是【群友】说的，跟你没关系，你不是他们中的任何一个人\n"
-            f"2. 🔴 最重要：你永远是你自己「{bot_name}」，绝对不要代替群里其他人回复！\n"
+            "1. 用户消息里的群聊记录都是【群友】说的，跟你没关系，你不是他们中的任何一个人\n"
+            "2. 🔴 最重要：你永远是你自己（你的名字见下方数据区），绝对不要代替群里其他人回复！\n"
             "   如果有群友A对群友B说了一句话，你应该以第三方的身份评论/吐槽，而不是装作群友B去回复\n"
             "3. 如果有人提到你、问问题、讨论有趣话题、或者气氛轻松 → 用自然活泼的语气插一句（20字以内）\n"
             "4. 即使话题与你不太相关，也可以发一句幽默的评论刷存在感\n"
             "5. 偶尔可以吐槽、开玩笑、或者表达情绪\n"
             "6. 只有在完全插不上话的严肃话题才回复 SILENT\n"
             "7. 主动插话不要引用别人的消息，也不要 @ 人——直接说就行\n\n"
-            "直接回复 SILENT 或者你想说的话（纯文本，不要带任何格式标记）。"
+            "直接回复 SILENT 或者你想说的话（纯文本，不要带任何格式标记）。\n\n"
+            "—— 以下为本次判断的数据 ——\n"
+            f"你的名字：{bot_name}\n"
+            f"{_time_facts()}\n"
+            f"关于这个群和群友的记忆：\n{memory_context}"
         )
         response = await llm_call.llm_create(
             model=ms["model"],
@@ -700,7 +730,67 @@ DEFAULT_MODEL_SETTINGS = {
     "context_size": 200,
     "max_context_tokens": 800000,
     "web_search_enabled": True,     # 联网搜索开关（SearXNG）
+    # ★ 多 provider 轮询：每次调用轮流选一个，分散负载避免单 API 429
+    # 空列表 = 只用上面的 api_url/api_key/model（兼容旧行为）
+    # 每个 provider: {api_url, api_key, model, supports_vision}
+    "providers": [
+        # 默认 provider（保持向后兼容，从上面的字段读取）
+        # 实际值在 load_model_settings 里动态填充
+    ],
 }
+
+def _parse_env_providers(raw: str) -> list[dict]:
+    """解析 .env 的 LLM_EXTRA_PROVIDERS（JSON 数组）为合法 provider 列表。
+
+    每项: {"api_url": "https://...", "api_key": "...", "model": "...", "supports_vision": true}
+    仅接受 http/https 的 api_url；缺 api_key/model 或格式非法的条目丢弃并记日志。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    try:
+        items = json.loads(raw)
+    except Exception:
+        logger.warning("LLM_EXTRA_PROVIDERS 不是合法 JSON，已整体忽略")
+        return []
+    if not isinstance(items, list):
+        logger.warning("LLM_EXTRA_PROVIDERS 必须是 JSON 数组，已整体忽略")
+        return []
+    providers = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        url = str(it.get("api_url", "")).strip()
+        key = str(it.get("api_key", "")).strip()
+        model = str(it.get("model", "")).strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            logger.warning(f"LLM_EXTRA_PROVIDERS 条目 api_url 非法（仅允许 http/https）: {url[:60]}")
+            continue
+        if not key or not model:
+            logger.warning(f"LLM_EXTRA_PROVIDERS 条目缺 api_key 或 model，已忽略: {url[:60]}")
+            continue
+        provider = {
+            "api_url": url,
+            "api_key": key,
+            "model": model,
+            "supports_vision": bool(it.get("supports_vision", False)),
+        }
+        # 可选：声明该渠道的上下文窗口上限（token），独占模式下用来收紧聊天上下文
+        max_ctx = it.get("max_context_tokens")
+        if isinstance(max_ctx, int) and max_ctx > 0:
+            provider["max_context_tokens"] = max_ctx
+        # 可选：思考档位（DeepSeek effort 映射，low/medium/high/xhigh/max），
+        # 非法值丢弃并记日志，不带此字段的渠道不发 output_config
+        effort = str(it.get("thinking_effort", "")).strip().lower()
+        if effort:
+            if effort in ("low", "medium", "high", "xhigh", "max"):
+                provider["thinking_effort"] = effort
+            else:
+                logger.warning(
+                    f"LLM_EXTRA_PROVIDERS 条目 thinking_effort 非法（应为 low/medium/high/xhigh/max）: {effort}")
+        providers.append(provider)
+    return providers
+
 
 def load_model_settings() -> dict:
     """加载模型设置（带缓存，减少文件 IO）"""
@@ -736,6 +826,42 @@ def load_model_settings() -> dict:
     # vision_model：JSON 没有 → 用 .env 的 LLM_VISION_MODEL
     if not settings.get("vision_model"):
         settings["vision_model"] = config.LLM_VISION_MODEL or DEFAULT_MODEL_SETTINGS["vision_model"]
+
+    # ★ 多 provider 轮询：
+    # 第一个 provider 永远是从 api_url/api_key/model 读出来的"默认 provider"
+    # 加上 JSON 里额外配置的 providers（比如 Claude via agentrouter）
+    default_provider = {
+        "api_url": settings.get("api_url", ""),
+        "api_key": settings.get("api_key", ""),
+        "model": settings.get("model", ""),
+        "supports_vision": False,  # gemini 经此网关不支持 vision
+    }
+    extra_providers = settings.get("providers", [])
+    if not isinstance(extra_providers, list):
+        extra_providers = []
+    # ★ .env 注入的 provider（LLM_EXTRA_PROVIDERS）：
+    # 普通模式排在【最前】——运维显式加的行就是当前主渠道（2026-09-06 用户指定
+    # DeepSeek 第一、ccode 默认渠道第二），llm_create 的 failover 从 index 0 开始。
+    # 独占模式（LLM_PROVIDERS_EXCLUSIVE=true）则只用 env 渠道，其余全部停用。
+    # 注意：Web 端保存设置会把合并结果快照进 JSON，之后删掉 env 行 JSON 副本仍在。
+    env_providers = _parse_env_providers(config.LLM_EXTRA_PROVIDERS)
+    if env_providers and config.LLM_PROVIDERS_EXCLUSIVE:
+        # 独占模式：默认渠道 / JSON 渠道全部关闭，只留 env 注入的渠道
+        settings["providers"] = env_providers
+        # 渠道窗口小于默认 800K（如 llama.cpp 32K）时收紧聊天上下文，
+        # 否则每条消息都会超限。llm_call 里也有超限 failover 兜底。
+        cap = env_providers[0].get("max_context_tokens")
+        if isinstance(cap, int) and 0 < cap < settings.get("max_context_tokens", 0):
+            settings["max_context_tokens"] = cap
+    else:
+        # 同 api_url+model 的 JSON 条目视为同渠道去重（env 版本生效）
+        env_keys = {(p["api_url"], p["model"]) for p in env_providers}
+        # 合并：env provider → 默认 provider → JSON 额外 provider（去重）
+        settings["providers"] = env_providers + [default_provider] + [
+            p for p in extra_providers
+            if isinstance(p, dict) and p.get("api_key")
+            and (p.get("api_url"), p.get("model")) not in env_keys
+        ]
 
     cache.model_settings_cache.set("model_settings", settings)
     return settings

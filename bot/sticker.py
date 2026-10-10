@@ -5,6 +5,7 @@ AI 表情/贴纸管理系统
 - AI 自动选用表情回复
 - 按群/标签管理
 """
+import html
 import json
 import logging
 import os
@@ -101,6 +102,8 @@ def remove_sticker(sticker_id: int) -> bool:
 async def download_to_cache(sticker_id: int, image_url: str) -> Optional[str]:
     """下载图片到本地缓存，返回本地 file:// 路径"""
     import httpx
+    # 入口反转义：入库的 URL 可能带 HTML 转义（&amp; 等），带着转义去下载必失败
+    image_url = html.unescape(image_url)
     ext = ".gif"
     if ".png" in image_url.lower(): ext = ".png"
     elif ".jpg" in image_url.lower() or ".jpeg" in image_url.lower(): ext = ".jpg"
@@ -318,18 +321,127 @@ EMOTION_FACE_MAP = {
 }
 
 def pick_emotion_face(emotion: str, group_id: int = 0) -> str:
-    """选表情：70% 从收藏库选，30% 用内置黄脸"""
+    """按情绪语义选表情：收藏库标签匹配 → 内置黄脸兜底。
+
+    旧版 70% 从收藏库【随机】抽——收藏库是群友发的什么表情都收，
+    所以"开心"语境抽出发尴尬脸（2026-09-06 线上实测牛头不对马嘴）。
+    现在只有语义匹配命中才用收藏库（image 类型含 GIF，命中即发动图），
+    匹配不到一律用内置情绪映射，绝不随机。
+    """
     import random
-    # 尝试从收藏库选 face 类型
-    if group_id and random.random() < 0.7:
-        stickers = get_group_stickers(group_id, limit=50)
-        face_stickers = [s for s in stickers if s.get("sticker_type") == "face"]
-        if face_stickers:
-            choice = random.choice(face_stickers)
-            return choice.get("cq_code", build_face_cq(14))
-    # 回退内置黄脸
-    ids = EMOTION_FACE_MAP.get(emotion, [14])
+    emo = _match_emotion_key(emotion) or emotion
+
+    # 1) 收藏库语义匹配（face/image 皆可；mface 的 url 会过期，排除）
+    if group_id:
+        candidates = [
+            s for s in get_group_stickers(group_id, limit=50)
+            if s.get("sticker_type") != "mface"
+        ]
+        scored = sorted(
+            ((_score_sticker_for_emotion(s, emo), s) for s in candidates),
+            key=lambda x: x[0], reverse=True,
+        )
+        if scored and scored[0][0] >= 0.5:
+            best = scored[0][1]
+            use_sticker(best["id"])
+            cq = _build_sticker_cq(best)
+            if cq:
+                return cq
+
+    # 2) 内置黄脸（语义正确的兜底）
+    ids = EMOTION_FACE_MAP.get(emo, EMOTION_FACE_MAP.get(emotion, [14]))
     return build_face_cq(random.choice(ids))
+
+
+# ─── 情绪名归一与语义打分 ───
+
+# LLM/群友可能写的中文表情名 → EMOTION_FACE_MAP 键
+EMOTION_ALIASES = {
+    "尴尬": "尴尬", "尴尬表情": "尴尬", "汗": "无语", "黑线": "无语",
+    "饥饿": "吃货", "饿": "吃货", "吃货": "吃货", "吃": "吃货", "干饭": "吃货",
+    "笑": "大笑", "大笑": "大笑", "哈哈": "大笑", "乐": "大笑",
+    "开心": "开心", "高兴": "开心", "快乐": "开心", "元气": "开心",
+    "哭": "哭泣", "哭泣": "哭泣", "委屈": "哭泣", "难过": "难受",
+    "伤心": "难受", "难受": "难受", "累": "困了", "困": "困了",
+    "困了": "困了", "睡": "困了", "晚安": "困了",
+    "生气": "生气", "怒": "生气", "愤怒": "生气",
+    "惊讶": "惊讶", "惊": "惊讶", "震惊": "惊讶", "什么": "惊讶",
+    "无语": "无语", "无奈": "无奈", "叹气": "无奈",
+    "害羞": "害羞", "脸红": "害羞", "喜欢": "喜欢", "爱": "喜欢",
+    "心": "喜欢", "比心": "喜欢", "赞": "赞", "点赞": "赞", "强": "赞",
+    "好耶": "赞", "厉害": "赞", "666": "赞",
+    "调皮": "调皮", "皮": "调皮", "捣蛋": "调皮",
+    "疑问": "疑问", "问号": "疑问", "疑惑": "疑问", "问": "疑问",
+    "害怕": "害怕", "恐惧": "害怕", "慌": "害怕",
+    "庆祝": "庆祝", "鼓掌": "庆祝", "撒花": "庆祝", "生日快乐": "庆祝",
+    "加油": "加油", "努力": "加油",
+    "撒娇": "撒娇", "卖萌": "卖萌", "可爱": "卖萌",
+    "安慰": "安慰", "抱抱": "安慰", "摸头": "安慰",
+    "得意": "得意", "嘚瑟": "嘚瑟", "酷": "冷酷", "冷酷": "冷酷",
+    "感动": "感动", "鄙视": "鄙视", "踩": "鄙视",
+    "打招呼": "打招呼", "你好": "打招呼", "hello": "打招呼", "hi": "打招呼",
+    "变态": "鄙视", "坏笑": "调皮", "斜眼": "无语", "翻白眼": "无语",
+    "微笑": "开心", "耶": "庆祝", "捂脸": "尴尬", "狗头": "调皮",
+}
+
+
+def _match_emotion_key(name: str) -> str:
+    """把 LLM 写的表情名归一到 EMOTION_FACE_MAP 的键，认不出返回空。"""
+    n = (name or "").strip().lower()
+    if not n:
+        return ""
+    if n in EMOTION_ALIASES:
+        return EMOTION_ALIASES[n]
+    # 去掉"表情/脸"后缀再试（如"尴尬表情"）
+    n2 = re.sub(r"(表情|脸|包| emoticon)$", "", n).strip()
+    return EMOTION_ALIASES.get(n2, "")
+
+
+def _score_sticker_for_emotion(s: dict, emotion: str) -> float:
+    """收藏表情与情绪的语义匹配分：tags/description/summary 与情绪词（含别名）重叠。"""
+    emo = _match_emotion_key(emotion) or emotion
+    terms = {emo, emotion.strip().lower()}
+    terms |= {a for a, k in EMOTION_ALIASES.items() if k == emo}
+    hay = " ".join(
+        [s.get("description", ""), s.get("summary", ""),
+         " ".join(s.get("tags", []) or [])]
+    ).lower()
+    if not hay.strip():
+        return 0.0
+    hit = sum(1 for t in terms if t and t in hay)
+    # 收藏数加一点权重（同样命中时优先常用的）
+    pop = min(0.1, s.get("use_count", 0) * 0.01 + s.get("favorite_count", 0) * 0.005)
+    return (hit / max(len(terms), 1)) * 1.5 + pop
+
+
+# 回复后处理：把 LLM 自创的中文表情标签转成真表情，转不出来的删掉。
+# （换模型后 DeepSeek 会写 [尴尬]/[饥饿]/[尴尬表情]/:尴尬: 这类文本标签，
+#   原样发出去就是一行"[表情]"，群友看着莫名其妙。）
+_FACE_TAG_RE = re.compile(r"\[([一-鿿a-zA-Z0-9]{1,6}?)\]|:([一-鿿]{1,4}?):")
+
+
+def normalize_face_tags(text: str) -> str:
+    """归一化回复里的中文表情标签。
+
+    - `[尴尬]` `[尴尬表情]` `:尴尬:` → 对应的 [CQ:face,id=N]
+    - 裸的 `[表情]`（占位符照抄）→ 删除
+    - 认不得的名字（如 [图片]）→ 原样保留（可能是正常文字）
+    """
+    def _sub(m: "re.Match") -> str:
+        name = (m.group(1) or m.group(2) or "").strip()
+        if not name:
+            return m.group(0)
+        if name == "表情":
+            return ""  # 工具结果里照抄出来的占位符
+        emo = _match_emotion_key(name)
+        if not emo:
+            return m.group(0)  # 不是表情名，别动
+        import random
+        ids = EMOTION_FACE_MAP.get(emo, [14])
+        return build_face_cq(random.choice(ids))
+
+    # 跳过 CQ 码本体（[CQ:...] 内部不会被 _FACE_TAG_RE 命中，因为名字段不含冒号逗号）
+    return _FACE_TAG_RE.sub(_sub, text)
 
 def pick_context_sticker(group_id: int, message: str, tags: list[str] = None) -> Optional[str]:
     """选一个合适的收藏表情，优先用本地缓存（永不过期）"""
@@ -370,8 +482,8 @@ def _build_sticker_cq(sticker: dict) -> str:
     if cached:
         return f"[CQ:image,file={cached}]"
 
-    # 回退原始 CQ 码（URL 可能已过期）
-    return sticker.get("cq_code", "")
+    # 回退原始 CQ 码（URL 可能已过期；先反转义 &amp;，否则 NapCat 拉不到图）
+    return html.unescape(sticker.get("cq_code", ""))
 
 # ═══════════════════════════════════════════════════════════
 #  AI 自动收藏
@@ -404,17 +516,15 @@ def maybe_collect_sticker(message: str, group_id: int, user_qq: int) -> Optional
             desc = f"QQ表情 {face_id}"
             tags = ["qq表情"]
         elif cq_type == "mface":
-            summary = params.get("summary", "")
-            url = params.get("url", "")
-            if not summary:
-                continue
-            unique_key = f"mface:{summary}"
-            cq_code = build_mface_cq(summary, url) if summary else c["raw"]
-            desc = summary[:40]
-            tags = ["商城表情"]
+            # 商城表情 URL 会过期，且选择逻辑（pick_emotion_face/pick_context_sticker）
+            # 始终排除 mface，收进库也基本永不复用——直接跳过，不白占 MAX_STICKERS 名额
+            # （对齐 maybe_collect_with_ai「商城表情不收藏」的立场；
+            #   存量坏数据交给 _auto_prune_stickers 按 use_count=0 优先淘汰，不做迁移）
+            continue
         elif cq_type == "image":
             file_id = params.get("file", "")
-            url = params.get("url", "")
+            # URL 反转义：raw 里的 &amp; 原样入库会导致下载/发送全部失败
+            url = html.unescape(params.get("url", ""))
             if not file_id:
                 continue
             unique_key = f"image:{file_id}"
@@ -533,6 +643,7 @@ async def evaluate_sticker_with_ai(image_url: str, description: str = "") -> Opt
             prompt += f"\n\n补充描述: {description}"
 
         response = await llm_call.llm_create(
+            priority="P3",
             model=ms["model"],
             max_tokens=150,
             messages=[{
@@ -566,6 +677,9 @@ async def maybe_collect_with_ai(
     - face 类型 → 直接收藏
     - 超过上限 → AI 自动淘汰
     """
+    # 入口反转义：实参来自 handler 扫描的 c["raw"]（URL 带 &amp; 等转义），
+    # 不还原则并行入库路径会持续写入坏 URL
+    cq_code = html.unescape(cq_code)
     data = _load_stickers()
     current_count = len(data)
 
@@ -575,8 +689,8 @@ async def maybe_collect_with_ai(
     if cq_type == "mface":
         return None  # 商城表情 URL 会过期，不收藏
 
-    # image → AI 评估
-    img_url = params.get("url", "")
+    # image → AI 评估（url 同样带 HTML 转义，先还原再评估/下载）
+    img_url = html.unescape(params.get("url", ""))
     if not img_url and cq_type == "mface":
         img_url = f"https://gchat.qpic.cn/gchatpic_new/0/0-0-{params.get('file', '')}/0"
 

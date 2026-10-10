@@ -32,6 +32,7 @@ import uvicorn
 
 import bot as bot_mod
 from bot import OneBotClient, config, db, handle_group_message, handle_notice, automod, trainer, scheduler, security, timeutil
+from bot import handler as bot_handler
 config._load_group_modes()
 from web.server import app as web_app
 
@@ -145,6 +146,7 @@ async def main():
                         owner_cmd_handled = True
                         detail = guardian.approve_action(arg)
                         if detail:
+                            await guardian.recall_notify(client, detail)
                             if detail["action"] == "kick":
                                 await client._call("set_group_kick",
                                     {"group_id": detail["group_id"], "user_id": detail["user_qq"]})
@@ -163,6 +165,7 @@ async def main():
                         owner_cmd_handled = True
                         detail = guardian.reject_action(arg)
                         if detail:
+                            await guardian.recall_notify(client, detail)
                             await client.send_private_msg(user_id,
                                 f"❌ 已拒绝: {detail['user_name']} 的 {detail['action']}")
                         else:
@@ -291,6 +294,10 @@ async def main():
                         logger.debug(f"空闲思考+发言失败: {e}")
                 asyncio.create_task(_idle_think_and_maybe_speak())
 
+            # ── 1.4 沉寂唤醒（聊到一半断掉的对话，3~10 分钟后自然接上）──
+            # 后台执行，不阻塞意识循环
+            asyncio.create_task(bot_handler.check_dormant_conversations(bot))
+
             # ── 2. QQ 状态同步（每 10 分钟检查一次）──
             if time.time() - _last_status_sync > 600:
                 _last_status_sync = time.time()
@@ -321,11 +328,14 @@ async def main():
                                 gid = g.get("group_id", 0)
                                 if gid and guardian.check_proactive_rate(gid):
                                     await send_human_like(bot, gid, proactive_msg)
+                                    # 逐群记录主动发言（被忽视追踪按群判定：
+                                    # 之后该群有人说话就不算被忽视）
+                                    cs.record_proactive_message(state, gid)
                                     await asyncio.sleep(random.uniform(4, 7))
                     except Exception as e:
                         logger.debug(f"volition 跳过: {e}")
 
-            # ── 5. 新闻分享（每 2 小时）──
+            # ── 5. 新闻分享（受 ai_brain.NEWS_SHARE_COOLDOWN 2 小时冷却，两条路径共用）──
             try:
                 news = await share_news_if_ready(bot)
                 if news:
@@ -335,6 +345,7 @@ async def main():
                     )
                     r = await bot._call("get_group_list", {})
                     groups = r.get("data", []) if r.get("status") == "ok" else []
+                    sent_groups = 0
                     for g in groups:
                         gid = g.get("group_id", 0)
                         if not gid:
@@ -354,9 +365,14 @@ async def main():
                                     msg_to_send = [{"type": "at", "data": {"qq": "all"}}] + msg_to_send
                         if isinstance(msg_to_send, str) and guardian.check_proactive_rate(gid):
                             await send_human_like(bot, gid, msg_to_send)
+                            sent_groups += 1
                         else:
                             await bot.send_group_msg(gid, msg_to_send)
+                            sent_groups += 1
                         await asyncio.sleep(random.uniform(5, 8))
+                    # 可观测性：之前发没发出去完全无日志，排查"到底发没发"全靠猜
+                    if sent_groups:
+                        logger.info(f"📰 新闻分享完成: 已发 {sent_groups}/{len(groups)} 个群")
             except Exception as e:
                 logger.debug(f"新闻分享跳过: {e}")
 
@@ -437,6 +453,12 @@ async def main():
             # ── 保存意识状态 ──
             if now.minute % 5 == 0:
                 cs.save()
+                # 顺手把对话上下文落盘（防重启失忆）
+                try:
+                    from bot import chat as _chat
+                    _chat.flush_contexts()
+                except Exception as e:
+                    logger.debug(f"上下文落盘跳过: {e}")
 
     asyncio.create_task(consciousness_loop())
 
@@ -446,6 +468,12 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
+        # 停机前把对话上下文落盘，减少重启失忆
+        try:
+            from bot import chat as _chat
+            _chat.flush_contexts()
+        except Exception:
+            pass
         await bot.close()
         await sched.stop()
         web_thread.stop()
@@ -458,6 +486,11 @@ async def shutdown(bot: OneBotClient):
 
 
 if __name__ == "__main__":
+    from bot.single_instance import acquire_single_instance_lock
+
+    if not acquire_single_instance_lock():
+        sys.stderr.write("已有 Bot 实例在运行，本次启动退出（详见 bot.log）\n")
+        sys.exit(1)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

@@ -80,6 +80,19 @@ def get_group_personality(group_id: int) -> dict:
     # 合并默认值
     result = {**DEFAULT_GROUP_PERSONALITY, **gp}
 
+    # 惰性迁移：清洗历史垃圾口头禅（旧版 LLM 学习器遗留），并把清洗结果落盘。
+    # 代码可部署而 data/ 不在部署白名单，线上数据靠这里自愈。
+    raw_quirks = result.get("quirks") or []
+    cleaned_quirks = _sanitize_quirks(raw_quirks)
+    if cleaned_quirks != raw_quirks:
+        logger.info(f"群{group_id} 清洗历史垃圾口头禅: {raw_quirks} → {cleaned_quirks}")
+        result["quirks"] = cleaned_quirks
+        if str(group_id) in data:
+            data[str(group_id)]["quirks"] = cleaned_quirks
+        else:
+            data[str(group_id)] = {"quirks": cleaned_quirks}
+        _save_all(data)
+
     # 缓存
     if cached is not None:
         cached.set(key, result)
@@ -225,6 +238,17 @@ _IDENTITY_WORDS = ("妹", "弟", "爷", "叔", "爸", "哥", "姐", "娘", "婆"
                    "妻", "夫", "儿", "老母", "老婆", "老公", "小号", "替身",
                    "分身", "本体", "真人", "假的", "AI妹妹", "亲戚")
 
+# 粗俗词 + 旧版 LLM 学习器（2026-08-07 废弃）遗留的垃圾口头禅。
+# 含这些子串的 quirk 一律拒绝/清除——它们曾让 Bot 满口"卧槽/唔姆/羊毛很厚"。
+_JUNK_QUIRK_WORDS = (
+    # 粗俗/骂人
+    "卧槽", "我操", "我艹", "woc", "傻逼", "sb", "cnm", "nmb", "nmsl",
+    "尼玛", "tmd", "妈的", "草泥马",
+    # 旧版学习器从群聊/自己发言里学来的垃圾
+    "唔姆", "白嫖", "羊毛", "哈基米", "哈吉米", "人机", "zdjd", "诶",
+    "改下昵称", "群友模式", "何意味", "尽管来", "超级强", "真可以",
+)
+
 
 def _is_safe_quirk(q) -> bool:
     """判断一条 quirk 是否安全可学。防投毒过滤。
@@ -236,6 +260,10 @@ def _is_safe_quirk(q) -> bool:
         return False
     q = q.strip()
     if len(q) > 8:  # 太长 → 几乎都是句子而非语气词
+        return False
+    if len(q) < 2 and q not in ("草", "乐"):  # 单字只允许学习器白名单里的语气词
+        return False
+    if any(w in q for w in _JUNK_QUIRK_WORDS):  # 粗俗/历史垃圾 → 拒绝
         return False
     if any(w in q for w in _IDENTITY_WORDS):  # 含身份/关系词 → 拒绝
         return False

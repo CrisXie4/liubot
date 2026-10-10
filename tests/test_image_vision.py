@@ -30,7 +30,7 @@ logging.getLogger("qqbot").setLevel(logging.INFO)
 
 from bot import memory, image_mod, media_reader
 
-IMG_PATH = os.path.join(_ROOT, "baidu.png")
+IMG_PATH = os.path.join(_ROOT, "tests", "assets", "baidu.png")
 
 
 class MockBot:

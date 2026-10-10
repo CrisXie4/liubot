@@ -8,6 +8,12 @@ data/
 .env
 bot.log
 
+# 本地归档（部署包/旧 zip/安装器，运行时生成或一次性产物）
+archives/
+
+# Mimosa 安全扫描历史
+.mimosa/
+
 # Third-party framework (not our code, plan never touches it)
 NapCatQQ-main/
 
@@ -24,3 +30,24 @@ node_modules/
 Thumbs.db
 .vscode/
 .idea/
+
+# ── 发布整理（2026-10-10）：以下为本地工作区内容，不入库 ──
+# AI 会话工作台（运维脚本含服务器信息）
+.zcode/
+# 第三方参考源码 / 学习目录
+AgentGal-main/
+_study_dsh/
+_study_jianer/
+_study_langbot/
+# 本地压缩产物与安装器
+*.zip
+# SDD 设计文档（开发过程产物）
+docs/superpowers/
+# 一次性运维诊断脚本（含服务器 IP，仅本地留存）
+scripts/diag_searxng*.py
+scripts/fix_searxng.py
+scripts/probe_d1kt.py
+scripts/repro_relay_chat.py
+scripts/test_mcp_conn.py
+scripts/settings.yml.new
+scripts/icons/

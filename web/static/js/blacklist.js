@@ -12,7 +12,7 @@ async function blLoad() {
       <td class="muted">${esc(ts(b.blacklisted_at))}</td>
       <td><button class="btn xs danger" onclick="blDel(${b.user_qq},${b.group_id || 0})">删除</button></td>
     </tr>`,
-    '⛔', '黑名单为空');
+    'user-delete', '黑名单为空');
 }
 
 function blAdd() {

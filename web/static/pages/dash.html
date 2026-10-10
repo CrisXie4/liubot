@@ -1,12 +1,16 @@
 <!-- DASHBOARD -->
 <div class="card panel quick-card">
-  <div class="panel-h">⚡ 快速控制</div>
+  <div class="panel-h">快速控制</div>
   <div class="panel-b dash-quick">
     <label class="tog"><input type="checkbox" id="ms-bot" data-action="toggle" data-path="/bot/master-switches" data-key="bot_enabled"><span class="sw"></span><strong>Bot 机器人</strong><span class="muted">关掉后机器人完全不响应</span><span class="lab-off">已关</span><span class="lab-on">运行中</span></label>
-    <label class="tog"><input type="checkbox" id="ms-ai" data-action="toggle" data-path="/bot/master-switches" data-key="ai_enabled"><span class="sw"></span><strong>AI 模式</strong><span class="muted">关掉后所有 LLM 调用短路</span><span class="lab-off">已关</span><span class="lab-on">运行中</span></label>
+    <label class="tog"><input type="checkbox" id="ms-ai" data-action="toggle" data-path="/bot/master-switches" data-key="ai_enabled"><span class="sw"></span><strong>AI 模式</strong><span class="muted">关闭后 AI 不再生成任何回复</span><span class="lab-off">已关</span><span class="lab-on">运行中</span></label>
   </div>
 </div>
 <div class="stats" id="dash-stats"></div>
+<div class="charts">
+  <div class="card"><div class="panel-h">每小时 Token 用量（近 48 小时）</div><div class="panel-b"><div class="chart-h"><canvas id="c-tok"></canvas></div></div></div>
+  <div class="card"><div class="panel-h">每小时消息量与 AI 调用（近 48 小时）</div><div class="panel-b"><div class="chart-h"><canvas id="c-msg"></canvas></div></div></div>
+</div>
 <div class="charts">
   <div class="card"><div class="panel-h">高频违规词</div><div class="panel-b"><div class="chart-h"><canvas id="c-kw"></canvas></div></div></div>
   <div class="card"><div class="panel-h">违规时段</div><div class="panel-b"><div class="chart-h"><canvas id="c-hr"></canvas></div></div></div>

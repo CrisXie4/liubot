@@ -42,6 +42,29 @@ def _save_cache():
     with open(MEDIA_CACHE_PATH, "w", encoding="utf-8") as f:
         json.dump(_media_cache, f, ensure_ascii=False, indent=2)
 
+
+def get_cached_description(image_url: str) -> Optional[str]:
+    """供其他模块（如 image_mod）复用已缓存的图片描述。
+    命中则返回描述文本，否则 None。避免对同一张图重复调 vision。
+    """
+    if not image_url:
+        return None
+    _load_cache()
+    cache_key = f"img:{image_url}"
+    cached = _media_cache.get(cache_key)
+    if isinstance(cached, dict) and cached.get("description"):
+        # 过期清理（24 小时）
+        analyzed = cached.get("analyzed_at", "")
+        if analyzed:
+            try:
+                analyzed_dt = datetime.strptime(analyzed, "%Y-%m-%d %H:%M:%S")
+                if (datetime.now() - analyzed_dt).total_seconds() > 86400:
+                    return None
+            except Exception:
+                pass
+        return cached["description"]
+    return None
+
 # ═══════════════════════════════════════════════════════════
 #  CQ 码解析
 # ═══════════════════════════════════════════════════════════
@@ -109,14 +132,27 @@ async def describe_image(image_url: str, context: str = "") -> Optional[str]:
     clean_url = _html.unescape(image_url)
     img_data = None
     content_type = "image/jpeg"
+    is_gif = False
     try:
         import httpx
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as http:
             resp = await http.get(clean_url, headers={"User-Agent": "QQBot/5.0"})
             if resp.status_code == 200:
-                img_data = b64.b64encode(resp.content).decode("utf-8")
-                ct = resp.headers.get("content-type", "")
-                if ct: content_type = ct
+                is_gif = _is_gif_url(clean_url, resp.headers.get("content-type", ""))
+                if is_gif:
+                    # GIF：抽帧拼成一张图（vision 按静态图理解，prompt 说明是动图分帧）
+                    frames_png = await asyncio.to_thread(
+                        _gif_to_frames_image, resp.content)
+                    if frames_png:
+                        img_data = b64.b64encode(frames_png).decode("utf-8")
+                        content_type = "image/png"
+                    else:
+                        img_data = b64.b64encode(resp.content).decode("utf-8")
+                        content_type = resp.headers.get("content-type", "") or "image/gif"
+                else:
+                    img_data = b64.b64encode(resp.content).decode("utf-8")
+                    ct = resp.headers.get("content-type", "")
+                    if ct: content_type = ct
             else:
                 logger.info(f"图片下载失败 HTTP {resp.status_code}: {image_url[:60]}")
                 return _basic_image_description(image_url)
@@ -127,21 +163,29 @@ async def describe_image(image_url: str, context: str = "") -> Optional[str]:
     if not img_data:
         return _basic_image_description(image_url)
 
-    prompt = (
-        "请详细描述这张图片的内容。"
-        "如果是截图/报错/代码：逐行读出所有文字内容，不要省略。"
-        "如果是聊天记录截图：读出每条消息的发送者和内容。"
-        "如果是表情包：描述画面、文字和情绪。"
-        "如果是照片：描述场景、人物、关键细节。"
-        "至少50字，信息越多越好。"
-    ) + (f"\n对话上下文: {context}" if context else "")
+    if is_gif:
+        prompt = (
+            "这是同一个GIF动图按时间顺序抽取的几帧画面（从左到右）。"
+            "请描述这个动图整体在表现什么：画面主体、动作/变化过程、"
+            "想传达的情绪或笑点。50字左右。"
+        ) + (f"\n对话上下文: {context}" if context else "")
+    else:
+        prompt = (
+            "请详细描述这张图片的内容。"
+            "如果是截图/报错/代码：逐行读出所有文字内容，不要省略。"
+            "如果是聊天记录截图：读出每条消息的发送者和内容。"
+            "如果是表情包：描述画面、文字和情绪。"
+            "如果是照片：描述场景、人物、关键细节。"
+            "至少50字，信息越多越好。"
+        ) + (f"\n对话上下文: {context}" if context else "")
 
-    # 图片理解走 vision_model（gemini 经此网关不支持 vision）
+    # 图片理解：让 llm_create 自动选支持 vision 的 provider（如 Claude）
+    # 传一个占位 model，llm_create 会用 provider 自己的 model 覆盖
     from . import llm_call
-    vision_model = ms.get("vision_model") or ms.get("fallback_model") or "minimax-m3-free"
     try:
         response = await llm_call.llm_create(
-            model=vision_model,
+            priority="P1",
+            model="vision-placeholder",
             max_tokens=400,
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": content_type, "data": img_data}},
@@ -168,6 +212,50 @@ def _basic_image_description(url: str) -> Optional[str]:
     if "qlogo" in url.lower() or "avatar" in url.lower():
         return "[头像图片]"
     return "[图片] - 建议开启 Vision 功能以获取内容描述"
+
+
+def _is_gif_url(url: str, content_type: str = "") -> bool:
+    """判断是否 GIF 动图（URL 后缀或响应 content-type）。"""
+    ct = (content_type or "").lower()
+    if "gif" in ct:
+        return True
+    return ".gif" in (url or "").lower().split("?")[0]
+
+
+def _gif_to_frames_image(img_bytes: bytes, max_frames: int = 3) -> Optional[bytes]:
+    """GIF 抽帧拼图：取首/中/尾最多 3 帧，横向拼成一张 PNG（vision 模型不直接吃多帧 GIF）。
+
+    返回 PNG 字节；失败返回 None（调用方退回原图直传）。
+    """
+    try:
+        import io as _io
+        from PIL import Image, ImageSequence
+        im = Image.open(_io.BytesIO(img_bytes))
+        frames = []
+        for frame in ImageSequence.Iterator(im):
+            frames.append(frame.convert("RGB"))
+            if len(frames) >= max_frames:
+                break
+        # 只有 1 帧说明近似静态图，直接原样单帧
+        target_w = 480
+        tiles = []
+        for f in frames:
+            ratio = target_w / max(f.width, 1)
+            tiles.append(f.resize((target_w, max(int(f.height * ratio), 1))))
+        gap = 8
+        total_w = sum(t.width for t in tiles) + gap * (len(tiles) - 1)
+        total_h = max(t.height for t in tiles)
+        canvas = Image.new("RGB", (total_w, total_h), (255, 255, 255))
+        x = 0
+        for t in tiles:
+            canvas.paste(t, (x, 0))
+            x += t.width + gap
+        out = _io.BytesIO()
+        canvas.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as e:
+        logger.debug(f"GIF 抽帧失败: {e}")
+        return None
 
 # ═══════════════════════════════════════════════════════════
 #  视频理解

@@ -48,8 +48,11 @@ async def security_headers_middleware(request: Request, call_next):
     for key, value in SECURITY_HEADERS.items():
         if value:
             response.headers[key] = value
-    # HTML 片段（动态注入的页面）不缓存，避免更新后浏览器仍用旧版本
-    if request.url.path.endswith(".html") or request.url.path in ("/", "/index.html"):
+    # HTML 片段和 JS/CSS 不缓存（ETag 仍在，只是强制每次回源校验），
+    # 避免更新后浏览器仍用启发式缓存里的旧脚本——曾导致违规页修复部署后
+    # 用户端仍跑旧 violations.js 反复报 null 错误
+    if (request.url.path.endswith((".html", ".js", ".css"))
+            or request.url.path in ("/", "/index.html")):
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
     for h in ("X-Powered-By", "Server"):
         try: del response.headers[h]

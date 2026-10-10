@@ -46,46 +46,46 @@
     </div>
     <nav class="nav" id="nav">
       <div class="nav-sec">总览</div>
-      <a data-tab="dash"><span class="ico">📊</span>仪表盘</a>
-      <a data-tab="humanize"><span class="ico">💬</span>拟人化</a>
-      <a data-tab="brain"><span class="ico">🧠</span>AI 状态</a>
+      <a data-tab="dash"><span class="ico" data-icon="dashboard"></span>仪表盘</a>
+      <a data-tab="humanize"><span class="ico" data-icon="message"></span>说话风格</a>
+      <a data-tab="brain"><span class="ico" data-icon="robot"></span>AI 状态</a>
 
       <div class="nav-sec">群管理</div>
-      <a data-tab="groups"><span class="ico">👥</span>群成员</a>
-      <a data-tab="modes"><span class="ico">⚖️</span>群模式</a>
-      <a data-tab="welcome"><span class="ico">👋</span>欢迎</a>
-      <a data-tab="schedules"><span class="ico">⏰</span>定时</a>
+      <a data-tab="groups"><span class="ico" data-icon="team"></span>群成员</a>
+      <a data-tab="modes"><span class="ico" data-icon="control"></span>群模式</a>
+      <a data-tab="welcome"><span class="ico" data-icon="smile"></span>欢迎语</a>
+      <a data-tab="schedules"><span class="ico" data-icon="clock-circle"></span>定时消息</a>
 
       <div class="nav-sec">安全</div>
-      <a data-tab="violations"><span class="ico">🚫</span>违规记录</a>
-      <a data-tab="blacklist"><span class="ico">⛔</span>黑名单</a>
-      <a data-tab="automod"><span class="ico">🤖</span>自动审核</a>
-      <a data-tab="llm"><span class="ico">🛡️</span>LLM 审核</a>
-      <a data-tab="approval"><span class="ico">📋</span>待审批</a>
-      <a data-tab="verify"><span class="ico">🔑</span>加群验证</a>
+      <a data-tab="violations"><span class="ico" data-icon="stop"></span>违规记录</a>
+      <a data-tab="blacklist"><span class="ico" data-icon="user-delete"></span>黑名单</a>
+      <a data-tab="automod"><span class="ico" data-icon="safety"></span>规则审核</a>
+      <a data-tab="llm"><span class="ico" data-icon="thunderbolt"></span>AI 审核</a>
+      <a data-tab="approval"><span class="ico" data-icon="audit"></span>待审批</a>
+      <a data-tab="verify"><span class="ico" data-icon="safety-certificate"></span>加群验证</a>
 
       <div class="nav-sec">AI</div>
-      <a data-tab="personality"><span class="ico">🎭</span>人设</a>
-      <a data-tab="group-personality"><span class="ico">👤</span>群人设</a>
-      <a data-tab="model"><span class="ico">⚙️</span>模型</a>
-      <a data-tab="memory"><span class="ico">💭</span>记忆</a>
-      <a data-tab="stickers"><span class="ico">🎨</span>表情</a>
-      <a data-tab="influence"><span class="ico">🌟</span>影响力</a>
+      <a data-tab="personality"><span class="ico" data-icon="idcard"></span>人设</a>
+      <a data-tab="group-personality"><span class="ico" data-icon="contacts"></span>群人设</a>
+      <a data-tab="model"><span class="ico" data-icon="api"></span>AI 模型</a>
+      <a data-tab="memory"><span class="ico" data-icon="database"></span>记忆</a>
+      <a data-tab="stickers"><span class="ico" data-icon="picture"></span>表情</a>
+      <a data-tab="influence"><span class="ico" data-icon="trophy"></span>影响力</a>
 
-      <div class="nav-sec">训练</div>
-      <a data-tab="keywords"><span class="ico">🔑</span>关键词</a>
-      <a data-tab="training"><span class="ico">🧪</span>训练</a>
-      <a data-tab="learn"><span class="ico">📖</span>学习</a>
+      <div class="nav-sec">审核优化</div>
+      <a data-tab="keywords"><span class="ico" data-icon="tags"></span>违规词库</a>
+      <a data-tab="training"><span class="ico" data-icon="experiment"></span>审核样本</a>
+      <a data-tab="learn"><span class="ico" data-icon="bulb"></span>审核经验</a>
 
       <div class="nav-sec">工具</div>
-      <a data-tab="send"><span class="ico">📨</span>发消息</a>
-      <a data-tab="checkin"><span class="ico">📅</span>签到榜</a>
-      <a data-tab="points"><span class="ico">💰</span>积分榜</a>
-      <a data-tab="bot-settings"><span class="ico">🔧</span>设置</a>
+      <a data-tab="send"><span class="ico" data-icon="send"></span>发消息</a>
+      <a data-tab="checkin"><span class="ico" data-icon="calendar"></span>签到榜</a>
+      <a data-tab="points"><span class="ico" data-icon="wallet"></span>积分榜</a>
+      <a data-tab="bot-settings"><span class="ico" data-icon="setting"></span>设置</a>
 
       <div class="nav-sec">系统</div>
-      <a data-tab="env"><span class="ico">📝</span>环境</a>
-      <a data-tab="logs"><span class="ico">📋</span>日志</a>
+      <a data-tab="env"><span class="ico" data-icon="code"></span>高级配置</a>
+      <a data-tab="logs"><span class="ico" data-icon="file-text"></span>运行日志</a>
     </nav>
     <div class="side-foot">
       <span class="dot" id="bot-dot"></span>
@@ -122,7 +122,8 @@
 <div id="modals-container"></div>
 
 <!-- 拆分后的 JS —— 加载顺序很重要 -->
-<script src="/static/js/core.js"></script>
+<script src="/static/js/icons.js"></script>
+  <script src="/static/js/core.js"></script>
 <script src="/static/js/api.js"></script>
 <script src="/static/js/ws.js"></script>
 <script src="/static/js/nav.js"></script>
@@ -147,6 +148,7 @@
 <script src="/static/js/memory.js"></script>
 <script src="/static/js/stickers.js"></script>
 <script src="/static/js/remaining.js"></script>
+<script>document.addEventListener('DOMContentLoaded', () => renderIcons());</script>
 
 <!-- 启动 -->
 <script>

@@ -5,6 +5,7 @@ OneBot v11 协议客户端
 - 支持 CQ 码自动转换为消息段
 """
 import asyncio
+import html
 import json
 import logging
 import re
@@ -25,28 +26,109 @@ from .config import config
 logger = logging.getLogger("qqbot")
 
 # ─── CQ 码 → 消息段转换 ───
-_CQ_RE = re.compile(r"\[CQ:(\w+),([^\]]*?)\]")
+# 参数区可空：[CQ:dice] / [CQ:rps] 这类无参消息段（NapCat 发送侧忽略参数、
+# 结果随机）也能识别，否则会被当纯文本原样发进群
+_CQ_RE = re.compile(r"\[CQ:(\w+)(?:,([^\]]*?))?\]")
 # 用于分段的 regex
-_CQ_SPLIT_RE = re.compile(r"(\[CQ:\w+,[^\]]*?\])")
+_CQ_SPLIT_RE = re.compile(r"(\[CQ:\w+(?:,[^\]]*?)?\])")
 
 
 def _parse_cq_params(params_str: str) -> dict:
-    """解析 CQ 码参数: key=value,key2=value2 → {key: value, key2: value2}"""
+    """解析 CQ 码参数: key=value,key2=value2 → {key: value, key2: value2}
+
+    按「逗号（容忍其后空格）+ 紧邻新参数 key=」的位置切分，而不是全局搜
+    key= 的位置——图片 URL 里也含 appid=/fileid= 这类 key= 形态，旧的
+    全局找 key= 做法会把 url 从 appid= 处截断。值统一做 CQ 反转义
+    （&amp;→&、&#91;→[ 等，html.unescape 恰好覆盖），下游拿到的就是明文。
+    """
     data = {}
-    # 智能分割: 找所有 key= 的位置避免值中的 = 和 , 干扰
-    key_re = re.compile(r",?\s*(\w+)\s*=")
-    last_end = 0
-    last_key = None
-    for km in key_re.finditer(params_str):
-        if last_key:
-            val = params_str[last_end:km.start()].strip().rstrip(",")
-            data[last_key] = val
-        last_key = km.group(1)
-        last_end = km.end()
-    if last_key:
-        val = params_str[last_end:].strip().rstrip(",")
-        data[last_key] = val
+    for part in re.split(r",\s*(?=\w+=)", params_str):
+        if "=" not in part:
+            continue
+        key, _, value = part.partition("=")
+        data[key.strip()] = html.unescape(value.strip())
     return data
+
+
+def _cq_contains_url(cq: str, url: str) -> bool:
+    """判断 CQ 码字符串里是否含给定 url。
+
+    存量的 cq_code 里 url 可能是 &amp; 转义形态，直接子串匹配永远不命中
+    （过期表情删不掉），所以先把整段 unescape 成明文再比对。
+    """
+    return bool(url) and url in html.unescape(cq or "")
+
+
+# ─── 合并转发响应归一化 ───
+# go-cqhttp 顶层 nickname 与 NapCat sender.nickname 两种子消息形状都兼容；
+# NapCat 会把嵌套转发的内容内联在 forward 段 data.content 里（按 id 重查
+# 内层是官方不支持的场景），有内联内容就直接拍平成文本段。
+_FORWARD_INLINE_MAX_DEPTH = 3
+
+
+def _sub_nickname(sub: dict) -> str:
+    """取转发子消息的昵称：顶层 nickname 优先，缺省回退 sender.nickname"""
+    nick = sub.get("nickname", "")
+    if not nick and isinstance(sub.get("sender"), dict):
+        nick = sub["sender"].get("nickname", "") or ""
+    return nick
+
+
+def _flatten_inline_forward(content: list, depth: int = 1) -> str:
+    """把 NapCat 内联的嵌套转发 content 拍平成「[内嵌转发]\n[昵称] 文本…」。
+
+    深度超过 _FORWARD_INLINE_MAX_DEPTH 停止展开（返回空串，调用方保留原段）。
+    """
+    if depth > _FORWARD_INLINE_MAX_DEPTH:
+        return ""
+    lines: list[str] = []
+    for sub in content or []:
+        if not isinstance(sub, dict):
+            continue
+        nick = _sub_nickname(sub)
+        parts: list[str] = []
+        for seg in sub.get("message") or []:
+            if not isinstance(seg, dict):
+                continue
+            if seg.get("type") == "text":
+                parts.append((seg.get("data") or {}).get("text", ""))
+            elif seg.get("type") == "forward" and isinstance((seg.get("data") or {}).get("content"), list):
+                inner = _flatten_inline_forward(seg["data"]["content"], depth + 1)
+                if inner:
+                    parts.append(inner)
+        text = "".join(parts).strip()
+        if text:
+            prefix = f"[{nick}] " if nick else ""
+            lines.append(f"{prefix}{text}")
+    if not lines:
+        return ""
+    return "[内嵌转发]\n" + "\n".join(lines)
+
+
+def _normalize_forward_message(msg) -> None:
+    """归一化单条转发子消息（原地修改）：
+    1. 顶层 nickname 缺失时从 sender.nickname 补（NapCat 形状）
+    2. message 里已内联的嵌套 forward 段（data.content 为 list）拍平成文本段
+    """
+    if not isinstance(msg, dict):
+        return
+    if not msg.get("nickname"):
+        nick = _sub_nickname(msg)
+        if nick:
+            msg["nickname"] = nick
+    sub_segs = msg.get("message")
+    if not isinstance(sub_segs, list):
+        return
+    new_segs = []
+    for seg in sub_segs:
+        if (isinstance(seg, dict) and seg.get("type") == "forward"
+                and isinstance((seg.get("data") or {}).get("content"), list)):
+            flat = _flatten_inline_forward(seg["data"]["content"])
+            if flat:
+                new_segs.append({"type": "text", "data": {"text": flat}})
+                continue
+        new_segs.append(seg)
+    msg["message"] = new_segs
 
 
 def cq_text_to_segments(text: str) -> list[dict]:
@@ -54,7 +136,12 @@ def cq_text_to_segments(text: str) -> list[dict]:
     将包含 CQ 码的文本转换为 NapCat 消息段数组。
     "哈哈[CQ:face,id=96]" →
       [{"type":"text","data":{"text":"哈哈"}}, {"type":"face","data":{"id":96}}]
+
+    同时展开 :178: / ：178： 表情快捷码——所有消息段路径（合并转发节点、
+    send_forward 工具等）都经过这里，此前快捷码只在 send_group_msg 的
+    字符串路径被展开，走段路径时 ":178:" 会原样漏进群里。
     """
+    text = expand_face_shortcuts(text)
     parts = _CQ_SPLIT_RE.split(text)
     segments = []
     for part in parts:
@@ -64,7 +151,8 @@ def cq_text_to_segments(text: str) -> list[dict]:
             m = _CQ_RE.match(part)
             if m:
                 cq_type = m.group(1)
-                params = _parse_cq_params(m.group(2))
+                # 无参码（[CQ:dice]）group(2) 为 None
+                params = _parse_cq_params(m.group(2) or "")
                 # NapCat 需要整数类型的 id/qq/duration 等
                 _fix_param_types(cq_type, params)
                 segments.append({"type": cq_type, "data": params})
@@ -96,16 +184,19 @@ def _fix_param_types(cq_type: str, params: dict):
 
 def has_cq_codes(text: str) -> bool:
     """检查文本是否包含 CQ 码或快捷表情"""
-    return bool(_CQ_RE.search(text)) or bool(re.search(r':(\d{1,4}):', text))
+    return bool(_CQ_RE.search(text)) or bool(_FACE_SHORTCUT_RE.search(text))
 
 
 # ─── 快捷表情替换 ───
 # {1,4} 覆盖 4 位大表情 id（如 392 龙年快乐、432 灵蛇献瑞）。
-# 旧的 {1,3} 只到 3 位，导致 :392: 这类大表情快捷码发不出去。
-_FACE_SHORTCUT_RE = re.compile(r':(\d{1,4}):')
+# 全角/半角冒号都认（DeepSeek 等模型爱输出 ：178： 全角变体，
+# 只匹配半角时会原样漏到群里变成字面 ":178:"）。
+# 前后加数字否定环视：时间「12:30:45」里的 :30: 两侧都是数字，
+# 不能展开成表情；数字语境下几乎必是时间/数值，宁可少展开不可误发。
+_FACE_SHORTCUT_RE = re.compile(r'(?<![0-9])[：:]([0-9]{1,4})[：:](?![0-9])')
 
 def expand_face_shortcuts(text: str) -> str:
-    """将 :14: 快捷格式转为 [CQ:face,id=14]"""
+    """将 :14: / ：14： 快捷格式转为 [CQ:face,id=14]"""
     return _FACE_SHORTCUT_RE.sub(r'[CQ:face,id=\1]', text)
 
 
@@ -147,6 +238,19 @@ class OneBotClient:
         self.self_id: str = ""
         # echo -> Future 映射（WS API 调用回执）
         self._pending: dict[str, asyncio.Future] = {}
+        # 最近一次 API 调用失败的原始原因（NapCat 返回的 msg），供工具层
+        # 把真实错误回传给 AI——否则 AI 只看到"失败"，会把对方沉默当成"不理我"
+        self.last_api_fail: dict | None = None
+
+    def last_fail_msg(self) -> str:
+        """返回最近一次 API 失败的简要原因（无失败返回空串）。"""
+        f = self.last_api_fail
+        if not f:
+            return ""
+        msg = str(f.get("msg", "") or "").replace("\n", " ")[:80]
+        retcode = f.get("retcode", "?")
+        action = str(f.get("action", "?"))
+        return f"{action} retcode={retcode} {msg}".strip()
 
     # ==================== API 调用 ====================
 
@@ -166,12 +270,15 @@ class OneBotClient:
                     if resp.status == 200:
                         data = await resp.json()
                         logger.debug(f"HTTP API [{action}] 成功")
+                        self.last_api_fail = None
                         return data
                     text = await resp.text()
                     logger.warning(f"HTTP API [{action}] 失败: {resp.status} {text[:200]}")
+                    self.last_api_fail = {"action": action, "retcode": resp.status, "msg": text[:200]}
                     return {"status": "failed", "retcode": resp.status, "msg": text[:200]}
         except Exception as e:
             logger.warning(f"HTTP API [{action}] 异常: {e}")
+            self.last_api_fail = {"action": action, "retcode": -1, "msg": str(e)}
             return {"status": "failed", "retcode": -1, "msg": str(e)}
 
     async def _call(self, action: str, params: dict) -> dict:
@@ -189,17 +296,24 @@ class OneBotClient:
             }, ensure_ascii=False))
             result = await asyncio.wait_for(future, timeout=15)
             if result.get("status") == "ok":
+                self.last_api_fail = None
                 return result
             # WS 返回失败 → 尝试 HTTP fallback
             logger.debug(f"WS API [{action}] 返回失败(retcode={result.get('retcode')}), 尝试HTTP")
             http_result = await self._call_http(action, params)
             if http_result.get("status") == "ok":
                 return http_result
-            return result  # HTTP 也失败，返回 WS 结果（含错误信息）
+            # HTTP 也失败：返回 WS 结果（含错误信息），并记录真实失败原因
+            result.setdefault("action", action)
+            self.last_api_fail = {"action": action, "retcode": result.get("retcode", "?"),
+                                  "msg": result.get("msg", "") or result.get("wording", "")}
+            return result
         except asyncio.TimeoutError:
             logger.warning(f"API 超时 [{action}]")
+            self.last_api_fail = {"action": action, "retcode": -1, "msg": "timeout"}
             return {"status": "failed", "retcode": -1, "msg": "timeout"}
         except Exception as e:
+            self.last_api_fail = {"action": action, "retcode": -1, "msg": str(e)}
             return {"status": "failed", "retcode": -1, "msg": str(e)}
         finally:
             self._pending.pop(echo, None)
@@ -256,7 +370,8 @@ class OneBotClient:
                     to_del = []
                     for sid, s in data.items():
                         cq = s.get("cq_code", "")
-                        if img_url and img_url in cq:
+                        # cq 里 url 可能是 &amp; 转义形态，经 _cq_contains_url 反转义后比对
+                        if _cq_contains_url(cq, img_url):
                             to_del.append(int(sid))
                     for sid in to_del:
                         _sticker.remove_sticker(sid)
@@ -462,10 +577,26 @@ class OneBotClient:
         r = await self._call("send_msg", params)
         return r["data"]["message_id"] if r.get("status") == "ok" else None
 
-    async def get_forward_msg(self, message_id: int) -> Optional[dict]:
-        """获取合并转发消息"""
-        r = await self._call("get_forward_msg", {"id": message_id})
-        return r["data"] if r.get("status") == "ok" else None
+    async def get_forward_msg(self, message_id=None, *, id=None) -> Optional[dict]:
+        """获取合并转发消息。
+
+        - 兼容两种调用：位置/关键字 message_id（旧签名）与关键字 id
+          （content_reader 以 get_forward_msg(id=resId) 调用，resId 是字符串）
+        - fid 缺失时直接返回 None，不向 NapCat 发 {"id": None}
+        - 返回前做响应归一化：昵称补齐（go-cqhttp/NapCat 两种形状）+
+          内联嵌套转发拍平，详见 _normalize_forward_message
+        """
+        fid = message_id if message_id is not None else id
+        if not fid:
+            return None
+        r = await self._call("get_forward_msg", {"id": fid})
+        data = r.get("data") if r.get("status") == "ok" else None
+        if isinstance(data, dict):
+            messages = data.get("messages")
+            if isinstance(messages, list):
+                for msg in messages:
+                    _normalize_forward_message(msg)
+        return data
 
     async def send_forward_msg(self, messages: list) -> Optional[int]:
         """发送合并转发消息（messages 为 node 数组）"""
@@ -633,6 +764,47 @@ class OneBotClient:
             "no_finger_open": no_finger_open,
         })
         return r.get("status") == "ok"
+
+    async def set_group_member_invite_policy(self, group_id: int, policy: str) -> bool:
+        """设置群成员邀请策略（NapCat 新版 action）。
+        policy: disabled=禁止邀请 / require_approval=邀请需管理员审核 /
+                no_approval=邀请无需审核 / no_approval_under_100=群成员少于100人时无需审核
+        """
+        r = await self._call("set_group_member_invite_policy", {
+            "group_id": str(group_id), "policy": policy,
+        })
+        ok = r.get("status") == "ok"
+        if not ok:
+            logger.warning(f"set_group_member_invite_policy 失败: group={group_id} policy={policy} resp={r}")
+        return ok
+
+    async def set_group_member_permissions(self, group_id: int,
+                                           allow_upload_album: bool | None = None,
+                                           allow_temporary_session: bool | None = None,
+                                           allow_create_group: bool | None = None) -> bool:
+        """设置群成员功能权限（NapCat 新版 action，至少传一项，未传项保持不变）。"""
+        params: dict = {"group_id": str(group_id)}
+        if allow_upload_album is not None:
+            params["allow_member_upload_album"] = bool(allow_upload_album)
+        if allow_temporary_session is not None:
+            params["allow_member_temporary_session"] = bool(allow_temporary_session)
+        if allow_create_group is not None:
+            params["allow_member_create_group"] = bool(allow_create_group)
+        r = await self._call("set_group_member_permissions", params)
+        ok = r.get("status") == "ok"
+        if not ok:
+            logger.warning(f"set_group_member_permissions 失败: group={group_id} resp={r}")
+        return ok
+
+    async def set_group_new_member_history_visibility(self, group_id: int, visible: bool) -> bool:
+        """设置新入群成员默认能否查看最近聊天记录（NapCat 新版 action）。"""
+        r = await self._call("set_group_new_member_history_visibility", {
+            "group_id": str(group_id), "visible": bool(visible),
+        })
+        ok = r.get("status") == "ok"
+        if not ok:
+            logger.warning(f"set_group_new_member_history_visibility 失败: group={group_id} visible={visible} resp={r}")
+        return ok
 
     # ═══════════════════════════════════════════════════════════
     #  群信息扩展
@@ -917,6 +1089,18 @@ class OneBotClient:
     #  分享 / Ark消息
     # ═══════════════════════════════════════════════════════════
 
+    async def send_group_music(self, group_id: int, data: dict) -> bool:
+        """发送音乐卡片消息段。data 为 music 段 data：
+        平台点歌 {"type": "qq|163|kugou|migu|kuwo", "id": 歌曲ID}
+        自定义卡 {"type": "custom", "url": 跳转链接, "image": 封面(NapCat必填),
+                  "title"/"audio"/"content" 可选}
+        """
+        r = await self._call("send_group_msg", {
+            "group_id": group_id,
+            "message": [{"type": "music", "data": data}],
+        })
+        return r.get("status") == "ok"
+
     async def send_group_ark_share(self, group_id: int, ark_data: dict) -> bool:
         r = await self._call("send_group_ark_share", {"group_id": group_id, "ark_data": ark_data})
         return r.get("status") == "ok"
@@ -1053,14 +1237,21 @@ class OneBotClient:
         r = await self._call("get_ai_record", {"group_id": group_id, "character_id": character_id, "text": text})
         return r["data"] if r.get("status") == "ok" else None
 
-    async def get_ai_characters(self) -> list:
-        """获取AI角色列表"""
-        r = await self._call("get_ai_characters", {})
+    async def get_ai_characters(self, group_id: int) -> list:
+        """获取AI角色列表。NapCat 要求 group_id 必填，返回按类别嵌套：
+        [{type, characters: [{character_id, character_name, preview_url}]}]"""
+        r = await self._call("get_ai_characters", {"group_id": str(group_id), "chat_type": 1})
         return r.get("data", []) if r.get("status") == "ok" else []
 
     async def send_group_ai_record(self, group_id: int, character_id: str, text: str) -> bool:
-        r = await self._call("send_group_ai_record", {"group_id": group_id, "character_id": character_id, "text": text})
-        return r.get("status") == "ok"
+        """发送群AI语音。NapCat action 的角色参数名是 character（非 character_id）"""
+        r = await self._call("send_group_ai_record", {
+            "group_id": str(group_id), "character": character_id, "text": text,
+        })
+        ok = r.get("status") == "ok"
+        if not ok:
+            logger.warning(f"send_group_ai_record 失败: group={group_id} character={character_id} resp={r}")
+        return ok
 
     # ═══════════════════════════════════════════════════════════
     #  戳一戳 & 点赞扩展

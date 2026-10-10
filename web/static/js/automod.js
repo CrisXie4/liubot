@@ -8,10 +8,10 @@ async function amLoad() {
     const el = $('am-stats');
     if (el) {
       el.innerHTML =
-        statCard('📊', s.violation_count || 0, '违规样本', '') +
-        statCard('✅', s.normal_samples || 0, '正常样本', '') +
-        statCard('🧠', s.ml_model_ready ? '✓' : '—', 'ML 模型', s.ml_model_ready ? 'ok' : 'muted') +
-        statCard('🎯', ((s.auto_mod_threshold || 0) * 100).toFixed(0) + '%', '阈值', '');
+        statCard('bar-chart', s.violation_count || 0, '违规样本', '') +
+        statCard('check-circle', s.normal_samples || 0, '正常样本', '') +
+        statCard('bulb', s.ml_model_ready ? '✓' : '—', '识别引擎', s.ml_model_ready ? 'ok' : 'muted') +
+        statCard('aim', ((s.auto_mod_threshold || 0) * 100).toFixed(0) + '%', '阈值', '');
     }
     const tog = $('am-tog'); if (tog) tog.textContent = s.auto_mod_enabled ? '🟢 已开启' : '⚪ 已关闭';
   } catch (e) { toast('加载失败', 'err'); }
@@ -23,7 +23,7 @@ async function amLoad() {
       <td>${esc((l.keywords_matched || []).slice(0, 4).join(', '))}</td>
       <td>${tag(l.action, l.action === 'recalled' ? 'no' : l.action === 'logged' ? 'warn' : 'info')}</td>
     </tr>`,
-    '📋', '还没有审核记录');
+    'audit', '还没有审核记录');
 }
 
 async function amToggle() {
@@ -42,6 +42,6 @@ async function amTest() {
   r.textContent = '评分中…';
   try {
     const d = await api('/automod/test?message=' + encodeURIComponent(msg));
-    r.textContent = `关键词: ${(d.keyword_score.confidence * 100).toFixed(1)}%  命中: ${(d.keyword_score.keywords_matched || []).join(',') || '无'}\nML: ${d.ml_score ? `${(d.ml_score.confidence * 100).toFixed(1)}% / 违规 ${(d.ml_score.violation_prob * 100).toFixed(1)}%` : '未训练'}`;
+    r.textContent = `违规词库得分: ${(d.keyword_score.confidence * 100).toFixed(1)}%  命中词: ${(d.keyword_score.keywords_matched || []).join(',') || '无'}\n识别引擎: ${d.ml_score ? `${(d.ml_score.confidence * 100).toFixed(1)}% / 违规概率 ${(d.ml_score.violation_prob * 100).toFixed(1)}%` : '暂无经验，先去「审核样本」应用几条'}`;
   } catch (e) { r.textContent = '错误: ' + e.message; }
 }

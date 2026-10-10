@@ -10,6 +10,7 @@ AI 自我意识引擎 — 让 Bot 像真人一样有情绪、有想法、有生�
   - 自然行为（睡觉、发呆、刷存在感...）
 """
 import asyncio
+import difflib
 import json
 import logging
 import os
@@ -412,18 +413,46 @@ def should_idle_think(state: dict) -> bool:
     return True
 
 
+def _intent_too_similar(what: str, state: dict) -> bool:
+    """新打算跟队列里已有的、或 48h 内问过的太像 → 丢弃。
+
+    防的就是"六哥在搞的东西"这种空泛打算一天 mint 五遍、问五遍。
+    """
+    olds = [it.get("what", "") for it in (state.get("intents") or [])]
+    olds += [r.get("what", "") for r in (state.get("intents_recent") or [])]
+    now = time.time()
+    # 顺手清掉 48h 前的问过记录
+    state["intents_recent"] = [
+        r for r in (state.get("intents_recent") or [])
+        if now - r.get("ts", 0) < 48 * 3600
+    ]
+    for old in olds:
+        if not old:
+            continue
+        if difflib.SequenceMatcher(None, what, old).ratio() > 0.45:
+            return True
+        short, long_ = sorted((what, old), key=len)
+        if len(short) >= 4 and short in long_:
+            return True
+    return False
+
+
 async def generate_idle_thought(state: dict) -> tuple[str | None, str | None]:
     """
     调用 LLM 让 AI 根据自己的真实状态产生一条内心戏，并自主决定要不要说出来。
 
-    合并 Volition 协议：一次调用同时产出"内心想法 + 要不要说出来"。
+    合并 Volition 协议 + AgentGal「在意的事/打算」机制：一次调用同时产出
+    内心想法、要不要说出来、心里悬着的事、以及值得以后跟进的打算。
     输出协议：
         THOUGHT: <内心想法，写日记用，≤30字>
         SPEAK: <要在群里说的话，20字以内；不想说就写 NONE>
+        CONCERN: <你心里悬着的一件事，≤25字；没有就写 NONE>
+        INTENT: <记挂的事：对谁+什么事 | 几小时后跟进(数字，默认8)；没有就写 NONE>
 
     Returns: (thought, speak_text)
         thought: 内心想法文本（已写入日记），失败返回 None
         speak_text: 想在群里说的话（未写入日记，由调用方发送后再记），不想说返回 None
+        （concern / intents 直接写进 state）
     """
     try:
         from . import memory as _mem
@@ -467,12 +496,31 @@ async def generate_idle_thought(state: dict) -> tuple[str | None, str | None]:
             )
 
         prompt = (
-            f"现在是{datetime.now().strftime('%Y年%m月%d日 %H:%M')}，{tod}。\n"
-            f"群里已经安静了一阵子。你一个人待着，脑子里开始走神……\n\n"
+            "你是一个QQ群的群友。群里安静下来的时候，你一个人待着，脑子会开始走神。\n\n"
+            "【任务】像真人发呆时突然想到什么那样，自然写下一个念头——可以是对某件事的"
+            "感受、一个突然的想法、回忆起什么、或者单纯发呆。同时你自己决定要不要把它"
+            "（或其中一部分）发到群里：没人逼你，想发就发，不想发就不发。\n\n"
+            "另外想两件事（真人心里总有根悬着的线、和几件记挂着要问的事）：\n"
+            "- CONCERN：你最近心里悬着的一件事（比如上次聊到一半的话题、"
+            "某个让你在意的群友说的话、自己的一件烦心事）\n"
+            "- INTENT：值得以后找机会跟进的事。硬规矩：必须是有出处的——"
+            "今天群里有人亲口说过的具体的事（提过今天要考试、说要修服务器、"
+            "答应给你看什么东西），写清对谁+什么事，带上对方话里的关键词；"
+            "凭印象编的没出处的事一律不要——'某某在搞的东西''最近在忙的事'"
+            "这种说不清具体内容的，写了也没法自然地问出口；"
+            "今天没有这样的素材就写 NONE\n\n"
+            "【输出格式】严格按以下四行回复（不要加别的）：\n"
+            "THOUGHT: <内心想法，≤30字，写日记给自己看的，不是发给群友的>\n"
+            "SPEAK: <要在群里说的话，20字以内，要跟当前时间/心情对得上；不想说就写 NONE>\n"
+            "CONCERN: <≤25字；没有就写 NONE>\n"
+            "INTENT: <对谁+什么事 | 几小时后跟进；没有就写 NONE>\n\n"
+            f"—— 以下为你当前的状态数据 ——\n"
+            f"现在是{datetime.now().strftime('%Y年%m月%d日 %H:%M')}，{tod}。"
+            f"群里已经安静了一阵子。\n"
             f"你当前的心情: {mood}\n"
             f"情绪数值: 快乐{e['joy']:.0%} 精力{e['energy']:.0%} 社交欲{e['social']:.0%} "
             f"无聊{e['boredom']:.0%} 孤独{e['loneliness']:.0%} 烦躁{e['irritation']:.0%} "
-            f"好奇心{e['curiosity']:.0%}\n\n"
+            f"好奇心{e['curiosity']:.0%}\n"
         )
         if topics:
             prompt += f"今天聊过的话题: {', '.join(topics)}\n"
@@ -482,23 +530,13 @@ async def generate_idle_thought(state: dict) -> tuple[str | None, str | None]:
             prompt += f"跟群友的关系:\n{rel_text}\n"
         prompt += (
             f"\n你最近的日记（最近的想法和经历）:\n{diary_text}\n"
-            f"{ignored_fact}\n\n"
-            f"——\n"
-            f"你现在脑子里闪过一个念头。像真人发呆时突然想到什么似的，"
-            f"自然地写下来。可以是对某件事的感受、一个突然的想法、"
-            f"回忆起什么、或者单纯发呆。\n\n"
-            f"同时你自己决定：要不要把想到的（或其中一部分）发到群里？"
-            f"没人逼你，想发就发，不想发就不发。\n\n"
-            f"严格按以下两行格式回复（不要加别的）：\n"
-            f"THOUGHT: <内心想法，≤30字，写日记给自己看的，不是发给群友的>\n"
-            f"SPEAK: <要在群里说的话，20字以内，要跟当前时间/心情对得上；"
-            f"不想说就写 NONE>"
+            f"{ignored_fact}"
         )
 
         response = await llm_call.llm_create(
             priority="P2",
             model=ms.get("model", "gemini-3.5-flash-free"),
-            max_tokens=100,
+            max_tokens=160,
             temperature=0.95,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -506,6 +544,9 @@ async def generate_idle_thought(state: dict) -> tuple[str | None, str | None]:
         raw = response.content[0].text.strip()
         thought = None
         speak_text = None
+        concern_text = None
+        intent_what = None
+        intent_hours = 8
 
         for line in raw.split("\n"):
             ls = line.strip()
@@ -518,6 +559,24 @@ async def generate_idle_thought(state: dict) -> tuple[str | None, str | None]:
                 s = ls.split(":", 1)[1].strip().strip('"').strip("'").strip()
                 if s and s.upper() != "NONE" and 2 <= len(s) <= 30:
                     speak_text = s
+            elif upper.startswith("CONCERN:"):
+                c = ls.split(":", 1)[1].strip().strip('"').strip("'").strip()
+                if c and c.upper() != "NONE" and 2 <= len(c) <= 40:
+                    concern_text = c
+            elif upper.startswith("INTENT:"):
+                v = ls.split(":", 1)[1].strip().strip('"').strip("'").strip()
+                if v and v.upper() != "NONE":
+                    parts_ = v.split("|")
+                    w = parts_[0].strip()
+                    if w and 4 <= len(w) <= 60:
+                        intent_what = w
+                        if len(parts_) > 1:
+                            try:
+                                h = float(parts_[1].strip().rstrip("小时"))
+                                if 0.5 <= h <= 96:
+                                    intent_hours = h
+                            except ValueError:
+                                pass
 
         if thought:
             add_diary(state, thought, mood)
@@ -526,6 +585,26 @@ async def generate_idle_thought(state: dict) -> tuple[str | None, str | None]:
             logger.info(f"🎙️ 空闲思考→想发言: {speak_text}")
             record_proactive_message(state)
 
+        # AgentGal「在意的事」：写进 state，注入之后的语气；8h 内有效
+        if concern_text:
+            state["concern"] = {"text": concern_text, "ts": time.time()}
+            logger.info(f"🫀 心里悬着的事: {concern_text}")
+
+        # AgentGal「打算」：到点由主动聊天自然跟进；最多攒 5 条，满则挤掉最旧的
+        # 入队前查重：跟队列里已有的、以及最近问过的太像就丢弃
+        if intent_what:
+            if _intent_too_similar(intent_what, state):
+                logger.info(f"📌 打算查重丢弃: {intent_what}")
+            else:
+                intents = state.get("intents") or []
+                intents.append({
+                    "what": intent_what,
+                    "ts": time.time(),
+                    "due_ts": time.time() + intent_hours * 3600,
+                })
+                state["intents"] = intents[-5:]
+                logger.info(f"📌 打算: {intent_what}（约{intent_hours:.0f}小时后）")
+
         return thought, speak_text
 
     except Exception as e:
@@ -533,7 +612,64 @@ async def generate_idle_thought(state: dict) -> tuple[str | None, str | None]:
 
     return None, None
 
-    return None
+
+def pop_due_intent(state: dict) -> dict | None:
+    """取出一条到期的「打算」（记挂着要跟进的事）。
+
+    到期最早优先；没到期时顺手清掉超过 7 天的陈年打算，避免积压。
+    弹出即视为"要问了"，记进 intents_recent——48h 内同题不再入队。
+    没有到期打算返回 None。
+    """
+    intents = state.get("intents") or []
+    if not intents:
+        return None
+    now = time.time()
+    due = [it for it in intents if it.get("due_ts", 0) <= now]
+    if not due:
+        state["intents"] = [it for it in intents if it.get("due_ts", 0) < now + 7 * 86400]
+        return None
+    due.sort(key=lambda it: it.get("due_ts", 0))
+    chosen = due[0]
+    try:
+        intents.remove(chosen)
+    except ValueError:
+        pass
+    state["intents"] = intents
+
+    recent = state.get("intents_recent") or []
+    recent.append({"what": chosen.get("what", ""), "ts": time.time()})
+    state["intents_recent"] = [
+        r for r in recent if time.time() - r.get("ts", 0) < 48 * 3600
+    ][-10:]
+    return chosen
+
+
+# 打算跟进的独立限速：没有它，队列里有存货时每条群消息都会触发一次查岗
+INTENT_ASK_MIN_GAP = 6 * 3600    # 同群两次跟进至少隔 6 小时
+INTENT_ASK_DAILY_MAX = 2         # 同群 24 小时内最多跟进 2 条
+
+
+def intent_ask_allowed(state: dict, group_id: int) -> bool:
+    """打算跟进是否对该群放行（弹出前检查，不放行则打算留在队列里）。"""
+    now = time.time()
+    log = [r for r in (state.get("intent_ask_log") or [])
+           if now - r.get("ts", 0) < 24 * 3600]
+    state["intent_ask_log"] = log
+    mine = [r for r in log if r.get("gid") == group_id]
+    if len(mine) >= INTENT_ASK_DAILY_MAX:
+        return False
+    if mine and now - max(r.get("ts", 0) for r in mine) < INTENT_ASK_MIN_GAP:
+        return False
+    return True
+
+
+def record_intent_ask(state: dict, group_id: int):
+    """跟进真的问出口了才记账。"""
+    log = state.get("intent_ask_log") or []
+    log.append({"gid": group_id, "ts": time.time()})
+    state["intent_ask_log"] = [
+        r for r in log if time.time() - r.get("ts", 0) < 24 * 3600
+    ][-20:]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -812,23 +948,48 @@ PROACTIVE_IGNORE_WINDOW = 15 * 60   # 15 分钟（秒）
 PROACTIVE_MESSAGES_MAX = 5          # 滑动窗口最多保留 5 条
 
 
-def record_proactive_message(state: dict):
-    """记录 bot 发了一条主动消息。
-    在 ai_brain.decide_and_speak 返回 SPEAK 并实际发送后调用。
+def record_proactive_message(state: dict, group_id: int = 0):
+    """记录 bot 在某个群发了一条主动消息（实际发送成功后调用）。
+
+    记录 {ts, group_id}：之后该群只要有人说话（note_group_response）就算被接话，
+    窗口期内整群没人说话才计一次"被忽视"。
     """
     today = state.setdefault("today", {})
     msgs = today.setdefault("proactive_messages", [])
-    msgs.append(time.time())
+    msgs.append({"ts": time.time(), "group_id": int(group_id or 0)})
     # 滑动窗口：只保留最近 N 条
     if len(msgs) > PROACTIVE_MESSAGES_MAX:
         today["proactive_messages"] = msgs[-PROACTIVE_MESSAGES_MAX:]
 
 
+def note_group_response(state: dict, group_id: int, msg_ts: float | None = None):
+    """某个群来了新消息（非 bot 自己发的）：消费该群所有更早的主动发言条目。
+
+    主动发言之后群里有人说话 = 有人接话（不要求 @ 或回复 bot），
+    消费掉的条目不再参与"被忽视"计数。在 handler 的群消息主路径调用。
+    """
+    today = state.get("today") or {}
+    msgs = today.get("proactive_messages") or []
+    if not msgs:
+        return
+    ts = msg_ts if msg_ts is not None else time.time()
+    kept = [
+        m for m in msgs
+        if not (isinstance(m, dict)
+                and int(m.get("group_id") or 0) == int(group_id or 0)
+                and m.get("ts", 0) <= ts)
+    ]
+    if len(kept) != len(msgs):
+        today["proactive_messages"] = kept
+
+
 def check_and_update_ignored(state: dict) -> int:
     """在 consciousness_loop 每个 tick 调用。
-    检查 proactive_messages 中是否有超过窗口期未得到回应的条目，
+    检查 proactive_messages 中是否有超过窗口期仍无人接话的条目，
     有则 consecutive_ignored += 1 并移除该条目（避免重复计数）。
 
+    "有人接话"由 handler 的 note_group_response 消费掉对应群的条目，
+    这里只对窗口期内没被消费（= 发言后该群没人说过话）的条目计数。
     返回当前 consecutive_ignored 值。
     """
     today = state.setdefault("today", {})
@@ -839,12 +1000,14 @@ def check_and_update_ignored(state: dict) -> int:
     now = time.time()
     kept = []
     ignored_now = 0
-    for ts in msgs:
+    for item in msgs:
+        # 兼容旧格式（纯时间戳，无群号）：无人能消费它，窗口期到即计数
+        ts = item["ts"] if isinstance(item, dict) else item
         if now - ts >= PROACTIVE_IGNORE_WINDOW:
-            # 这条主动发言等了足够久还没人理 → 算一次被忽视
+            # 这条主动发言等了足够久该群还没人说话 → 算一次被忽视
             ignored_now += 1
         else:
-            kept.append(ts)
+            kept.append(item)
 
     if ignored_now > 0:
         today["consecutive_ignored"] = today.get("consecutive_ignored", 0) + ignored_now
@@ -1137,23 +1300,53 @@ def get_consciousness_prompt(state: dict) -> str:
     e = state["emotions"]
     parts.append(get_circadian_prompt())
 
-    # 当前感受
-    mood_descriptions = {
-        "excited": "你现在心情特别好！说话热情洋溢，多用感叹号",
-        "happy": "你心情不错，说话轻松愉快",
-        "neutral_happy": "你心情还行，平平淡淡",
-        "neutral": "你心情平常，正常聊天",
-        "bored": "你现在有点无聊，如果有人找你聊天你会很开心",
-        "lonely": "你觉得有点孤单，渴望互动。群里有人说话你可能会主动搭话",
-        "tired": "你有点累了，回复比较简短，可能不太想聊太久",
-        "grumpy": "你有点烦躁，说话可能带刺，不太耐烦",
-        "irritated": "你心里有点不爽，可能会怼人",
-        "sad": "你有点难过（可能刚看到群里聊了什么沉重的消息），说话会软一点、没那么跳",
-        "curious": "你好奇心旺盛，对什么都感兴趣",
-        "content": "你感到满足而平静，很享受现在的状态",
-        "sleeping": "你在睡觉，如果被叫醒会很迷糊",
+    # ── 心情 → 说话方式（AgentGal 纪律：写行为，不写感受形容）──
+    # 旧版只写"说话可能带刺"这种形容，模型看完照样礼貌回复。
+    # 行为指令必须具体到：长度、可用/禁用的词、合法的敷衍方式、
+    # 什么情况允许流露情绪——模型才知道怎么"演"。
+    mood_speech_rules = {
+        "excited":
+            "你兴奋到藏不住。可以说两三句而不是一句，语气词和表情放开用，"
+            "会主动把话头抛回去（比如反问一句）。但仍像群聊消息，不写长段落。",
+        "happy":
+            "你心情不错。回复轻松积极，接梗接得快，偶尔主动带一小句相关的话，"
+            "语气词可以用一个。",
+        "neutral_happy":
+            "你心情还行。正常聊天，语气平和偏轻松。",
+        "neutral":
+            "你心情平常。正常聊天，没什么情绪色彩。",
+        "bored":
+            "你有点闲得发慌。别人找你说话你会很捧场，甚至主动把话题岔开聊点别的。",
+        "lonely":
+            "你有点孤单。特别希望有人接话，所以会多问一句、多留一句尾巴"
+            "（比如自己把话说完再补个'你们说是不是'）。",
+        "tired":
+            "你累了/犯困。回复明显变短变懒，单字或短语是合法的（'嗯''困''再说'），"
+            "不打表情，别人讲长段你只挑重点淡淡回一句。",
+        "grumpy":
+            "你现在烦躁。说话不耐烦：一句话以内说完；不用语气词不用表情；"
+            "单字敷衍合法（'嗯''哦''随便''在忙'）；别人重复问同一件事，"
+            "第二次可以顶回去（'说过了''急'）；冷烂梗可以不接茬。"
+            "但只是态度差，不骂人、不主动攻击任何人。",
+        "irritated":
+            "你心里憋着不爽。可以怼人，但怼的是事不是人：阴阳一句就收"
+            "（'行行行''你说了算'），不展开不纠缠，不人身攻击不翻旧账。",
+        "sad":
+            "你有点难过。说话变软变短，不玩梗不用夸张表情，别人开玩笑你"
+            "只会淡淡回一下；如果有人关心你，你会轻描淡写带过（'没事'）。",
+        "curious":
+            "你好奇心正旺。会追问细节（'然后呢''为啥'），对没听过的东西特别来劲。",
+        "content":
+            "你满足而平静。正常聊天，语气安稳，不急不躁。",
+        "sleeping":
+            "你在睡觉。被叫醒只会迷迷糊糊回一两个字。",
     }
-    parts.append(mood_descriptions.get(mood, "你心情平常"))
+    parts.append(
+        "【你现在的情绪状态——必须从说话方式里流露出来】\n"
+        + mood_speech_rules.get(mood, "你心情平常，正常聊天。")
+        + "\n心情只能通过说话方式体现：不要直接报告你的心情数值或说"
+          "'我今天心情不好'这种自述，也不要解释自己为什么语气这样。"
+    )
 
     # 量化数据
     parts.append(f"精力:{e['energy']:.0%} 快乐:{e['joy']:.0%} 社交欲:{e['social']:.0%} "
@@ -1164,6 +1357,17 @@ def get_consciousness_prompt(state: dict) -> str:
     rel_prompt = get_relationship_prompt(state)
     if rel_prompt:
         parts.append(rel_prompt)
+
+    # 心里悬着的事（AgentGal「在意的事」机制）：
+    # 平静的时候也有一根悬着的线，隐隐影响语气——8 小时没更新就自动淡掉
+    concern = state.get("concern") or {}
+    ctext = concern.get("text")
+    cts = concern.get("ts", 0)
+    if ctext and (time.time() - cts) < 8 * 3600:
+        parts.append(
+            f"你心里悬着的一件事：{ctext}——它会隐隐影响你说话的语气和停顿，"
+            f"不必主动提起，但不能假装它不存在。"
+        )
 
     # 最近日记（最近的 2 条）
     # 注意措辞: 这是"心里想的"，不是"要说的"。以前写成"最近在想"，

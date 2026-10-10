@@ -6,14 +6,14 @@
 /* ─── INFLUENCE ─── */
 async function infLoad() {
   const gid = $('inf-gid').value;
-  if (!gid) { empty('#inf-tbl', '🌟', '请选择群'); return; }
+  if (!gid) { empty('#inf-tbl', 'trophy', '请选择群'); return; }
   await fillTable('#inf-tbl', async () => (await api('/influence/' + gid + '?limit=30')).items,
     (e, i) => `<tr>
       <td class="num"><strong>#${i + 1}</strong></td>
       <td>${esc(e.user_name || e.user_qq)}</td>
       <td class="num">${(e.total_score || 0).toFixed(0)}</td>
     </tr>`,
-    '🌟', '还没有影响力数据');
+    'trophy', '还没有影响力数据');
 }
 
 /* ─── KEYWORDS ─── */
@@ -25,7 +25,7 @@ async function kwLoad() {
       <td class="num">${k.weight}</td>
       <td><button class="btn xs danger" onclick="kwDel('${attr(k.keyword)}')">删除</button></td>
     </tr>`,
-    q ? '🔍 没有匹配的关键词' : '🔑 关键词库为空');
+    q ? '🔍 没有匹配的词语' : '🔑 词库还是空的，点右上角「＋ 添加词语」补充');
 }
 
 function kwAdd() { $('kw-w').value = ''; $('kw-v').value = 3; openModal('m-kw'); }
@@ -46,10 +46,10 @@ async function kwDel(k) {
 }
 
 async function kwCleanup() {
-  if (!confirm('清理低权重(<0.5)？')) return;
+  if (!confirm('清理风险权重低于 0.5 的词语？')) return;
   try {
     const r = await api('/keywords/cleanup', { method: 'POST' });
-    kwLoad(); toast('已清理 ' + (r.removed || 0));
+    kwLoad(); toast('已清理 ' + (r.removed || 0) + ' 个词语');
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -64,13 +64,13 @@ async function trLoad(p = 1) {
     const el = $('tr-stats');
     if (el) {
       el.innerHTML =
-        statCard('📊', s.total || 0, '总数', '') +
-        statCard('🚫', s.violation_count || 0, '违规', '') +
-        statCard('✅', s.normal_count || 0, '正常', '') +
-        statCard('⏳', s.unapplied_count || 0, '待应用', '');
+        statCard('bar-chart', (s.total || 0).toLocaleString(), '样本总数', '') +
+        statCard('stop', (s.violation_count || 0).toLocaleString(), '违规样本', '') +
+        statCard('check-circle', (s.normal_count || 0).toLocaleString(), '正常样本', '') +
+        statCard('clock-circle', (s.unapplied_count || 0).toLocaleString(), '待生效', '');
     }
     const items = d.items || [];
-    if (!items.length) { empty('#tr-tbl', '🧪', '还没有训练数据'); $('tr-pager').innerHTML = ''; return; }
+    if (!items.length) { empty('#tr-tbl', 'experiment', '还没有样本，点右上角「＋ 添加样本」录入'); $('tr-pager').innerHTML = ''; return; }
     tbody('#tr-tbl').innerHTML = items.map(r => `<tr>
       <td class="num">${r.id}</td>
       <td class="wrap">${esc(trunc(r.message_text, 80))}</td>
@@ -110,10 +110,10 @@ async function trDel(id) {
 }
 
 async function trApply() {
-  if (!confirm('应用到学习引擎？')) return;
+  if (!confirm('让审核引擎学习这些样本？生效后会自动更新违规识别。')) return;
   try {
     const r = await api('/training-data/apply', { method: 'POST' });
-    toast(r.message || '已应用'); trLoad();
+    toast(r.message || '已生效，审核引擎已更新'); trLoad();
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -124,15 +124,17 @@ async function learnLoad() {
     const el = $('learn-stats');
     if (el) {
       el.innerHTML =
-        statCard('🔑', s.learned_keywords_count || 0, '关键词', '') +
-        statCard('📐', s.learned_patterns_count || 0, '模式', '') +
-        statCard('⚠️', s.false_positives_count || 0, '误判', '') +
-        statCard('📈', '阶段 ' + s.phase, '学习', '');
+        statCard('tags', (s.learned_keywords_count || 0).toLocaleString(), '记住的词', '') +
+        statCard('experiment', (s.learned_patterns_count || 0).toLocaleString(), '识别套路', '') +
+        statCard('warning', (s.false_positives_count || 0).toLocaleString(), '误判记录', '') +
+        statCard('fund', s.phase || '—', '当前阶段', '');
     }
+    const pd = $('learn-phase');
+    if (pd) pd.textContent = s.phase_desc || '';
     tbody('#learn-tbl').innerHTML = (s.top_keywords || []).map(k => `<tr>
       <td>${esc(k.keyword)}</td>
-      <td class="num">${k.weight}</td>
-    </tr>`).join('') || '<tr><td colspan="2" class="muted" style="padding:20px;text-align:center">无数据</td></tr>';
+      <td class="num">${Number(k.weight).toFixed(1)}</td>
+    </tr>`).join('') || '<tr><td colspan="2" class="muted" style="padding:20px;text-align:center">暂无数据</td></tr>';
   } catch (e) { toast('加载失败', 'err'); }
 }
 
@@ -153,7 +155,7 @@ async function ckLoad() {
   if (!sel.value && gs.length) sel.value = gs[0].group_id;
   sel.onchange = ckLoad;
   const gid = sel.value;
-  if (!gid) { empty('#ck-tbl', '📅', '请选择群'); return; }
+  if (!gid) { empty('#ck-tbl', 'calendar', '请选择群'); return; }
   await fillTable('#ck-tbl', async () => { try { return (await api('/checkin/leaderboard/' + gid)).items || []; } catch { return []; } },
     (e, i) => `<tr>
       <td><strong>#${i + 1}</strong></td>
@@ -161,7 +163,7 @@ async function ckLoad() {
       <td class="num">${e.streak || 0}</td>
       <td class="num">${e.total || 0}</td>
     </tr>`,
-    '📅', '还没有签到');
+    'calendar', '还没有签到');
 }
 
 async function ptLoad() {
@@ -170,14 +172,14 @@ async function ptLoad() {
   if (!sel.value && gs.length) sel.value = gs[0].group_id;
   sel.onchange = ptLoad;
   const gid = sel.value;
-  if (!gid) { empty('#pt-tbl', '💰', '请选择群'); return; }
+  if (!gid) { empty('#pt-tbl', 'wallet', '请选择群'); return; }
   await fillTable('#pt-tbl', async () => { try { return (await api('/points/leaderboard/' + gid)).items || []; } catch { return []; } },
     (e, i) => `<tr>
       <td><strong>#${i + 1}</strong></td>
       <td>${esc(e.user_name || e.user_qq)}</td>
       <td class="num">${e.points || 0}</td>
     </tr>`,
-    '💰', '还没有积分');
+    'wallet', '还没有积分');
 }
 
 /* ─── BOT SETTINGS ─── */
@@ -282,20 +284,25 @@ async function envEditSensitive(k) {
 let _logTimer = null;
 
 async function logLoad() {
-  const lines = $('log-lines')?.value || '200';
+  const lines = $('log-lines')?.value || '500';
   const level = $('log-level')?.value || '';
   try {
     const d = await api('/logs?lines=' + lines + '&level=' + encodeURIComponent(level));
     if (!d.ok) { const o = $('log-out'); if (o) o.textContent = '加载失败: ' + (d.error || ''); return; }
     const o = $('log-out');
     if (!o) return;
-    o.innerHTML = (d.lines || []).map(l => {
-      let cls = 'muted';
-      if (l.includes('| ERROR')) cls = 'err';
-      else if (l.includes('| WARNING')) cls = 'warn';
-      else if (l.includes('| INFO')) cls = 'info';
+    // 日志行头格式 "2026-.. [ERROR] name: ..."；无时间戳前缀的行是上一条的
+    // 续行（堆栈等），沿用上一条的颜色。尾部截断时提示更早日志仍在文件里。
+    let cls = 'muted';
+    let html = (d.lines || []).map(l => {
+      if (l.includes('[ERROR]') || l.includes('| ERROR')) cls = 'err';
+      else if (l.includes('[WARNING]') || l.includes('| WARNING')) cls = 'warn';
+      else if (l.includes('[INFO]') || l.includes('| INFO')) cls = 'info';
+      else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} /.test(l)) cls = 'muted';
       return `<span style="display:block" class="${cls}">${esc(l)}</span>`;
     }).join('');
+    if (d.truncated) html = `<span style="display:block" class="warn">（日志文件超过 5MB，仅显示最近部分；更早日志请直接查看服务器 bot.log）</span>` + html;
+    o.innerHTML = html;
     o.scrollTop = o.scrollHeight;
   } catch (e) { const o = $('log-out'); if (o) o.textContent = '错误: ' + e.message; }
 }

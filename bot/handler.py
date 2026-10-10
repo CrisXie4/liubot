@@ -138,6 +138,63 @@ def _extract_text(message: list[dict]) -> str:
     return "".join(texts).strip()
 
 
+def _forward_aware_text(raw_message: str, forward_block: dict | None) -> str:
+    """把 raw 里的 [CQ:forward] 换成可见摘要，让决策/记忆侧"看见"合并转发。
+
+    没人 @ 的合并转发原本只以裸 CQ 码进决策引擎和记忆，AI 完全不知道里面
+    说了什么。这里用展开结果替换 CQ 码；正文摘录固定截 150 字——防止大
+    转发包灌高决策相关性、撑爆记忆缓冲。无 forward 或展开失败时原样返回。
+    """
+    if not raw_message or "[CQ:forward," not in raw_message:
+        return raw_message or ""
+    block = forward_block or {}
+    fwd_text = (block.get("text") or "").strip()
+    if not fwd_text:
+        return raw_message
+    count = block.get("count") or 0
+    summary = f"[合并转发:{count}条] {fwd_text[:150]}"
+    # 摘录按字面插入：用可调用替换，防止转发言里含 \1、\g<1> 等序列时
+    # 被 re.sub 当组引用（轻则吞字，重则 PatternError 炸掉整个消息处理）
+    return re.sub(r"\[CQ:forward,[^\]]*\]", lambda _m: summary, raw_message)
+
+
+async def _forward_images_to_media_ctx(images: list[dict], limit: int = 2) -> list[dict]:
+    """把转发包内的图片经视觉描述转成 AI 媒体上下文。
+
+    节流：每条转发最多 limit 张（describe_image 自带 24h media_cache，
+    重复图不会重复烧 vision 配额）。describe 失败/无描述的跳过。
+    """
+    out: list[dict] = []
+    for img in (images or [])[:limit]:
+        url = (img or {}).get("url", "")
+        if not url:
+            continue
+        try:
+            desc = await media_reader.describe_image(
+                url, context="群友转发的聊天记录里的图")
+        except Exception:
+            desc = None
+        if desc:
+            out.append({"type": "image", "description": desc,
+                        "url": url, "raw_cq": ""})
+    return out
+
+
+def _is_reply_to_bot(quoted_context: dict | None, bot_qq: int | str) -> bool:
+    """真·回复Bot判定：被引用消息的发送者就是 Bot 自己才算。
+
+    sender_qq 由 quote_handler.get_quoted_context 从被引消息 sender.user_id
+    取得；群友互回不再被当成回复 Bot（避免虚增互动分/触发必回分支）。
+    """
+    if not quoted_context:
+        return False
+    try:
+        sender_qq = int(quoted_context.get("sender_qq") or 0)
+        return sender_qq != 0 and sender_qq == int(bot_qq or 0)
+    except (TypeError, ValueError):
+        return False
+
+
 # ═══════════════════════════════════════════════════════════
 #  @mention 解析 — 把 [CQ:at,qq=xxx] 替换为 @用户名
 #  避免 AI 看到裸 QQ 号不知道是谁 → "他/这个" 无法理解
@@ -147,6 +204,19 @@ def _extract_text(message: list[dict]) -> str:
 async def _resolve_at_mentions(bot, group_id: int, text: str) -> str:
     """将消息中的 [CQ:at,qq=xxx] 替换为 @用户名（含群名片优先）"""
     return await _get_identity().resolve_at_mentions(bot, group_id, text)
+
+
+def _strip_self_at(bot, text: str) -> str:
+    """剥掉消息里 @机器人自己 的 CQ 码。
+
+    必须在解析别人的 @ 之前做——否则 bot 自己的 @ 会被解析成「@六哥AI」
+    留在文本里，模型看到自己名片里的"六哥"字样会误触发老大相关的反应。
+    """
+    try:
+        import re as _re_strip
+        return _re_strip.sub(rf"\[CQ:at,qq={int(bot.bot_qq)}[^\]]*\]", " ", text or "")
+    except (TypeError, ValueError):
+        return text or ""
 
 
 async def _build_roster(
@@ -190,6 +260,55 @@ def _is_at_bot(message: list[dict], bot_qq: str) -> bool:
             if qq == bot_qq or qq == "all":
                 return True
     return False
+
+
+# ═══ 输入防抖聚合（学 LangBot aggregator）═══
+# 群友连发几条 @ 消息时，等 1.2s 收齐再一次性回答，
+# 消灭"一句话被掰成三问答三遍"的机器感。
+DEBOUNCE_WAIT = 1.2
+_debounce_windows: dict[tuple[int, int], dict] = {}  # (group, user) → window
+
+
+def _debounce_strip_cq(raw: str) -> str:
+    import re as _re
+    return _re.sub(r"\[CQ:[^\]]+\]", "", raw or "").strip()
+
+
+async def _collect_debounced_message(group_id: int, user_id: int,
+                                     raw_message: str, first_text: str):
+    """防抖收集同一用户的连发消息。
+
+    返回合并后的文本（本条为首条消息，等满窗口后取走全部）；
+    返回 None = 本条已被更早的收集窗口收编（调用方直接 return 不回复）。
+    """
+    import asyncio as _asyncio
+    import time as _time
+
+    key = (group_id, user_id)
+    clean = _debounce_strip_cq(raw_message) or first_text
+    st = _debounce_windows.get(key)
+    if st is not None and _time.time() < st["deadline"]:
+        st["texts"].append(clean)
+        logger.debug(f"防抖收编 [群{group_id} {user_id}]: 窗口内已有 {len(st['texts'])} 条")
+        return None
+
+    st = {"texts": [clean], "deadline": _time.time() + DEBOUNCE_WAIT}
+    _debounce_windows[key] = st
+    await _asyncio.sleep(DEBOUNCE_WAIT)
+    # 只取走自己的窗口（期间被覆盖时不误删别人的）
+    if _debounce_windows.get(key) is st:
+        _debounce_windows.pop(key, None)
+    merged = " / ".join(t for t in st["texts"] if t)
+    if len(st["texts"]) > 1:
+        logger.info(f"防抖合并 [群{group_id} {user_id}]: {len(st['texts'])} 条连发合并为一次回答")
+    return merged or first_text
+
+
+# ═══ 占位消息（学 Jianer）：查询类请求先回一句"稍等"，回复发出后撤回 ═══
+_QUERY_INTENT_RE = re.compile(
+    r"帮我查|搜索|搜一下|查一下|查查|什么是|什么叫|啥是|介绍一下|"
+    r"总结一下|总结下|讲讲|详解|分析一下")
+_PLACEHOLDER_LINES = ["稍等，我看看…", "等我查查哈", "让我想想…", "马上~先看一眼"]
 
 
 def _is_owner(user_id: int) -> bool:
@@ -343,6 +462,61 @@ async def _mark_read_later(bot: OneBotClient, group_id: int):
         pass
 
 
+async def _note_emoji_likes(bot: OneBotClient, group_id: int, message_id: int, event_likes: list):
+    """有人给 Bot 自己的历史消息贴了表情回应 → 写人话汇总进意识状态。
+
+    覆盖式上限：state 里只有一个 emoji_like_note 槽位，每条新回应覆盖旧记录，
+    读取侧（chat.py）自行按 ts 判断新鲜度。
+    """
+    if not message_id:
+        return
+    try:
+        msg = await bot.get_msg(message_id)
+    except Exception as e:
+        logger.debug(f"表情回应归属反查失败: {e}")
+        return
+    if not isinstance(msg, dict):
+        return
+    sender_id = (msg.get("sender") or {}).get("user_id", 0)
+    bot_qq = str(bot.bot_qq or config.BOT_QQ or "")
+    if not bot_qq or str(sender_id) != bot_qq:
+        return  # 回应的不是我的消息，不感知
+    # 优先 get_msg 响应里的累计列表（emoji_id/emoji_type/likes_cnt），
+    # 拿不到再退回事件自带的增量列表（emoji_id/count）
+    likes = []
+    for it in msg.get("emoji_likes_list") or []:
+        if isinstance(it, dict):
+            likes.append((it.get("emoji_id", ""), it.get("likes_cnt", it.get("count", 0))))
+    if not likes:
+        for it in event_likes or []:
+            if isinstance(it, dict):
+                likes.append((it.get("emoji_id", ""), it.get("count", 1)))
+    parts = []
+    for eid, cnt in likes[:5]:
+        try:
+            n = int(str(cnt))
+        except (TypeError, ValueError):
+            continue
+        eid = str(eid)
+        try:
+            code = int(eid)
+            # unicode emoji 的 id 是码点（如 128514=😂）；QQ 小黄脸 id 较小，无字符可映射
+            face = chr(code) if code >= 0x1F000 else f"[表情{eid}]"
+        except ValueError:
+            face = f"[表情{eid}]"
+        parts.append(f"{n} 个{face}")
+    if not parts:
+        return
+    summary = "收到表情回应：" + "、".join(parts)
+    try:
+        from . import consciousness as _cs
+        state = _cs.get_state()
+        state["emoji_like_note"] = {"text": summary, "ts": int(time.time())}
+        logger.info(f"群{group_id} 消息{message_id} {summary}")
+    except Exception as e:
+        logger.debug(f"表情回应写入状态失败: {e}")
+
+
 async def handle_notice(bot: OneBotClient, event: dict):
     """处理通知事件（成员加入/离开、管理变更、禁言、撤回等）"""
     notice_type = event.get("notice_type", "")
@@ -432,6 +606,15 @@ async def handle_notice(bot: OneBotClient, event: dict):
         except Exception:
             pass
 
+        # ── 离场兜底：待验证成员无论被踢还是自己退群，验证期间发的消息全部撤回 ──
+        # 广告套路"进群刷广告→不验证就退场"：审核漏掉的广告不能永远留在群里
+        try:
+            from . import verify as _verify
+            await _verify.recall_pending_messages(bot, group_id, target_qq,
+                                                  reason=f"离场({sub_type or 'unknown'})")
+        except Exception as e:
+            logger.debug(f"离场撤回兜底异常: {e}")
+
         if sub_type == "kick" or sub_type == "kick_me":
             # 被踢
             logger.info(f"群{group_id} {nickname}({target_qq}) 被踢出")
@@ -520,7 +703,7 @@ async def handle_notice(bot: OneBotClient, event: dict):
                         pass
                     # 通知主人
                     try:
-                        await bot.send_private_msg(int(config.OWNER_QQ),
+                        nid = await bot.send_private_msg(int(config.OWNER_QQ),
                             f"🚨 **待审批: 踢人（名片违规）**\n"
                             f"群: {group_id}\n"
                             f"用户: {card_new}({user_id})\n"
@@ -529,6 +712,7 @@ async def handle_notice(bot: OneBotClient, event: dict):
                             f"累计: 第{violation_count}次\n\n"
                             f"回复 \"同意 {aid}\" 执行踢人\n"
                             f"回复 \"拒绝 {aid}\" 取消")
+                        guardian.set_notify_msg(aid, nid)
                     except Exception:
                         pass
                     logger.warning(f"昵称违规踢人审批已创建: {aid} {user_id} {card_new}")
@@ -572,6 +756,23 @@ async def handle_notice(bot: OneBotClient, event: dict):
             op_name = str(operator)
         group_events.record(group_id, "recall", operator, op_name)
 
+    # ── 表情回应感知 ──
+    # NapCat 的 group_msg_emoji_like 通知事件（OB11MsgEmojiLikeEvent）：
+    # {notice_type, group_id, user_id=回应者, message_id=被回应的消息,
+    #  likes: [{emoji_id, count}], is_add}
+    # 注意（本地源码核实）：消息事件本体不带 emoji_likes_list（该字段只在
+    # get_msg 响应里填充），事件也不标注被回应消息的归属，所以这里用
+    # get_msg 反查：回应的是 Bot 自己的历史消息才记进意识状态。
+    if notice_type == "group_msg_emoji_like":
+        try:
+            await _note_emoji_likes(
+                bot, group_id, int(event.get("message_id", 0) or 0),
+                event.get("likes") or [],
+            )
+        except Exception as e:
+            logger.debug(f"表情回应感知异常: {e}")
+        return
+
     # 戳一戳 → 回戳（兼容多种事件格式）
     if (notice_type == "notify" and event.get("sub_type") == "poke") or notice_type == "poke":
         target_id = event.get("target_id", 0)
@@ -599,6 +800,28 @@ async def handle_notice(bot: OneBotClient, event: dict):
     if notice_type == "notify" and event.get("sub_type") == "honor":
         # 群荣誉变更（龙王/群聊之火等）→ 无视
         return
+
+
+def _name_processed_recently(v_records: list[dict], nickname: str, window: int = 86400) -> bool:
+    """同一昵称在 window 秒内已被昵称扫描处理过 → True。
+
+    扫描每 30 分钟跑一轮：不去重会把同一人重复记档/重复禁言/重复建审批，
+    违规次数也会被灌水（线上出现过一天记 20+ 次的案例）。
+    """
+    now = time.time()
+    for prev in v_records:
+        raw = prev.get("raw_message") or ""
+        if not raw.startswith("[昵称违规]"):
+            continue
+        if (prev.get("violator_name") or "") != nickname:
+            continue
+        try:
+            ts = time.mktime(time.strptime(prev.get("recorded_at", ""), "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, TypeError):
+            continue
+        if now - ts < window:
+            return True
+    return False
 
 
 async def check_member_names(bot: OneBotClient, group_id: int, dry_run: bool = False) -> dict:
@@ -633,18 +856,29 @@ async def check_member_names(bot: OneBotClient, group_id: int, dry_run: bool = F
             role = m.get("role", "member")
             if role in ("admin", "owner"):
                 continue
-            # 优先检查群名片，再检查QQ昵称
+            # 优先检查群名片，再检查QQ昵称（"违规昵称"是 Bot 打的标记，不再二次检测）
+            skip_member = False
             for name in [card, nickname]:
-                if not name or len(name) < 3:
+                if not name or len(name) < 3 or name == "违规昵称":
+                    continue
+                # 纯数字名不是广告：QQ 默认昵称本就是数字，不含任何可传播内容
+                if name.isdigit():
                     continue
                 score = learner.score_with_learning(name)
                 kw_list = [h["keyword"] for h in score.get("details", {}).get("keyword_hits", [])]
-                if score["is_violation"] and score["confidence"] >= 0.7:
+                # 昵称判罚必须有真实违规词命中——打分器的"形状"信号（疑似QQ号、
+                # 重复字符等）是为消息内容设计的，数字年份、QQ号式昵称都会中招
+                if score["is_violation"] and score["confidence"] >= 0.7 and kw_list:
                     conf = score["confidence"]
                     display_name = card or nickname
                     # 查询历史违规次数
                     v_records = db.query_violations(group_id=group_id, violator_qq=qq)
                     violation_count = len(v_records) + 1  # +1 包含本次
+
+                    # 同一昵称 24h 内已处理过 → 跳过（防重复禁言/记档/审批）
+                    if _name_processed_recently(v_records, nickname):
+                        skip_member = True
+                        break
 
                     # 记录违规
                     db.add_violation(
@@ -664,18 +898,19 @@ async def check_member_names(bot: OneBotClient, group_id: int, dry_run: bool = F
                         f"  置信度: {conf:.0%} | 第{violation_count}次违规"
                     )
 
-                    # ── 分级处理：禁言 + 改名片 + @提醒 + 私聊 ──
+                    # ── 分级处理：禁言 + 改名片 + @警告 ──
                     if not dry_run and bot_is_admin:
-                        # 1. 把违规昵称改成"违规昵称"
-                        try:
-                            ok = await bot.set_group_card(group_id, qq, "违规昵称")
-                            if ok:
-                                actions.append({"qq": qq, "name": display_name, "action": "card_renamed", "confidence": conf})
-                                logger.info(f"昵称违规改名: {qq} {display_name} → 违规昵称")
-                            else:
-                                logger.warning(f"昵称违规改名失败(API): {qq}")
-                        except Exception as e:
-                            logger.warning(f"昵称违规改名异常: {qq} {e}")
+                        # 1. 把违规昵称改成"违规昵称"（已是标记则跳过）
+                        if card != "违规昵称":
+                            try:
+                                ok = await bot.set_group_card(group_id, qq, "违规昵称")
+                                if ok:
+                                    actions.append({"qq": qq, "name": display_name, "action": "card_renamed", "confidence": conf})
+                                    logger.info(f"昵称违规改名: {qq} {display_name} → 违规昵称")
+                                else:
+                                    logger.warning(f"昵称违规改名失败(API): {qq}")
+                            except Exception as e:
+                                logger.warning(f"昵称违规改名异常: {qq} {e}")
                         # 2. 禁言 30 分钟
                         try:
                             await bot.set_group_ban(group_id, qq, 1800)
@@ -683,20 +918,23 @@ async def check_member_names(bot: OneBotClient, group_id: int, dry_run: bool = F
                             actions.append({"qq": qq, "name": display_name, "action": "muted_1800s", "confidence": conf})
                         except Exception as e:
                             logger.warning(f"昵称违规禁言异常: {qq} {e}")
-                        # 3. @提醒
+                        # 3. @警告 —— 无论第几次都告知本人，让人知道自己哪里违规、该怎么改
                         if violation_count < 3:
-                            try:
-                                await bot.send_group_msg(group_id,
-                                    f"[CQ:at,qq={qq}] ⚠️ 你的群昵称「{display_name}」疑似广告\n"
-                                    f"已禁言30分钟，名片已改为'违规昵称'，请尽快修改！\n"
-                                    f"（第{violation_count}/3次，满3次将被踢出）")
-                            except Exception as e:
-                                logger.warning(f"昵称违规@提醒失败: {qq} {e}")
-                        # 私聊改成了群里 @ 警告（不是好友私聊发不出去）
-                        # 群里 @ 警告已在上面 send_group_msg 完成
+                            warn_msg = (
+                                f"[CQ:at,qq={qq}] ⚠️ 你的昵称「{name}」命中违规词：{', '.join(kw_list[:3]) or '疑似广告'}\n"
+                                f"已禁言 30 分钟，群名片已改为'违规昵称'。请尽快修改昵称，满 3 次将被移出群聊。\n"
+                                f"（第{violation_count}/3 次）")
+                        else:
+                            warn_msg = (
+                                f"[CQ:at,qq={qq}] 🚫 你的昵称「{name}」多次命中违规词：{', '.join(kw_list[:3]) or '疑似广告'}\n"
+                                f"已禁言 30 分钟，并已提交移出群聊审批，等待管理员确认。")
+                        try:
+                            await bot.send_group_msg(group_id, warn_msg)
+                        except Exception as e:
+                            logger.warning(f"昵称违规@警告失败: {qq} {e}")
 
-                        # 第3次：创建踢人审批（不自动踢）
-                        if violation_count >= 3:
+                        # 第3次：创建踢人审批（同一人同一动作只挂一个，不重复创建）
+                        if violation_count >= 3 and not guardian.has_pending_action(group_id, qq, "kick"):
                             aid = guardian.create_action_request(
                                 group_id, qq, display_name,
                                 action="kick",
@@ -707,7 +945,7 @@ async def check_member_names(bot: OneBotClient, group_id: int, dry_run: bool = F
                             actions.append({"qq": qq, "name": display_name, "action": "approval_created", "confidence": conf})
                             # 通知主人
                             try:
-                                await bot.send_private_msg(int(config.OWNER_QQ),
+                                nid = await bot.send_private_msg(int(config.OWNER_QQ),
                                     f"🚨 **待审批: 踢人（昵称违规）**\n"
                                     f"群: {group_id}\n"
                                     f"用户: {display_name}({qq})\n"
@@ -717,6 +955,7 @@ async def check_member_names(bot: OneBotClient, group_id: int, dry_run: bool = F
                                     f"置信度: {conf:.0%}\n\n"
                                     f"回复 \"同意 {aid}\" 执行踢人\n"
                                     f"回复 \"拒绝 {aid}\" 取消")
+                                guardian.set_notify_msg(aid, nid)
                             except Exception:
                                 # 私聊失败 → 群里发（仅主人可见的审批通知）
                                 pass
@@ -725,6 +964,8 @@ async def check_member_names(bot: OneBotClient, group_id: int, dry_run: bool = F
 
                     warnings.append(warn_text)
                     break  # 一个用户只报一次
+            if skip_member:
+                continue
     except Exception as e:
         logger.error(f"成员名检查异常: {e}", exc_info=True)
     return {"warnings": warnings, "actions": actions}
@@ -805,9 +1046,18 @@ async def monitor_all_group_names(bot: OneBotClient):
 # 会话期内：不 @ 也有较高回复概率；群里任何人加入对话都算同一条线
 # （解决"必须@才回"和"多人聊天 Bot 插不上嘴"）。
 # TTL 随 Bot 社交情绪伸缩（8-15 分钟）——心情好/想聊时会话拉长。
-_followup: dict[int, dict] = {}  # {group_id: {"users": {uid: name}, "expiry": ts}}
+# 另跟踪双方最后发言时间，供决策引擎"热对话续聊"和沉寂唤醒使用：
+#   last_msg_ts       群友最后一次说话的时间
+#   last_bot_reply_ts Bot 最后一次发言的时间
+#   woken             本会话沉寂唤醒是否已试过（每个会话只试一次，不硬追）
+_followup: dict[int, dict] = {}
 SESSION_TTL_BASE = 480     # 8 分钟
 SESSION_TTL_MAX = 900      # 15 分钟
+
+# 沉寂唤醒窗口：对话断线 3~10 分钟内才值得自然接一句，
+# 超过 10 分钟话题早凉了，硬接反而尬。
+DORMANT_MIN_S = 180
+DORMANT_MAX_S = 600
 
 # ===== 回戳冷却 =====
 _poke_cooldown: dict[int, float] = {}
@@ -846,10 +1096,75 @@ def _set_followup(group_id: int, user_id: int, user_name: str = ""):
     g = _followup.setdefault(group_id, {"users": {}, "expiry": 0})
     g["users"][user_id] = user_name or str(user_id)
     g["expiry"] = now + _session_ttl()
+    g["last_msg_ts"] = now
+    g["last_speaker_uid"] = user_id
+
+
+def _note_bot_reply(group_id: int):
+    """记录 Bot 在该群发了一次言（供热对话续聊和沉寂唤醒判断方向）。"""
+    g = _followup.get(group_id)
+    if g:
+        g["last_bot_reply_ts"] = time.time()
 
 
 def _clear_followup(group_id: int):
     _followup.pop(group_id, None)
+
+
+# ═══════════════════════════════════════════════════════════
+#  沉寂唤醒：聊到一半断掉的对话，过几分钟自然接上
+#  =========================================================
+#  真人不会聊着聊着突然永远消失——话头悬在那儿，过一会儿
+#  总会"回过神来"补一句。判定方向很关键：
+#    · 群友说了话、Bot 还没接（对方在等回应）→ 该唤醒
+#    · Bot 说了话收了尾、群友没接（话已说完）→ 不硬追
+#  唤醒内容由 LLM 看最近对话生成，接不上就沉默（SKIP）。
+# ═══════════════════════════════════════════════════════════
+
+async def check_dormant_conversations(bot: OneBotClient):
+    """扫描各群会话，对断线 3~10 分钟、话头悬在 Bot 这边的对话尝试自然接上。
+
+    由 main.py 意识循环每分钟调用一次。每个会话只试一次（woken 标记），
+    失败/沉默都不重试——真人不复读机式地追着人聊。
+    """
+    now = time.time()
+    for group_id, g in list(_followup.items()):
+        try:
+            if g.get("woken"):
+                continue
+            last_msg = g.get("last_msg_ts", 0)
+            idle = now - last_msg
+            if not (DORMANT_MIN_S <= idle <= DORMANT_MAX_S):
+                continue
+            # Bot 最后发言晚于群友最后发言 → 话是 Bot 收的尾，不用接
+            if g.get("last_bot_reply_ts", 0) >= last_msg:
+                continue
+
+            from . import consciousness as _cs
+            state = _cs.get_state()
+            ok, why = _cs.can_speak_proactively(state)
+            if not ok:
+                logger.debug(f"沉寂唤醒跳过 [群{group_id}]: {why}")
+                continue
+            if not guardian.check_proactive_rate(group_id):
+                continue
+
+            g["woken"] = True  # 无论成败，这个会话只试一次
+            line = await chat.generate_dormant_wake(group_id, g)
+            if not line:
+                logger.debug(f"沉寂唤醒 [群{group_id}]: 没有值得接的话，保持安静")
+                continue
+
+            await humanizer.send_human_like(bot, group_id, line)
+            chat.add_context(group_id, "assistant", line, importance=0.7)
+            memory.window_add_message(
+                group_id, int(bot.bot_qq),
+                group_personality.get_group_bot_name(group_id), line,
+            )
+            _cs.record_proactive_message(state, group_id)
+            logger.info(f"😴→💬 沉寂唤醒 [群{group_id}] (断线{idle/60:.0f}分钟): {line[:60]}")
+        except Exception as e:
+            logger.debug(f"沉寂唤醒异常 [群{group_id}]: {e}")
 
 
 async def handle_group_message(bot: OneBotClient, event: dict):
@@ -865,15 +1180,11 @@ async def handle_group_message(bot: OneBotClient, event: dict):
     if not rs.is_bot_on() and not _is_owner(user_id):
         return
 
-    # ── 加群验证答题检测（群内版）──
-    # 如果发送者正在待验证，verify 内部会判题并踢人/通过，
-    # 返回 True 表示已处理，这里直接 return，不再走 AI 聊天
-    from . import verify as _verify
+    # 📊 每小时消息量统计（面板图表用，失败静默）
     try:
-        if await _verify.handle_group_verify_answer(bot, event):
-            return
-    except Exception as e:
-        logger.debug(f"verify 答题检测异常: {e}")
+        db.usage_hour_add(msgs_in=1)
+    except Exception:
+        pass
 
     sender = event.get("sender", {})
     user_name = sender.get("card", "") or sender.get("nickname", "")
@@ -978,13 +1289,13 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                     )
         except Exception:
             pass
-            pass
 
     # ── 记录群友影响力 ──
     if not _is_owner(user_id):
         if at_bot:
             influence.track_interaction(group_id, user_id, user_name, "mention_bot")
-        if is_reply:
+        # 真·回复Bot才记账——群友互回不算（防止影响力账本被灌水）
+        if _is_reply_to_bot(quoted_context, bot.bot_qq):
             influence.track_interaction(group_id, user_id, user_name, "reply_to_bot")
         if has_image:
             influence.track_interaction(group_id, user_id, user_name, "image_shared")
@@ -994,9 +1305,9 @@ async def handle_group_message(bot: OneBotClient, event: dict):
         if raw_message and len(raw_message) > 2:
             influence.track_interaction(group_id, user_id, user_name, "message_count", 0.1)
 
-    # ── 自动收藏表情 ──
-    if has_sticker_code:
-        sticker.maybe_collect_sticker(raw_message, group_id, user_id)
+    # （自动收藏表情的唯一入口在上面 :1149 的主扫描——同一条 raw_message
+    #   在这里再扫一遍只会靠 unique_key 去重虚增 favorite_count + 重复文件 IO，
+    #   第二次调用已删除）
 
     # ===== 自动审核（跳过主人和QQ官方账号）=====
     bot_is_admin = await _is_bot_admin(bot, group_id)
@@ -1160,7 +1471,7 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                         message=raw_message,
                     )
                     try:
-                        await bot.send_private_msg(int(config.OWNER_QQ),
+                        nid = await bot.send_private_msg(int(config.OWNER_QQ),
                             f"🚨 **待审批: 踢人**\n"
                             f"群: {group_id}\n"
                             f"用户: {user_name}({user_id})\n"
@@ -1170,6 +1481,7 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                             f"回复 \"同意 {aid}\" 执行踢人\n"
                             f"回复 \"拒绝 {aid}\" 取消"
                         )
+                        guardian.set_notify_msg(aid, nid)
                     except Exception:
                         # 私聊失败 → 群里喊
                         try:
@@ -1248,15 +1560,28 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             if not friend_mode:
                 return
 
+    # ── 加群验证答题检测（群内版）──
+    # 故意放在自动审核之后：待验证成员是广告重灾区，消息必须先过一遍
+    # 关键词/LLM/图片审核当场拦广告，没被拦下的才进判题（通过/答错/提示）。
+    # 返回 True 表示已处理，直接 return，不再走 ML 采样、记忆和 AI 聊天。
+    from . import verify as _verify
+    try:
+        if await _verify.handle_group_verify_answer(bot, event):
+            return
+    except Exception as e:
+        logger.debug(f"verify 答题检测异常: {e}")
+
     # ===== 正常消息采样（ML 训练用） =====
     if raw_message and 5 < len(raw_message) < 200:
         trainer.collect_normal_sample(group_id, user_id, raw_message)
 
     # ===== AI 记忆：记住用户 + 缓冲消息 + 事实提取 =====
     if raw_message and len(raw_message) > 2:
-        memory.remember_user(user_id, group_id, user_name, raw_message)
-        memory.buffer_message(group_id, user_id, user_name, raw_message)
-        memory.window_add_message(group_id, user_id, user_name, raw_message, message_id=message_id)
+        # 转发可见性：合并转发以摘要进记忆，而不是裸 [CQ:forward,id=..]
+        fwd_visible = _forward_aware_text(raw_message, content.get("forward"))
+        memory.remember_user(user_id, group_id, user_name, fwd_visible)
+        memory.buffer_message(group_id, user_id, user_name, fwd_visible)
+        memory.window_add_message(group_id, user_id, user_name, fwd_visible, message_id=message_id)
         asyncio.create_task(
             memory.extract_and_learn_from_message(user_id, user_name, group_id, raw_message)
         )
@@ -1278,18 +1603,28 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             except Exception:
                 pass
 
+            try:
+                # ★ Volition：该群有人说话 → bot 之前的主动发言算被接话了，
+                # 不再计入"15 分钟无人回应"（修复"回了话还说没人理"）
+                from .consciousness import note_group_response as _note_resp, get_state as _cs_get
+                _note_resp(_cs_get(), group_id)
+            except Exception:
+                pass
+
         # ★ 短期上下文：把每条群消息都记进回复上下文，让小六被 @ 时能"看到"
         # 刚才群里在聊什么（修复"聊着聊着就忘了话题"）。小六自己的消息不记——
         # 它的回复由 chat_reply / try_proactive_chat 以 assistant 身份记录。
         if user_id != int(bot.bot_qq or 0):
             chat.add_context(
                 group_id, "user",
-                f"[{user_name}] 说: {raw_message}",
+                f"[{user_name}] 说: {_forward_aware_text(raw_message, content.get('forward'))}",
                 importance=0.4, msg_id=message_id,
             )
 
     # ===== 群风观察：AI 自动习得群氛围和癖好 =====
-    if raw_message and len(raw_message) > 3:
+    # 不观察小六自己的发言——否则它说的每个语气词都会回灌成"群癖好"，
+    # 形成"自己学自己"的正反馈（旧版 LLM 学习器就是这么满口卧槽的）
+    if raw_message and len(raw_message) > 3 and user_id != int(bot.bot_qq or 0):
         group_personality.observe_message(group_id, user_name, raw_message)
         if group_personality.should_analyze_and_learn(group_id):
             asyncio.create_task(group_personality.auto_learn_group_style(group_id))
@@ -1720,6 +2055,7 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             if not detail:
                 await bot.send_group_msg(group_id, f"审批 ID {arg} 不存在或已过期")
                 return
+            await guardian.recall_notify(bot, detail)
             # 执行操作
             if detail["action"] == "kick":
                 try:
@@ -1746,6 +2082,7 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                 return
             detail = guardian.reject_action(arg.strip())
             if detail:
+                await guardian.recall_notify(bot, detail)
                 await bot.send_group_msg(group_id, f"❌ 已拒绝: {detail['user_name']} 的 {detail['action']}")
             else:
                 await bot.send_group_msg(group_id, f"审批 ID {arg} 不存在或已过期")
@@ -2126,9 +2463,14 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                     pass  # 表情表态失败不阻塞，继续走文字回复
 
             # 走决策引擎判断这条消息是否值得接话
+            # （会话态 + Bot 刚说完话 → 决策引擎走"热对话续聊"高概率层）
+            # 转发可见性：决策引擎拿到的是转发摘要而不是裸 CQ 码
             should_follow, reason = await decision_engine.should_reply_to_message(
-                bot, group_id, user_id, user_name, raw_message or text,
+                bot, group_id, user_id, user_name,
+                _forward_aware_text(raw_message, content.get("forward")) or text,
                 is_at_bot=False, is_reply_to_bot=False, quoted_context=quoted_context,
+                in_followup=True,
+                bot_last_reply_ts=_followup.get(group_id, {}).get("last_bot_reply_ts", 0.0),
             )
             if not should_follow:
                 logger.debug(f"follow-up跳过(决策引擎): {reason}")
@@ -2140,16 +2482,23 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             # 不再用硬编码的"在呢/嗯？"，避免太机械
             chat_text = "（有人叫了我一声）"
 
+        # ★ 输入防抖聚合（学 LangBot aggregator）：等 1.2s 收齐同一用户
+        # 的连发消息再一次性回答——消灭"一句话被掰成三问答三遍"的机器感。
+        # 只作用于被 @ 的入口；后续消息被收编时本次直接 return。
+        if at_bot and chat_text != "（有人叫了我一声）":
+            merged = await _collect_debounced_message(
+                group_id, user_id, raw_message, chat_text)
+            if merged is None:
+                return  # 已被更早的防抖任务收编，由那个任务统一回复
+            chat_text = merged
+
         # 🔧 解析 @mention: 把 [CQ:at,qq=xxx] 替换为 @用户名
         # 这样 AI 看到 "@嘟嘟 他喽" 而不是 "他喽"，能理解"他"是谁
         if raw_message and "[CQ:at,qq=" in raw_message:
             try:
-                resolved = await _resolve_at_mentions(bot, group_id, raw_message)
+                resolved = await _resolve_at_mentions(bot, group_id, _strip_self_at(bot, raw_message))
                 import re as _re2
-                # 去掉 bot 自己的 @ (避免 AI 困惑) 和其他 CQ 码
-                bot_at = f"[CQ:at,qq={bot.bot_qq}]"
-                resolved_clean = resolved.replace(bot_at, "").strip()
-                resolved_clean = _re2.sub(r"\[CQ:[^\]]+\]", "", resolved_clean).strip()
+                resolved_clean = _re2.sub(r"\[CQ:[^\]]+\]", "", resolved).strip()
                 # 如果解析后内容比 segment text 更丰富，使用解析后的
                 if resolved_clean and len(resolved_clean) > len(chat_text):
                     chat_text = resolved_clean
@@ -2157,17 +2506,46 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                 pass
 
         t0 = time.time()
+
+        # ★ 占位消息：查询类请求 AI 生成+工具链路可能要十几秒，
+        # 先回一句"稍等"让用户知道在干活，回复发出后撤回（学 Jianer）
+        placeholder_msg_id = 0
+        if at_bot and _QUERY_INTENT_RE.search(chat_text or ""):
+            try:
+                placeholder_msg_id = await bot.send_group_msg(
+                    group_id, random.choice(_PLACEHOLDER_LINES))
+            except Exception:
+                pass
+
+        # 合并转发：聊天路径也展开（此前只有审核路径能看懂转发内容）
+        forward_text = ""
+        fwd_media: list[dict] = []
+        if raw_message and "[CQ:forward," in raw_message:
+            try:
+                from . import content_reader as _content_reader
+                fwd_content = await _content_reader.extract_full_content(
+                    bot, raw_message, message)
+                if fwd_content.get("has_forward") and fwd_content.get("forward"):
+                    forward_text = fwd_content["forward"].get("text", "")
+                    # 转发包内的图也进 AI 上下文（节流：每包最多 2 张）
+                    fwd_media = await _forward_images_to_media_ctx(
+                        fwd_content["forward"].get("images") or [])
+            except Exception as _fwd_err:
+                logger.debug(f"合并转发展开失败: {_fwd_err}")
+
         roster = await _build_roster(
             bot, group_id, user_id, user_name, raw_message, quoted_context
         )
         reply = await chat.chat_reply(
             group_id, user_id, user_name, chat_text,
             quoted_context=quoted_context,
-            media_context=media_ctx,
+            # media_ctx 副本 + 转发包内图片的视觉描述
+            media_context=list(media_ctx) + fwd_media,
             message_id=message_id,
             roster=roster,
             at_bot=at_bot,
             master_instructed=is_master,
+            forward_text=forward_text,
         )
         if reply:
             clean_text = await _execute_ai_actions(
@@ -2182,20 +2560,38 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                     trigger_user_qq=user_id,
                     trigger_user_name=user_name,
                 )
+            sent_bubbles = None
             if clean_text:
-                await humanizer.send_human_like(bot, group_id, clean_text, started_at=t0)
-            memory.window_add_message(group_id, int(bot.bot_qq), group_personality.get_group_bot_name(group_id), clean_text or reply)
-            # 🧠 意识：成功回复了
-            ai_brain.on_bot_replied_to(user_name)
-            # ★ Volition: 被回应了 → 被忽视计数清零（不改情绪，只清事实计数）
-            from .consciousness import reset_ignored_counter as _reset_ig, get_state as _cs_state
-            _reset_ig(_cs_state())
+                sent_bubbles = await humanizer.send_human_like(bot, group_id, clean_text, started_at=t0)
+            if sent_bubbles or not clean_text:
+                memory.window_add_message(group_id, int(bot.bot_qq), group_personality.get_group_bot_name(group_id), clean_text or reply)
+                _note_bot_reply(group_id)
+                # 🧠 意识：成功回复了
+                ai_brain.on_bot_replied_to(user_name)
+                # ★ Volition: 被回应了 → 被忽视计数清零（不改情绪，只清事实计数）
+                from .consciousness import reset_ignored_counter as _reset_ig, get_state as _cs_state
+                _reset_ig(_cs_state())
+            else:
+                # 生成成功但一条都没发出去：如实告知 AI，别让它以为自己说过话
+                _fail = getattr(humanizer, "last_send_failure", None) or {}
+                chat.note_send_failure(
+                    group_id, _fail.get("reason", ""),
+                    failed=_fail.get("failed", 0), total=_fail.get("total", 0),
+                )
         else:
             await humanizer.send_human_like(
                 bot, group_id,
                 random.choice(["等会 脑子有点卡", "卡了 待会再喊我", "刚走神了，过会再说一遍呗"]),
             )
             _clear_followup(group_id)
+
+        # 撤回查询占位消息（回复已发出或明确失败，占位完成使命）
+        if placeholder_msg_id:
+            try:
+                await asyncio.sleep(random.uniform(0.8, 1.6))
+                await bot.delete_msg(placeholder_msg_id)
+            except Exception:
+                pass
         return
 
     # ===== 没人 @ Bot → 决策是否主动回复 =====
@@ -2209,10 +2605,13 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             except Exception:
                 pass
         else:
+            # 转发可见性：主动决策同样看转发摘要，纯转发消息才有机会被接话
             should_reply, reason = await decision_engine.should_reply_to_message(
-                bot, group_id, user_id, user_name, raw_message,
+                bot, group_id, user_id, user_name,
+                _forward_aware_text(raw_message, content.get("forward")),
                 is_at_bot=False,
-                is_reply_to_bot=is_reply and quoted_context is not None,
+                # 真·回复Bot判定：群友互回不再被当成回复 Bot 触发必回分支
+                is_reply_to_bot=_is_reply_to_bot(quoted_context, bot.bot_qq),
                 quoted_context=quoted_context,
             )
             if should_reply:
@@ -2235,11 +2634,9 @@ async def _auto_reply(
         chat_msg = message
         if message and "[CQ:at,qq=" in message:
             try:
-                resolved = await _resolve_at_mentions(bot, group_id, message)
+                resolved = await _resolve_at_mentions(bot, group_id, _strip_self_at(bot, message))
                 import re as _re3
-                bot_at = f"[CQ:at,qq={bot.bot_qq}]"
-                resolved_clean = resolved.replace(bot_at, "").strip()
-                resolved_clean = _re3.sub(r"\[CQ:[^\]]+\]", "", resolved_clean).strip()
+                resolved_clean = _re3.sub(r"\[CQ:[^\]]+\]", "", resolved).strip()
                 if resolved_clean:
                     chat_msg = resolved_clean
             except Exception:
@@ -2268,8 +2665,16 @@ async def _auto_reply(
                 trigger_user_name=user_name,
             )
             if clean_text and len(clean_text) > 1:
-                await humanizer.send_human_like(bot, group_id, clean_text, started_at=t0)
-                memory.window_add_message(group_id, int(bot.bot_qq), group_personality.get_group_bot_name(group_id), clean_text)
-                logger.info(f"自主回复 [群{group_id}] -> {clean_text[:60]}...")
+                sent_bubbles = await humanizer.send_human_like(bot, group_id, clean_text, started_at=t0)
+                if sent_bubbles:
+                    memory.window_add_message(group_id, int(bot.bot_qq), group_personality.get_group_bot_name(group_id), clean_text)
+                    _note_bot_reply(group_id)
+                    logger.info(f"自主回复 [群{group_id}] -> {clean_text[:60]}...")
+                else:
+                    _fail = getattr(humanizer, "last_send_failure", None) or {}
+                    chat.note_send_failure(
+                        group_id, _fail.get("reason", ""),
+                        failed=_fail.get("failed", 0), total=_fail.get("total", 0),
+                    )
     except Exception as e:
         logger.error(f"自主回复异常: {e}")

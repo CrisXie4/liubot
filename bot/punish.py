@@ -103,7 +103,7 @@ async def punish_violation(
                 kick_approval = True
                 # 通知主人
                 try:
-                    await bot.send_private_msg(int(config.OWNER_QQ),
+                    nid = await bot.send_private_msg(int(config.OWNER_QQ),
                         f"🚨 **待审批: 踢人**\n"
                         f"群: {group_id}\n"
                         f"用户: {user_name}({user_id})\n"
@@ -112,6 +112,7 @@ async def punish_violation(
                         f"回复 \"同意 {aid}\" 执行踢人\n"
                         f"回复 \"拒绝 {aid}\" 取消"
                     )
+                    guardian.set_notify_msg(aid, nid)
                 except Exception:
                     pass
             except Exception as e:

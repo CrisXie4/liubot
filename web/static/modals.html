@@ -58,9 +58,9 @@
 <!-- 关键词 -->
 <div class="modal-bg" id="m-kw">
   <div class="modal">
-    <h3>添加关键词</h3>
-    <div class="fg"><label>关键词</label><input id="kw-w"></div>
-    <div class="fg"><label>权重</label><input type="number" id="kw-v" step="0.1" value="3"></div>
+    <h3>添加违规词</h3>
+    <div class="fg"><label>词语</label><input id="kw-w"></div>
+    <div class="fg"><label>风险权重（0-10，越高越严重）</label><input type="number" id="kw-v" step="0.1" value="3"></div>
     <div class="actions">
       <button class="btn" onclick="closeModal('m-kw')">取消</button>
       <button class="btn pri" onclick="kwSave()">添加</button>
@@ -68,14 +68,14 @@
   </div>
 </div>
 
-<!-- 训练 -->
+<!-- 审核样本 -->
 <div class="modal-bg" id="m-tr">
   <div class="modal">
-    <h3>添加训练样本</h3>
-    <div class="fg"><label>消息</label><textarea id="tr-msg" rows="3"></textarea></div>
+    <h3>添加审核样本</h3>
+    <div class="fg"><label>消息内容</label><textarea id="tr-msg" rows="3"></textarea></div>
     <div class="fr">
-      <div class="fg"><label>标签</label><select id="tr-label"><option value="violation">违规</option><option value="normal">正常</option></select></div>
-      <div class="fg"><label>分类</label><input id="tr-cat"></div>
+      <div class="fg"><label>判定</label><select id="tr-label"><option value="violation">违规</option><option value="normal">正常</option></select></div>
+      <div class="fg"><label>分类（如：广告 / 引战）</label><input id="tr-cat"></div>
     </div>
     <div class="actions">
       <button class="btn" onclick="closeModal('m-tr')">取消</button>

@@ -1,7 +1,10 @@
-<!-- LLM MOD -->
+<!-- LLM MOD (AI 审核) -->
+<p class="muted" style="font-size:13px;margin:0 0 14px">
+  规则审核拿不准的消息交给 AI 复核，两道判定结合得出最终结果。适合识别换了说法的新广告。
+</p>
 <div class="stats" id="llm-stats"></div>
 <div class="card panel">
-  <div class="panel-h">LLM 审核测试</div>
+  <div class="panel-h">AI 审核测试</div>
   <div class="panel-b">
     <div class="fr">
       <div class="fg"><input id="llm-test" placeholder="输入测试消息"></div>
@@ -13,7 +16,7 @@
 <div class="card panel">
   <div class="panel-h">审核日志</div>
   <div class="panel-b np"><div class="tw"><table class="tbl" id="llm-log-tbl">
-    <thead><tr><th>时间</th><th>消息</th><th class="num">KW</th><th>LLM</th><th class="num">LLM 置信</th><th>结果</th><th class="num">耗时</th></tr></thead>
+    <thead><tr><th>时间</th><th>消息</th><th class="num">规则置信</th><th>AI 判定</th><th class="num">AI 置信度</th><th>最终结果</th><th class="num">耗时</th></tr></thead>
     <tbody></tbody>
   </table></div></div>
 </div>

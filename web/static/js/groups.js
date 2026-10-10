@@ -7,7 +7,7 @@ let _gmAll = [];
 async function gmLoad() {
   const gid = $('gm-gid').value;
   if (!gid) {
-    empty('#gm-tbl', '👥', '请选择群');
+    empty('#gm-tbl', 'team', '请选择群');
     _gmAll = [];
     $('gm-info').textContent = '';
     return;
@@ -26,7 +26,7 @@ async function gmLoad() {
 function gmRender() {
   const gid = $('gm-gid').value;
   if (!gid || !_gmAll.length) {
-    empty('#gm-tbl', '👥', '请选择群');
+    empty('#gm-tbl', 'team', '请选择群');
     return;
   }
   const q = ($('gm-search')?.value || '').toLowerCase();
@@ -38,7 +38,7 @@ function gmRender() {
       )
     : _gmAll;
   if (!list.length) {
-    empty('#gm-tbl', '🔍', '没有匹配的成员');
+    empty('#gm-tbl', 'search', '没有匹配的成员');
     return;
   }
   tbody('#gm-tbl').innerHTML = list.map(m => {

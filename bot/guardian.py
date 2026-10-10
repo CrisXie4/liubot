@@ -132,6 +132,15 @@ def create_action_request(
         }
     return aid
 
+def has_pending_action(group_id: int, user_qq: int, action: str = "") -> bool:
+    """同一目标同一动作已有待审批 → True（防止扫描每轮重复建审批）"""
+    with _pending_lock:
+        for a in _pending_actions.values():
+            if a.get("group_id") == group_id and a.get("user_qq") == user_qq                     and (not action or a.get("action") == action):
+                return True
+    return False
+
+
 def get_pending_actions() -> list[dict]:
     """获取所有待审批操作"""
     with _pending_lock:
@@ -146,6 +155,26 @@ def reject_action(action_id: str) -> Optional[dict]:
     """拒绝操作"""
     with _pending_lock:
         return _pending_actions.pop(action_id, None)
+
+
+def set_notify_msg(action_id: str, message_id) -> None:
+    """登记发给主人的待审批通知消息 ID，处理后用于撤回"""
+    if not message_id:
+        return
+    with _pending_lock:
+        if action_id in _pending_actions:
+            _pending_actions[action_id]["notify_msg_id"] = message_id
+
+
+async def recall_notify(bot, detail: dict) -> None:
+    """审批处理完毕后撤回待审批通知（超过 QQ 撤回时限会静默失败，不影响流程）"""
+    mid = detail.get("notify_msg_id")
+    if not mid:
+        return
+    try:
+        await bot.delete_msg(int(mid))
+    except Exception:
+        pass
 
 
 # ==================== 分级裁判闸门（通用） ====================
@@ -397,11 +426,11 @@ def check_at_all_rate(group_id: int) -> bool:
 
 
 def check_essence_rate(group_id: int) -> bool:
-    """自主设精华限速：每群每天 N 次"""
+    """自主设精华限速：每群每天 N 次（LLM 判定后标准变严，默认配额收紧到 2）"""
     cfg = load_config().get("thresholds", {})
     return _check_rate(
         group_id, "essence", 24,
-        cfg.get("essence_daily_per_group", 5),
+        cfg.get("essence_daily_per_group", 2),
     )
 
 

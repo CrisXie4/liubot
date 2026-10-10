@@ -13,7 +13,7 @@ async function schLoad() {
       <td class="mono">${esc(s.cron || s.interval || '')}</td>
       <td><button class="btn xs danger" onclick="schDel(${s._idx})">删除</button></td>
     </tr>`,
-    '⏰', '还没有定时任务');
+    'clock-circle', '还没有定时任务');
 }
 
 function schAdd() {

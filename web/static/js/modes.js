@@ -7,7 +7,7 @@ async function modesLoad() {
   try {
     const [gs, ms] = await Promise.all([loadGroups(), api('/group-modes')]);
     if (!gs.length) {
-      empty('#modes-tbl', '⚖️', '尚未加入任何群');
+      empty('#modes-tbl', 'control', '尚未加入任何群');
       return;
     }
     const modes = ms.modes || {};

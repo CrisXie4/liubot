@@ -1,8 +1,17 @@
-<!-- KEYWORDS -->
+<!-- RISK WORDS -->
+<p class="muted" style="font-size:13px;margin:0 0 14px">
+  违规词库：系统从违规记录里自动积累，也可以手动补充。命中词越多、权重越高，消息被判违规的可能性越大（权重上限 10）。
+</p>
 <div class="card panel">
-  <div class="panel-h"><div class="search-box"><input id="kw-search" placeholder="搜索" oninput="kwLoad()"></div></div>
+  <div class="panel-h">
+    <div class="search-box"><input id="kw-search" placeholder="搜索" oninput="kwLoad()"></div>
+    <span style="margin-left:auto;display:flex;gap:8px">
+      <button class="btn xs" onclick="kwCleanup()">清理低权重</button>
+      <button class="btn xs pri" onclick="kwAdd()">＋ 添加词语</button>
+    </span>
+  </div>
   <div class="panel-b np"><div class="tw"><table class="tbl" id="kw-tbl">
-    <thead><tr><th>关键词</th><th class="num">权重</th><th style="width:60px"></th></tr></thead>
+    <thead><tr><th>词语</th><th class="num">风险权重</th><th style="width:60px"></th></tr></thead>
     <tbody></tbody>
   </table></div></div>
 </div>

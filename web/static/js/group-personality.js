@@ -6,13 +6,13 @@ async function gpLoad() {
   await fillTable('#gp-tbl', async () => (await api('/group-personalities')).items,
     g => `<tr>
       <td class="num">${g.group_id}</td>
-      <td>${esc(g.bot_name || '<span class="muted">默认</span>')}</td>
-      <td>${esc(g.personality || '<span class="muted">默认</span>')}</td>
+      <td>${g.bot_name ? esc(g.bot_name) : '<span class="muted">默认</span>'}</td>
+      <td>${g.personality ? esc(g.personality) : '<span class="muted">默认</span>'}</td>
       <td class="num">${g.reply_frequency || 0.5}</td>
       <td>${esc((g.quirks || []).join(', ') || '-')}</td>
       <td><button class="btn xs" onclick="gpEdit(${g.group_id})">编辑</button></td>
     </tr>`,
-    '👤', '还没有群人设');
+    'user', '还没有群人设');
 }
 
 async function gpEdit(gid) {

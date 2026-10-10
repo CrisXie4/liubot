@@ -5,6 +5,8 @@
 AI 可通过 tool_use 调用 web_search 获取最新信息。
 """
 import logging
+import os
+import re
 from typing import Optional
 from urllib.parse import quote
 
@@ -14,8 +16,8 @@ from .config import config
 
 logger = logging.getLogger("qqbot")
 
-# SearXNG 地址
-SEARXNG_URL = "http://85.137.245.172:8080"
+# SearXNG 地址（可用 .env 的 SEARXNG_URL 覆盖；服务器 IP 变动时改 env 不用改代码）
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://127.0.0.1:8080")
 
 # ─── Tool Definition（Anthropic tool_use 格式）───
 SEARCH_TOOL = {
@@ -65,6 +67,12 @@ async def search(query: str, max_results: int = 5,
                     formatted = _format_results(results)
                     if max_age_days is not None:
                         formatted = _filter_by_age(formatted, max_age_days)
+                    if not formatted:
+                        # 0 结果时把引擎异常暴露出来（上游 CAPTCHA/限流一眼可查）
+                        unresp = data.get("unresponsive_engines") or []
+                        if unresp:
+                            logger.warning(
+                                f"SearXNG 0 结果，上游引擎异常: {unresp}")
                     logger.info(f"SearXNG JSON: '{query}' → {len(formatted)} 条")
                     return formatted
                 except Exception:
@@ -206,9 +214,50 @@ async def search_and_format(query: str, max_results: int = 5) -> str:
 
 
 async def search_recent(query: str, max_age_days: int = 7, max_results: int = 5) -> list[dict]:
-    """便捷封装：默认只搜最近一周"""
-    return await search(query, max_results=max_results,
-                        time_range="week", max_age_days=max_age_days)
+    """便捷封装：结果按 max_age_days 做新鲜度过滤。
+
+    注意：不要传 time_range——实测 SearXNG 的 bing 引擎对中文查询 +
+    time_range=week 恒返回 0 条（2026-09-06 排障结论）；
+    新鲜度由 _filter_by_age 按 publishedDate 二次过滤兜底。
+
+    韧性：白天 SearXNG 上游引擎被限流时经常 0 结果——此时换措辞
+    （去掉尾部时间限定词用 topic 裸词，或给裸词补当月月份词）重试一次，
+    仍 0 才返回空。签名与返回形状不变，调用方零改动。
+    """
+    results = await search(query, max_results=max_results,
+                           max_age_days=max_age_days)
+    if results:
+        return results
+
+    # 0 结果 → 换措辞重试一次
+    bare = _strip_time_qualifier(query)
+    if not bare:
+        # 整个查询都是限定词，没法换措辞
+        return results
+    retry_query = bare if bare != (query or "").strip() else f"{bare} {_month_qualifier()}"
+    logger.info(f"SearXNG 0 结果，换措辞重试: '{query}' → '{retry_query}'")
+    return await search(retry_query, max_results=max_results,
+                        max_age_days=max_age_days)
+
+
+# 查询尾部可剥的时间限定词（含动态月份词，如"10月"；与 ai_brain 的 angle 池同族）
+_TIME_QUALIFIER_RE = re.compile(r"(最新|今天|本周|最近|今年|去年|昨日|上周|上月|20\d{2}|\d{1,2}月)\s*$")
+
+
+def _strip_time_qualifier(query: str) -> str:
+    """去掉查询尾部的"最新/本周/10月"之类时间限定词，得到 topic 裸词。"""
+    q = (query or "").strip()
+    prev = None
+    while prev != q and q:
+        prev = q
+        q = _TIME_QUALIFIER_RE.sub("", q).strip()
+    return q
+
+
+def _month_qualifier() -> str:
+    """当前月份限定词（如"10月"），用权威上海时间动态生成。"""
+    from . import timeutil
+    return f"{timeutil.now_shanghai().month}月"
 
 
 # ─── 搜索结果缓存 ───

@@ -2,7 +2,7 @@
 消息引用/回复处理模块
 - 解析被引用的消息内容
 - AI 可使用引用格式回复
-- 支持引用文本、图片、视频
+- 支持引用文本、图片、视频、合并转发
 """
 import logging
 from typing import Optional
@@ -13,43 +13,12 @@ from .onebot_client import OneBotClient
 logger = logging.getLogger("qqbot")
 
 
-def build_reply_cq(message_id: int) -> str:
-    """构建回复引用 CQ 码"""
-    return f"[CQ:reply,id={message_id}]"
-
-
-def build_quote_reply(message_id: int, text: str) -> str:
-    """构建带引用的回复消息"""
-    return f"{build_reply_cq(message_id)}{text}"
-
-
-def extract_reply_id(message: list[dict]) -> Optional[int]:
-    """从消息段中提取被引用的消息 ID"""
-    for seg in message:
-        if seg.get("type") == "reply":
-            try:
-                return int(seg["data"].get("id", 0))
-            except (ValueError, TypeError):
-                pass
-    return None
-
-
-def extract_reply_text(message: list[dict]) -> Optional[str]:
-    """从消息段中提取被引用消息的文本（如果有 text 段）"""
-    # OneBot 回复段可能包含被引用消息的文本片段
-    for seg in message:
-        if seg.get("type") == "reply":
-            text = seg.get("data", {}).get("text", "")
-            if text:
-                return text
-    return None
-
-
 async def get_quoted_context(bot: OneBotClient, reply_msg_id: int) -> Optional[dict]:
     """
     获取被引用消息的完整上下文。
     返回: {"sender_qq": xxx, "sender_name": "xxx", "text": "xxx",
-           "has_image": bool, "has_video": bool, "raw_message": "xxx"}
+           "has_image": bool, "has_video": bool, "raw_message": "xxx",
+           "forward_text"?: 被引合并转发的展开内容, "image_desc"?: 被引图片的视觉描述}
     """
     try:
         msg_data = await bot.get_msg(reply_msg_id)
@@ -66,7 +35,7 @@ async def get_quoted_context(bot: OneBotClient, reply_msg_id: int) -> Optional[d
         has_video = "[CQ:video" in raw
         has_face = "[CQ:face" in raw or "[CQ:mface" in raw
 
-        return {
+        result = {
             "sender_qq": sender_qq,
             "sender_name": sender_name,
             "message_id": reply_msg_id,
@@ -76,6 +45,30 @@ async def get_quoted_context(bot: OneBotClient, reply_msg_id: int) -> Optional[d
             "has_face": has_face,
             "raw_message": raw,
         }
+
+        # 被引用的是合并转发 → 展开内容给 AI（text 键保持原 raw 不动）
+        if "[CQ:forward,id=" in raw:
+            try:
+                from . import content_reader as _cr
+                fwd = await _cr.extract_full_content(bot, raw, [])
+                fwd_text = ((fwd or {}).get("forward") or {}).get("text", "") or ""
+                if fwd_text:
+                    result["forward_text"] = fwd_text[:500]
+            except Exception as e:
+                logger.debug(f"引用的转发内容展开失败: {e}")
+
+        # 被引用的是图片 → 补视觉描述（get_quoted_media_description 内部走
+        # describe_image，自带 &amp; 反转义与 24h 缓存，同一张图只烧一次配额）
+        if has_image:
+            try:
+                from . import media_reader as _mr
+                desc = await _mr.get_quoted_media_description(raw)
+                if desc:
+                    result["image_desc"] = desc[:200]
+            except Exception as e:
+                logger.debug(f"引用图片视觉描述失败: {e}")
+
+        return result
     except Exception as e:
         logger.warning(f"获取引用消息内容失败: {e}")
         return None
@@ -106,5 +99,15 @@ def format_quoted_context_for_ai(quoted: dict) -> str:
     id_str = f" [消息ID={mid}]" if mid else ""
 
     parts.append(f"他引用了 {sender} 的这条消息{media_str}{id_str}:\n> {text[:300]}")
+
+    # 被引的图片有视觉描述 → 附在媒体标记旁（AI 才知道图里是什么）
+    image_desc = (quoted.get("image_desc") or "").strip()
+    if image_desc:
+        parts.append(f"图片内容: {image_desc}")
+
+    # 被引用的是合并转发 → 附展开内容（独立截断，不受上面 text[:300] 影响）
+    forward_text = (quoted.get("forward_text") or "").strip()
+    if forward_text:
+        parts.append(f"> [转发记录] {forward_text}")
 
     return "\n".join(parts)

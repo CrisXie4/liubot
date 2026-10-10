@@ -47,20 +47,25 @@
 /* ─── 登录页 ─── */
 .login-bg {
   position: fixed; inset: 0; z-index: 999;
-  background: linear-gradient(135deg, #f5f3ee 0%, #e9e6df 100%);
+  background:
+    radial-gradient(620px 420px at 85% 12%, rgba(47, 111, 87, .09), transparent 62%),
+    radial-gradient(520px 380px at 8% 92%, rgba(47, 111, 87, .07), transparent 62%),
+    linear-gradient(160deg, #f6f7f5 0%, #ebedeb 100%);
   display: flex; align-items: center; justify-content: center;
 }
 .login-card {
   background: var(--bg2);
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 16px;
   padding: 40px 36px;
   width: 380px; max-width: 92vw;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, .05);
+  box-shadow: 0 24px 60px rgba(28, 45, 38, .09), 0 2px 8px rgba(28, 45, 38, .04);
 }
 .login-card .brand-mark {
   width: 44px; height: 44px;
-  border-radius: 11px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--accent2), var(--accent));
+  box-shadow: 0 4px 12px rgba(47, 111, 87, .3);
   margin-bottom: 20px; font-size: 19px;
 }
 .login-card h2 {
@@ -98,4 +103,9 @@
 /* ─── 仪表盘：快控区 ─── */
 .quick-card {
   border-left: 3px solid var(--accent);
+}
+
+/* ─── 页面顶部说明文字 ─── */
+.section > p.muted {
+  max-width: 860px;
 }

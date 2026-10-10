@@ -25,7 +25,7 @@ DEFAULT_SENSITIVE_WORDS = {
     # 广告类
     "广告", "推广", "加群", "加我", "免费领取", "点击链接",
     "扫码", "兼职", "日赚", "刷单", "返利", "代理", "微商",
-    "引流", "私聊我", "加微信", "加QQ", "看主页",
+    "引流", "加微信", "加QQ", "看主页",
     # 辱骂/人身攻击
     "傻逼", "sb", "脑残", "废物", "垃圾", "cnm", "操你妈",
     "他妈", "草泥马", "nmsl", "司马", "畜生", "狗日的",
@@ -372,7 +372,7 @@ async def handle_violation(
         )
         # 通知主人审批
         try:
-            await bot.send_private_msg(int(_cfg.OWNER_QQ),
+            nid = await bot.send_private_msg(int(_cfg.OWNER_QQ),
                 f"🚨 **待审批: 踢人（手动标记累计）**\n"
                 f"群: {group_id}\n"
                 f"用户: {violator_name}({violator_qq})\n"
@@ -381,6 +381,7 @@ async def handle_violation(
                 f"回复 \"同意 {aid}\" 执行踢人\n"
                 f"回复 \"拒绝 {aid}\" 取消"
             )
+            guardian.set_notify_msg(aid, nid)
         except Exception:
             pass
         # 群里也发一条提示（不自动踢，等主人确认）

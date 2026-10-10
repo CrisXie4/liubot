@@ -19,6 +19,7 @@ logger = logging.getLogger("qqbot")
 FORWARD_DEPTH_LIMIT = 3
 FORWARD_SUBMSG_LIMIT = 50
 FORWARD_CACHE_TTL = 300  # 5 分钟
+FORWARD_CACHE_MAX = 300  # 缓存条数上限（长驻进程防 resId 只增不删，超限清最旧）
 
 # resId → (result_text, ts)
 _forward_cache: dict[str, tuple] = {}
@@ -200,4 +201,9 @@ async def _unfold_forward(bot, forward_id: str, depth: int) -> tuple:
     combined = "\n".join(text_parts)
     # 写缓存
     _forward_cache[forward_id] = (combined, images, stickers, time.time())
+    # 条数上限：超过就按写入时间清最旧的（TTL 惰性过期挡不住长驻进程涨内存）
+    if len(_forward_cache) > FORWARD_CACHE_MAX:
+        oldest = sorted(_forward_cache, key=lambda k: _forward_cache[k][3])
+        for k in oldest[:len(_forward_cache) - FORWARD_CACHE_MAX]:
+            _forward_cache.pop(k, None)
     return (combined, images, stickers, nested, count, errors)

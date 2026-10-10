@@ -8,11 +8,12 @@ async function vLoad(p = 1) {
   _vPage = p;
   loading('#v-tbl');
   try {
-    const src = $('v-src').value;
+    const srcEl = $('v-src');
+    const src = srcEl ? srcEl.value.trim() : '';
     const d = await api(`/violations?page=${p}&page_size=30` + (src ? `&source=${src}` : ''));
     const items = d.items || d.records || [];
     if (!items.length) {
-      empty('#v-tbl', '✅', '没有违规记录');
+      empty('#v-tbl', 'check-circle', '没有违规记录');
       $('v-pager').innerHTML = '';
       const del = $('v-del'); if (del) del.disabled = true;
       return;

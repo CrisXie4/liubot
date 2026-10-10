@@ -9,10 +9,10 @@ async function csLoad() {
     const statsEl = $('cs-stats');
     if (statsEl) {
       statsEl.innerHTML =
-        statCard('🌡️', (d.mood_score_pct || 0) + '%', '心情', d.mood_score > 0.6 ? 'ok' : d.mood_score > 0.4 ? 'warn' : 'muted') +
-        statCard('📨', t.messages_sent || 0, '今日发言', '') +
-        statCard('👋', t.interactions || 0, '今日互动', '') +
-        statCard('😴', d.sleeping ? '是' : '否', '睡觉中', d.sleeping ? 'warn' : 'ok');
+        statCard('smile', (d.mood_score_pct || 0) + '%', '心情', d.mood_score > 0.6 ? 'ok' : d.mood_score > 0.4 ? 'warn' : 'muted') +
+        statCard('send', t.messages_sent || 0, '今日发言', '') +
+        statCard('user', t.interactions || 0, '今日互动', '') +
+        statCard('clock-circle', d.sleeping ? '是' : '否', '睡觉中', d.sleeping ? 'warn' : 'ok');
     }
 
     const emoKeys = ['joy', 'energy', 'calm', 'curiosity', 'social', 'satisfaction', 'boredom', 'loneliness', 'irritation'];

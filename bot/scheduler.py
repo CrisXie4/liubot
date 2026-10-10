@@ -69,9 +69,12 @@ class Scheduler:
                 glist = await groups.fetch_groups()
                 for g in glist:
                     gid = g["group_id"]
-                    warnings = await handler.check_member_names(_bot.bot_instance, gid)
-                    if warnings:
-                        logger.info(f"名片扫描: 群{gid} 发现 {len(warnings)} 个违规名片")
+                    result = await handler.check_member_names(_bot.bot_instance, gid)
+                    # check_member_names 返回 {"warnings": [...], "actions": [...]}
+                    warns = result.get("warnings") if isinstance(result, dict) else result
+                    if warns:
+                        preview = ' | '.join(str(w).splitlines()[0] for w in warns[:3])
+                        logger.info(f"名片扫描: 群{gid} 发现 {len(warns)} 个违规名片: {preview[:300]}")
             except Exception as e:
                 logger.warning(f"名片扫描异常: {e}")
 

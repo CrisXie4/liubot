@@ -8,10 +8,10 @@ async function stLoad() {
     const el = $('st-stats');
     if (el) {
       el.innerHTML =
-        statCard('📦', s.total || 0, '收藏总数', '') +
-        statCard('😀', s.by_type?.face || 0, 'QQ 表情', '') +
-        statCard('🖼️', s.by_type?.image || 0, '图片', '') +
-        statCard('🔥', s.most_used?.[0]?.use_count || 0, '最高使用', '');
+        statCard('cloud', s.total || 0, '收藏总数', '') +
+        statCard('smile', s.by_type?.face || 0, 'QQ 表情', '') +
+        statCard('picture', s.by_type?.image || 0, '图片', '') +
+        statCard('fire', s.most_used?.[0]?.use_count || 0, '最高使用', '');
     }
   } catch {}
   await fillTable('#st-tbl', async () => (await api('/stickers?limit=100')).items,

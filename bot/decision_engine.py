@@ -23,6 +23,7 @@ logger = logging.getLogger("qqbot")
 # 全局冷却控制（防止 Bot 刷屏）
 _last_reply_time: dict[int, float] = {}
 GLOBAL_COOLDOWN = 10  # 全局冷却（秒）— 会话态下可以接得密一点
+FOLLOWUP_COOLDOWN = 3  # 会话态冷却：真人聊天是乒乓的，间隔几秒很正常
 
 # 注：旧版 decision_engine 维护自己独立的 _bot_mood，跟 consciousness 的多维
 # 情绪系统打架。现已统一——consciousness 是唯一权威，get_bot_mood 只读映射。
@@ -90,14 +91,21 @@ async def should_reply_to_message(
     is_at_bot: bool = False,
     is_reply_to_bot: bool = False,
     quoted_context: Optional[dict] = None,
+    in_followup: bool = False,
+    bot_last_reply_ts: float = 0.0,
 ) -> tuple[bool, str]:
     """
     决定 Bot 是否应该回复这条消息。
 
     三级决策:
       1. 确定性回复 — 被@、明确求助、聊到Bot自己 → 必回
-      2. 高概率回复 — 有问题特征、情绪表达 → 大概率回
+      2. 热对话/高概率回复 — 刚跟Bot聊过的人接话、有问题特征、情绪表达 → 大概率回
       3. 随机回复 — 普通闲聊 → 按概率碰运气
+
+    Args:
+        in_followup: 发送者是否在本群的活跃会话中（之前刚和 Bot 聊过）
+        bot_last_reply_ts: Bot 在该群最后一次发言的时间戳（0 表示未知），
+            用于"热对话"判断——对方刚回完你，你接着说，他大概率继续接。
 
     Returns:
         (should_reply: bool, reason: str) — reason 用于日志
@@ -107,10 +115,11 @@ async def should_reply_to_message(
     if is_at_bot:
         return True, "被@提及"
 
-    # 检查冷却
+    # 检查冷却（会话态对话者用短冷却——乒乓对话间隔常常不到 10 秒）
     now = time.time()
     cooldown = _last_reply_time.get(group_id, 0)
-    if now - cooldown < GLOBAL_COOLDOWN:
+    effective_cooldown = FOLLOWUP_COOLDOWN if in_followup else GLOBAL_COOLDOWN
+    if now - cooldown < effective_cooldown:
         return False, "全局冷却中"
 
     # 获取群设置和Bot名字
@@ -130,6 +139,17 @@ async def should_reply_to_message(
         influence.track_interaction(group_id, user_qq, user_name, "bot_replied_to")
         return True, f"提到Bot({bot_name_hit})"
 
+    # ── 入群避让：新人刚被验证出题时不再插话 ──
+    # 验证系统已单行 @ 出题，AI 对"XX 进群了？"再补一句欢迎就是连环刷屏（09-25 反馈）。
+    # 被 @ 仍走上面必回；这里拦的是把闲聊入群当"明确求助"必回的情况。
+    try:
+        from .verify import get_recent_joins
+        for _uid, _name in get_recent_joins(group_id):
+            if _name and len(_name) >= 2 and _name in message:
+                return False, "入群避让(新人刚被出题)"
+    except Exception:
+        pass
+
     # 1b. 明确求助/提问 → 必回
     is_question, question_type = _is_clear_question(message)
     if is_question:
@@ -144,6 +164,23 @@ async def should_reply_to_message(
         _last_reply_time[group_id] = now
         influence.track_interaction(group_id, user_qq, user_name, "bot_replied_to")
         return True, "回复了Bot的消息"
+
+    # ── 第 1.5 级：热对话续聊（修复"聊着聊着就不回了"）──
+    # 会话态用户在 Bot 发言后短时间内接话（纠正、补充、接梗），
+    # 间隔越短回复概率越高——真人聊天是乒乓的，不该按 15% 冷启动骰子算。
+    if in_followup and bot_last_reply_ts > 0:
+        since_bot = now - bot_last_reply_ts
+        if since_bot < 60:
+            hot_prob = 0.85
+        elif since_bot < 180:
+            hot_prob = 0.60
+        else:
+            hot_prob = 0.0
+        if hot_prob and random.random() < hot_prob:
+            update_bot_mood(group_id, -0.03)
+            _last_reply_time[group_id] = now
+            influence.track_interaction(group_id, user_qq, user_name, "bot_replied_to")
+            return True, f"热对话续聊(Bot刚说完{since_bot:.0f}s, p={hot_prob:.0%})"
 
     # ── 第二级：高概率回复 ──
     content_score = _score_message_relevance(message)

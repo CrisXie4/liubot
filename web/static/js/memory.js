@@ -8,9 +8,9 @@ async function memLoad() {
     const el = $('mem-stats');
     if (el) {
       el.innerHTML =
-        statCard('👤', s.total_profiles || 0, '用户画像', '') +
-        statCard('💬', s.total_memories || 0, '对话记忆', '') +
-        statCard('📌', s.total_facts || 0, '知识碎片', '');
+        statCard('user', s.total_profiles || 0, '用户画像', '') +
+        statCard('message', s.total_memories || 0, '对话记忆', '') +
+        statCard('tags', s.total_facts || 0, '知识碎片', '');
     }
   } catch {}
   await fillTable('#mem-tbl', async () => {

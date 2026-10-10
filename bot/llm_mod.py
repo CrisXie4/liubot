@@ -140,27 +140,17 @@ def _build_moderation_prompt(
         pass
 
     # ── 组装 prompt ──
-    prompt = f"""你是一个QQ群内容审核专家。请判断以下消息是否违规。
-
-【已知敏感词库（从历史违规实时学习，权重越高越危险）】
-{kw_lib_text}
-
-【已知的违规模式】
-{pat_text}
-
-【本条消息命中的敏感词】
-{hit_text if hit_text else "（无关键词直接命中，但仍需结合敏感词库和上下文判断）"}
-
-【最近被标记的违规案例（参考）】
-{recent_cases_text}
-
-【待审核消息】
-「{raw_message[:500]}」
+    # ★ 缓存命中率优化：判断标准/排除规则/输出格式是每次审核都一样的稳定
+    # 前缀，放最前面吃 DeepSeek/Anthropic 的前缀缓存；每次都变的词库/模式/
+    # 命中/案例/待审消息全部放尾部。审核是全量抽样的高频调用，这个重排
+    # 能把每次几百 token 的固定开销变成缓存命中价。
+    prompt = f"""你是一个QQ群内容审核专家。请按以下标准判断最后给出的【待审核消息】是否违规。
 
 【判断标准】
 - 消息含"高危词"或命中多个"可疑词" → 很可能违规
 - 只有明确的广告推广、色情低俗、赌博诈骗、辱骂攻击才算违规
 - 正常的日常聊天、技术讨论、开玩笑不算违规
+- 「收/出」类正常交易帖（收key、出账号、拼车、闲置出）是本群允许的正常业务，不算违规不算广告
 - 如果消息同时满足多个条件（如既含敏感词又有链接/QQ号），更可能是违规
 - 注意变形词和拼音替换（如"vx"="微信"、"jq"="加群"、emoji 替代敏感字）
 
@@ -180,7 +170,24 @@ def _build_moderation_prompt(
 - "kick": 严重违规或屡犯
 
 请只输出一行JSON（不要markdown包裹）:
-{{"is_violation": true或false, "reason": "15字内简述", "confidence": 0.00到1.00, "category": "ad/spam/abuse/porn/gamble/normal", "suggested_action": "none/warn/mute/kick"}}"""
+{{"is_violation": true或false, "reason": "15字内简述", "confidence": 0.00到1.00, "category": "ad/spam/abuse/porn/gamble/normal", "suggested_action": "none/warn/mute/kick"}}
+
+—— 以下为本次审核的数据 ——
+
+【已知敏感词库（从历史违规实时学习，权重越高越危险）】
+{kw_lib_text}
+
+【已知的违规模式】
+{pat_text}
+
+【本条消息命中的敏感词】
+{hit_text if hit_text else "（无关键词直接命中，但仍需结合敏感词库和上下文判断）"}
+
+【最近被标记的违规案例（参考）】
+{recent_cases_text}
+
+【待审核消息】
+「{raw_message[:500]}」"""
     return prompt
 
 # ═══════════════════════════════════════════════════════════

@@ -116,12 +116,19 @@ VISION_MODERATION_PROMPT = """你是一个QQ群内容审核助手。请仔细检
 - AI 模型/服务的正常讨论（GPT、Claude、DeepSeek 等）
 - 编程语言/框架的官方文档截图
 - 任何人分享"如何使用某个工具/服务"的教程截图
+- 个人支付/转账凭证截图：微信/支付宝/银行的付款页、扫码支付页、转账成功页、
+  账单详情、红包记录——群友分享**自己的**支付凭证（特征：截图形式、含浏览器
+  界面/金额/订单号/支付确认 UI）是正常聊天内容。即使支付页面周围有广告横幅
+  或可疑域名，也不是发图者在打广告
 
 以下才是真正的广告（is_violation=true）：
 - 明显售卖/推广：加群/加微信引流、付费推广链接
 - 金钱诱惑：日赚/返利/刷单/兼职招聘
 - 带有价格和购买方式的商品推销
 - 大量群号/微信号刷屏
+- 收款二维码本身作为广告发布，并配引流话术（加微信、私聊、扫码进群、
+  套现代办等），目的是让群友扫码付钱——注意与上面"分享自己的支付凭证截图"
+  区分：凭证是已完成的交易记录，广告是招揽别人付款
 
 请以 JSON 格式回复（只输出 JSON）：
 {
@@ -131,6 +138,36 @@ VISION_MODERATION_PROMPT = """你是一个QQ群内容审核助手。请仔细检
   "ocr_text": "图片中所有文字内容，逐字读出，不要省略",
   "reason": "简短判断理由（20字以内）"
 }"""
+
+# ── 个人支付凭证防误判 ──
+# 线上案例(2026-08-17): 群友分享自己的微信支付截图被判 advertising(82%) → 撤回+禁言1h；
+# 同类截图另几次又判 normal，说明模型在这类图上随机摇摆。
+# 防护：AI 判 advertising，但依据文本呈现"支付凭证特征"且无引流话术 → 降级为 normal。
+_PAYMENT_RECEIPT_EVIDENCE = re.compile(
+    r"扫码支付|支付页面|付款页面|收款页面|支付成功|付款成功|转账成功|转账记录|"
+    r"交易单号|商户单号|订单号|账单|红包|零钱明细|支付凭证|支付报错|支付页"
+)
+_AD_SOLICIT_WORDS = re.compile(
+    r"加微信|加群|加[vv]|私聊|联系我|联系方式|日赚|佣金|兼职|刷单|返利|套现|"
+    r"招代理|代理加盟|低价出售|名额有限|扫码进群|秒到账|秒到|代付|回收|招商"
+)
+
+
+def _payment_receipt_guard(result: dict, text_basis: str) -> dict:
+    """个人支付凭证截图防误判：支付凭证特征明显 + 无引流话术 → advertising 降级为 normal。"""
+    if not isinstance(result, dict) or not result.get("is_violation"):
+        return result
+    if result.get("violation_type") != "advertising":
+        return result
+    text = text_basis or ""
+    if _PAYMENT_RECEIPT_EVIDENCE.search(text) and not _AD_SOLICIT_WORDS.search(text):
+        logger.info(f"图片审核防误判: 个人支付凭证截图 → 降级为 normal（依据: {text[:50]}）")
+        return {**result,
+                "is_violation": False,
+                "confidence": 0.3,
+                "reason": "个人支付凭证截图，非广告"}
+    return result
+
 
 # ═══════════════════════════════════════════════════════════
 #  MiniMax 多模态审核
@@ -170,72 +207,91 @@ async def review_image_with_ai(
     if model is None:
         logger.debug("图片审核跳过: 无 API key")
         return None
+    # model 现在只是占位，llm_create 会用 provider 自己的 model 覆盖
 
-    # 获取图片 base64 数据
+    # ★ 先查 media_reader 的图片描述缓存：命中则直接做文本审核，
+    # 不再下载图片、不再调 vision（同图去重，节省额度和带宽）
+    cached_desc = None
+    if image_url:
+        try:
+            from . import media_reader as _mr
+            cached_desc = _mr.get_cached_description(image_url)
+        except Exception:
+            pass
+
+    # 获取图片 base64 数据（缓存命中时跳过）
     img_b64 = None
     media_type = "image/jpeg"
 
-    if file_id and bot and bot._ws:
-        try:
-            r = await bot._call("get_image", {"file": file_id})
-            if r.get("status") == "ok":
-                data = r.get("data", {})
-                b64 = data.get("data", data.get("file", ""))
-                if b64:
-                    # 修复 padding
-                    padding = 4 - len(b64) % 4
-                    if padding != 4:
-                        b64 += "=" * padding
-                    # 验证是否为有效 base64
-                    try:
-                        base64.b64decode(b64)
-                        img_b64 = b64
-                    except Exception:
-                        # 可能是 URL 而不是 base64
-                        image_url = b64 if b64.startswith("http") else image_url
-        except Exception as e:
-            logger.warning(f"获取图片数据失败: {e}")
+    if not cached_desc:
+        if file_id and bot and bot._ws:
+            try:
+                r = await bot._call("get_image", {"file": file_id})
+                if r.get("status") == "ok":
+                    data = r.get("data", {})
+                    b64 = data.get("data", data.get("file", ""))
+                    if b64:
+                        # 修复 padding
+                        padding = 4 - len(b64) % 4
+                        if padding != 4:
+                            b64 += "=" * padding
+                        # 验证是否为有效 base64
+                        try:
+                            base64.b64decode(b64)
+                            img_b64 = b64
+                        except Exception:
+                            # 可能是 URL 而不是 base64
+                            image_url = b64 if b64.startswith("http") else image_url
+            except Exception as e:
+                logger.warning(f"获取图片数据失败: {e}")
 
-    # 备用: 通过 URL 下载（先修复 HTML 实体: &amp; → &）
-    if not img_b64 and image_url:
-        import html as _html
-        clean_url = _html.unescape(image_url)
-        try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.get(clean_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        raw = await resp.read()
-                        img_b64 = base64.b64encode(raw).decode("utf-8")
-                        # 检测 content-type
-                        ct = resp.headers.get("Content-Type", "")
-                        if "png" in ct:
-                            media_type = "image/png"
-                        elif "gif" in ct:
-                            media_type = "image/gif"
-                        elif "webp" in ct:
-                            media_type = "image/webp"
-        except Exception as e:
-            logger.warning(f"图片下载失败: {e}")
+        # 备用: 通过 URL 下载（先修复 HTML 实体: &amp; → &）
+        if not img_b64 and image_url:
+            import html as _html
+            clean_url = _html.unescape(image_url)
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(clean_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status == 200:
+                            raw = await resp.read()
+                            img_b64 = base64.b64encode(raw).decode("utf-8")
+                            # 检测 content-type
+                            ct = resp.headers.get("Content-Type", "")
+                            if "png" in ct:
+                                media_type = "image/png"
+                            elif "gif" in ct:
+                                media_type = "image/gif"
+                            elif "webp" in ct:
+                                media_type = "image/webp"
+            except Exception as e:
+                logger.warning(f"图片下载失败: {e}")
 
-    if not img_b64:
-        logger.debug("无法获取图片数据用于 AI 审核")
-        return None
+        if not img_b64:
+            logger.debug("无法获取图片数据用于 AI 审核")
+            return None
 
     # 构建审核请求
     user_content = []
-    user_content.append({
-        "type": "image",
-        "source": {"type": "base64", "media_type": media_type, "data": img_b64},
-    })
     text_prompt = VISION_MODERATION_PROMPT
     if caption:
         text_prompt += f"\n\n图片附带的文字说明: {caption}"
-    user_content.append({"type": "text", "text": text_prompt})
+
+    if cached_desc:
+        # 基于已有描述做审核（文本输入，比再发一次图片省额度）
+        text_prompt += f"\n\n已有图片描述（基于此判断）: {cached_desc}"
+        user_content.append({"type": "text", "text": text_prompt})
+    else:
+        user_content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": img_b64},
+        })
+        user_content.append({"type": "text", "text": text_prompt})
 
     try:
         from . import llm_call
         response = await llm_call.llm_create(
+            priority="P3",
             model=model,
             max_tokens=800,
             messages=[{"role": "user", "content": user_content}],
@@ -252,6 +308,13 @@ async def review_image_with_ai(
             logger.warning(f"AI 图片审核返回非 JSON: {text[:100]}")
             return {"is_violation": False, "confidence": 0, "violation_type": "none",
                     "ocr_text": text[:200], "reason": "解析失败"}
+
+        # 个人支付凭证防误判（确定性复核，覆盖缓存描述与 vision 两条路径）
+        text_basis = " ".join(filter(None, [
+            caption, cached_desc,
+            result.get("ocr_text", ""), result.get("reason", ""),
+        ]))
+        result = _payment_receipt_guard(result, text_basis)
 
         logger.info(
             f"AI 图片审核: violation={result.get('is_violation')} "

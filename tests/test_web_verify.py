@@ -615,8 +615,150 @@ class TestWebVerifyE2E(unittest.TestCase):
         self.assertEqual(items[0]["attempts"], 3)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestLocalProof(unittest.TestCase):
+    """自托管人机证明校验测试"""
+
+    def setUp(self):
+        from bot import verify
+        self.verify = verify
+        verify._web_pending.clear()
+        verify._used_web_codes.clear()
+
+    def _pow(self, token: str, bits: int):
+        """枚举找出一个满足 bits 难度的 nonce"""
+        import hashlib
+        from bot.verify import _count_leading_zero_bits
+        for n in range(5_000_000):
+            if _count_leading_zero_bits(
+                hashlib.sha256(f"{token}:{n}".encode()).digest()
+            ) >= bits:
+                return n
+        raise RuntimeError("找不到 PoW 解")
+
+    def _good_proof(self, token: str, elapsed_ms: int = 2000):
+        """构造一个各项指标都正常的 proof"""
+        now_ms = int(__import__("time").time() * 1000)
+        return {
+            "pow": {"nonce": self._pow(token, self.verify.LOCAL_POW_BITS),
+                    "bits": self.verify.LOCAL_POW_BITS},
+            "ts": now_ms,
+            "loadedAt": now_ms - elapsed_ms,
+            "events": {"mouseMoves": 15, "mousePath": 220.5,
+                       "touchEvents": 0, "keysPressed": 0},
+            "env": {"webdriver": False, "pluginCount": 3,
+                    "langCount": 2, "screenW": 1920, "screenH": 1080,
+                    "tz": "Asia/Shanghai"},
+        }
+
+    def test_pow_valid_proof(self):
+        """完整合法的证明 → ok=True"""
+        token = "validtoken_abc"
+        ok, reason = self.verify._verify_local_proof(token, self._good_proof(token))
+        self.assertTrue(ok, f"应该通过但失败: {reason}")
+
+    def test_pow_missing(self):
+        """缺 PoW → 拒"""
+        proof = self._good_proof("validtoken_abc")
+        proof["pow"] = {}
+        ok, reason = self.verify._verify_local_proof("validtoken_abc", proof)
+        self.assertFalse(ok)
+        self.assertIn("工作量证明", reason)
+
+    def test_pow_wrong_nonce(self):
+        """错误的 nonce → 拒"""
+        proof = self._good_proof("validtoken_abc")
+        proof["pow"]["nonce"] = 0
+        ok, reason = self.verify._verify_local_proof("validtoken_abc", proof)
+        self.assertFalse(ok)
+        self.assertIn("工作量证明", reason)
+
+    def test_pow_wrong_token(self):
+        """nonce 是为别的 token 算的 → 拒"""
+        proof = self._good_proof("tokenA")
+        ok, reason = self.verify._verify_local_proof("tokenB", proof)
+        self.assertFalse(ok)
+        self.assertIn("工作量证明", reason)
+
+    def test_too_fast(self):
+        """页面加载到提交 < 1.2s → 拒（脚本特征）"""
+        token = "fasttoken"
+        proof = self._good_proof(token, elapsed_ms=500)
+        ok, reason = self.verify._verify_local_proof(token, proof)
+        self.assertFalse(ok)
+        self.assertIn("过快", reason)
+
+    def test_request_expired(self):
+        """ts 与服务器时间偏差过大 → 拒"""
+        import time
+        token = "oldtoken"
+        proof = self._good_proof(token)
+        proof["ts"] = int(time.time() * 1000) - 120_000   # 2 分钟前
+        ok, reason = self.verify._verify_local_proof(token, proof)
+        self.assertFalse(ok)
+        self.assertIn("过期", reason)
+
+    def test_webdriver_detected(self):
+        """navigator.webdriver=true → 硬拒"""
+        token = "bottoken"
+        proof = self._good_proof(token)
+        proof["env"]["webdriver"] = True
+        ok, reason = self.verify._verify_local_proof(token, proof)
+        self.assertFalse(ok)
+        self.assertIn("自动化", reason)
+
+    def test_headless_signals(self):
+        """无插件 + 无语言 → headless 嫌疑"""
+        token = "headless"
+        proof = self._good_proof(token)
+        proof["env"]["pluginCount"] = 0
+        proof["env"]["langCount"] = 0
+        ok, reason = self.verify._verify_local_proof(token, proof)
+        self.assertFalse(ok)
+        self.assertIn("行为", reason)
+
+    def test_no_mouse_activity(self):
+        """鼠标几乎没动 + 没触摸 → 拒"""
+        token = "stillon"
+        proof = self._good_proof(token)
+        proof["events"]["mouseMoves"] = 1
+        proof["events"]["mousePath"] = 5
+        proof["events"]["touchEvents"] = 0
+        ok, reason = self.verify._verify_local_proof(token, proof)
+        self.assertFalse(ok)
+
+    def test_touch_device_ok(self):
+        """触摸设备（没鼠标但有触摸）→ 通过"""
+        token = "phonetoken"
+        proof = self._good_proof(token)
+        proof["events"]["mouseMoves"] = 0
+        proof["events"]["mousePath"] = 0
+        proof["events"]["touchEvents"] = 5
+        ok, reason = self.verify._verify_local_proof(token, proof)
+        self.assertTrue(ok)
+
+    def test_proof_failure_accumulates(self):
+        """失败累计，达到上限 token 被清"""
+        async def fake_gen():
+            return "星空"
+        with patch.object(self.verify, '_generate_web_code', new=fake_gen):
+            token = _run(self.verify.create_web_challenge(100, 1001, "alice"))
+
+        # 失败 MAX_WRONG_ATTEMPTS_WEB 次
+        for i in range(self.verify.MAX_WRONG_ATTEMPTS_WEB - 1):
+            r = _run(self.verify._record_proof_failure(token))
+            self.assertFalse(r["kicked"])
+        r = _run(self.verify._record_proof_failure(token))
+        self.assertTrue(r["kicked"])
+        self.assertNotIn(token, self.verify._web_pending)
+
+    def test_pow_bits_out_of_range(self):
+        """难度 bits 异常（<8 或 >24）→ 拒"""
+        token = "weirdtoken"
+        proof = self._good_proof(token)
+        proof["pow"]["bits"] = 2
+        proof["pow"]["nonce"] = 0    # 任意值，因 bits 异常都拒
+        ok, reason = self.verify._verify_local_proof(token, proof)
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

@@ -49,11 +49,11 @@ async function loadVerifyHistory() {
     const statsEl = $('verify-stats');
     if (statsEl) {
       statsEl.innerHTML =
-        statCard('✅', allApproved, '通过', 'ok') +
-        statCard('❌', allRejected, '拒绝', 'warn') +
-        statCard('⏰', allTimeout, '超时', 'no') +
-        statCard('🌐', webTotal, '网站模式', '') +
-        statCard('📈', (allApproved / total * 100).toFixed(0) + '%', '通过率', '');
+        statCard('check-circle', allApproved, '通过', 'ok') +
+        statCard('close-circle', allRejected, '拒绝', 'warn') +
+        statCard('clock-circle', allTimeout, '超时', 'no') +
+        statCard('cloud', webTotal, '网站模式', '') +
+        statCard('fund', (allApproved / total * 100).toFixed(0) + '%', '通过率', '');
     }
 
     await fillTable('#verify-tbl', async () => d.items || [],
@@ -79,7 +79,7 @@ async function loadVerifyHistory() {
           <td class="num">${attempts}</td>
         </tr>`;
       },
-      '🔑', '暂无验证记录');
+      'tags', '暂无验证记录');
   } catch (e) {
     toast('加载验证记录失败: ' + e.message, 'err');
   }

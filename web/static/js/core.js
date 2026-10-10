@@ -77,7 +77,7 @@ function loading(sel) {
   tbl(sel, '<div class="empty-state"><div class="ico"><span class="spinner"></span></div>加载中…</div>');
 }
 function empty(sel, ico, msg) {
-  tbl(sel, `<div class="empty-state"><div class="ico">${ico || '📭'}</div>${esc(msg || '暂无数据')}</div>`);
+  tbl(sel, `<div class="empty-state"><div class="ico">${renderIco(ico || 'inbox')}</div>${esc(msg || '暂无数据')}</div>`);
 }
 function errorState(sel, e) {
   tbl(sel, `<div class="err-state">⚠️ 加载失败：${esc((e && e.message) || e)}</div>`);
@@ -104,9 +104,15 @@ function tag(text, kind) {
   return `<span class="tag ${kind || ''}">${esc(text)}</span>`;
 }
 
+/* ─── 图标解析:icon 名 → 内联 SVG;emoji 原样兼容 ─── */
+function renderIco(name, cls) {
+  if (typeof ICONS !== 'undefined' && ICONS[name]) return iconSvg(name, cls);
+  return esc(name || '');
+}
+
 /* ─── Stat 卡片渲染 ─── */
 function statCard(ico, val, lab, cls) {
-  return `<div class="stat"><span class="ico">${ico}</span><div class="val">${val}</div><div class="lab">${esc(lab)}</div></div>`;
+  return `<div class="stat ${cls || ''}"><span class="stat-ico">${renderIco(ico)}</span><div class="val">${val}</div><div class="lab">${esc(lab)}</div></div>`;
 }
 
 /* ─── 群列表缓存 ─── */

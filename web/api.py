@@ -118,6 +118,17 @@ async def dashboard():
     }
 
 
+# ==================== 用量图表 ====================
+
+@router.get("/usage/hourly")
+async def usage_hourly_data(hours: int = Query(48, ge=6, le=168)):
+    """每小时用量：LLM 调用数、tokens（缓存命中/未命中/输出）、群消息数。"""
+    return {
+        "items": db.usage_hourly(hours),
+        "summary": db.usage_summary(min(hours, 24)),
+    }
+
+
 # ==================== Violations ====================
 
 @router.get("/violations")
@@ -582,6 +593,7 @@ async def guardian_approve(action_id: str):
     # 执行操作
     import bot as _bot
     if _bot.bot_instance:
+        await guardian.recall_notify(_bot.bot_instance, detail)
         if detail["action"] == "kick":
             try:
                 await _bot.bot_instance._call("set_group_kick",
@@ -606,6 +618,9 @@ async def guardian_reject(action_id: str):
     detail = guardian.reject_action(action_id)
     if not detail:
         raise HTTPException(404, "审批不存在或已过期")
+    import bot as _bot
+    if _bot.bot_instance:
+        await guardian.recall_notify(_bot.bot_instance, detail)
     return {"ok": True, "detail": detail}
 
 
@@ -1448,7 +1463,8 @@ def _update_env_file(key: str, value: str):
     if not _os.path.exists(env_path):
         return
     try:
-        with open(env_path, "r", encoding="utf-8") as f:
+        # utf-8-sig 自动剥 Windows 记事本可能留下的 BOM，防止首行变成乱码 key
+        with open(env_path, "r", encoding="utf-8-sig") as f:
             lines = f.readlines()
         updated = False
         for i, line in enumerate(lines):
@@ -1480,7 +1496,9 @@ def _parse_env_file() -> dict[str, str]:
     result = {}
     if not _os.path.exists(env_path):
         return result
-    with open(env_path, "r", encoding="utf-8") as f:
+    # utf-8-sig 自动剥 BOM：否则首行 "\ufeff#====" 不被认成注释，
+    # 会解析出一个乱码 key、值为整行等号的假配置（面板上显示为乱码条目）
+    with open(env_path, "r", encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -1594,13 +1612,38 @@ async def get_verify_history(limit: int = 50):
 @router.post("/verify/code/{token}")
 async def reveal_web_code(token: str, data: dict, request: Request):
     """
-    网站认证：新人点完 Turnstile 后调，校验通过返回词。
+    网站认证：点完验证后调，校验通过返回词。
     公开接口（无需 JWT），但 token 一次性绑定 (group, user)。
+
+    两种验证方式：
+      - Turnstile: 配了 secret 时必须用，body={cf_token: ...}
+      - 自托管 PoW: 未配 secret 时启用，body={proof: {...}}
     """
     from bot import verify as _verify
+    from bot.config import config as _cfg
     cf_token = (data or {}).get("cf_token", "")
-    if not cf_token:
+    proof = (data or {}).get("proof")
+
+    has_cf = bool(cf_token)
+    has_proof = isinstance(proof, dict)
+
+    if not (has_cf or has_proof):
+        raise HTTPException(400, "缺少人机验证凭证")
+
+    # 配了 Turnstile secret 就必须用 cf_token（proof 不能绕过）
+    if _cfg.TURNSTILE_SECRET_KEY and not has_cf:
         raise HTTPException(400, "缺少人机验证 token")
+
+    # 自托管 proof 校验
+    if has_proof:
+        ok, reason = _verify._verify_local_proof(token, proof)
+        if not ok:
+            status = await _verify._record_proof_failure(token)
+            if status.get("kicked"):
+                # 失败次数已满 → 让前端显示更严重的提示
+                raise HTTPException(400, f"验证失败次数过多，请重新触发: {reason}")
+            raise HTTPException(400, reason)
+
     remote_ip = request.client.host if request.client else ""
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
@@ -1663,11 +1706,51 @@ async def set_verify_ratio(data: dict):
 
 # ==================== 日志查看 ====================
 
+# 日志尾部读取上限：bot.log 没有轮转，长期运行会很大，
+# 整文件 readlines 会把内存吃爆，只读尾部 5MB（约几万行，够看很久）。
+_LOG_TAIL_BYTES = 5 * 1024 * 1024
+
+
+def _read_log_tail(path: str, max_bytes: int = _LOG_TAIL_BYTES) -> tuple[list[str], bool]:
+    """读取日志文件尾部（最多 max_bytes 字节），返回 (行列表, 是否因超限截断)。"""
+    import os as _os
+    size = _os.path.getsize(path)
+    truncated = size > max_bytes
+    with open(path, "rb") as f:
+        if truncated:
+            f.seek(size - max_bytes)
+            f.readline()  # 丢弃定位出来的半行
+        data = f.read()
+    return data.decode("utf-8", errors="replace").splitlines(), truncated
+
+
+def _filter_by_level(all_lines: list[str], level: str) -> list[str]:
+    """按级别过滤日志行，traceback 等续行跟随上一条命中行。
+
+    日志行头格式 "2026-08-25 10:00:00 [ERROR] qqbot: ..."（main.py basicConfig），
+    带时间戳前缀的才是新日志行；堆栈等续行属于上一条——过滤时必须跟着保留，
+    否则按 ERROR 筛出来的异常没有堆栈，等于白筛。
+    """
+    import re as _re
+    head = _re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ")
+    markers = (f"[{level}]", f"| {level} ", f"|{level} ")
+    kept: list[str] = []
+    hit = False
+    for line in all_lines:
+        if head.match(line):
+            hit = any(m in line for m in markers)
+            if hit:
+                kept.append(line)
+        elif hit:
+            kept.append(line)  # 续行（堆栈/多行消息）跟随上一条命中行
+    return kept
+
+
 @router.get("/logs")
-async def get_bot_logs(lines: int = 200, offset: int = 0, level: str = ""):
+async def get_bot_logs(lines: int = 500, offset: int = 0, level: str = ""):
     """
     获取 Bot 运行日志。
-    - lines: 返回行数 (默认 200，最大 2000)
+    - lines: 返回行数 (默认 500，最大 5000)
     - offset: 跳过前 N 行（倒序前）
     - level: 按日志级别过滤 (DEBUG/INFO/WARNING/ERROR)
     """
@@ -1676,19 +1759,16 @@ async def get_bot_logs(lines: int = 200, offset: int = 0, level: str = ""):
     if not _os.path.exists(log_path):
         return {"ok": True, "lines": [], "total": 0, "message": "日志文件不存在"}
 
-    lines = max(1, min(lines, 2000))
+    lines = max(1, min(lines, 5000))
     offset = max(0, offset)
 
     try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
-
+        all_lines, truncated = _read_log_tail(log_path)
         total = len(all_lines)
 
-        # 按级别过滤
+        # 按级别过滤（含 traceback 续行）
         if level:
-            level_upper = level.upper()
-            all_lines = [l for l in all_lines if f"| {level_upper} " in l or f"|{level_upper} " in l]
+            all_lines = _filter_by_level(all_lines, level.upper())
 
         filtered_total = len(all_lines)
 
@@ -1699,11 +1779,12 @@ async def get_bot_logs(lines: int = 200, offset: int = 0, level: str = ""):
 
         return {
             "ok": True,
-            "lines": [l.rstrip("\n").rstrip("\r") for l in result],
+            "lines": result,
             "total": total,
             "filtered_total": filtered_total,
             "returned": len(result),
             "file_exists": True,
+            "truncated": truncated,  # true = 只读了尾部 5MB，更早的日志在文件里
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}

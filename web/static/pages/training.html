@@ -1,8 +1,17 @@
-<!-- TRAINING -->
+<!-- AUDIT SAMPLES -->
+<p class="muted" style="font-size:13px;margin:0 0 14px">
+  由你人工判定的消息样本：标为「违规」或「正常」喂给审核引擎。<strong>点「应用样本」后生效</strong>，规则审核会参考这些样本改进识别。
+</p>
 <div class="stats" id="tr-stats"></div>
 <div class="card panel">
+  <div class="panel-h">样本列表
+    <span style="margin-left:auto;display:flex;gap:8px">
+      <button class="btn xs" onclick="trApply()">应用样本</button>
+      <button class="btn xs pri" onclick="trAdd()">＋ 添加样本</button>
+    </span>
+  </div>
   <div class="panel-b np"><div class="tw"><table class="tbl" id="tr-tbl">
-    <thead><tr><th class="num">ID</th><th>消息</th><th>标签</th><th>分类</th><th>已应用</th><th>操作</th></tr></thead>
+    <thead><tr><th class="num">ID</th><th>消息内容</th><th>判定</th><th>分类</th><th>已生效</th><th>操作</th></tr></thead>
     <tbody></tbody>
   </table></div></div>
   <div id="tr-pager" class="btn-row" style="justify-content:center;padding:12px"></div>

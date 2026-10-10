@@ -10,6 +10,7 @@ v3.0: 全面接入自我意识引擎 (bot/consciousness.py)
   - 新闻分享：AI 自己判断值不值得发，带图片
 """
 import asyncio
+import difflib
 import logging
 import random
 import re
@@ -200,6 +201,16 @@ def _check_mood_change(state: dict, trigger: str):
 LEARN_INTERVAL = 60  # 防同一秒内连调
 _last_learn_time = 0
 
+# 新闻分享冷却：两条新闻路径（share_news_if_ready / maybe_proactive_action 的 learn 分支）共用
+# 2 小时内只允许成功分享一次，避免刷屏（尤其夜间）。每次"真正发出去"后刷新时间戳。
+NEWS_SHARE_COOLDOWN = 2 * 60 * 60
+_last_news_share = 0.0
+
+
+def _news_on_cooldown() -> bool:
+    """距离上次成功分享新闻是否还没过冷却（2 小时）。"""
+    return (time.time() - _last_news_share) < NEWS_SHARE_COOLDOWN
+
 
 def _is_news_too_old(published: str, max_age_days: int = 30) -> bool:
     """判断新闻发布日期是否太旧。空日期返回 False（放行让 LLM 判断）。"""
@@ -212,6 +223,104 @@ def _is_news_too_old(published: str, max_age_days: int = 30) -> bool:
         return pub < cutoff
     except Exception:
         return False
+
+
+# ── 分享去重记忆（持久化在意识状态里，重启不丢）──
+# 事故实录（2026-10-09/10）：同一条 Steam"720款新游"新闻连发两天，
+# 根因是完全没有去重记忆（load_brain 里 last_news_shared 已废弃）。
+# 现在存 {topic, text, ts} 到 consciousness 的 state（随 data/consciousness.json 持久化）。
+NEWS_HISTORY_TTL = 12 * 24 * 3600   # 分享记忆保留 12 天
+NEWS_HISTORY_CAP = 30               # 最多记 30 条
+NEWS_DUP_RATIO = 0.55               # 与历史相似度超过该值视为同一事件
+RECENT_TOPICS_TTL = 48 * 3600       # 选题 48 小时内不重选
+RECENT_TOPICS_CAP = 8               # 最近选题记录上限
+
+
+def _get_news_history(state: dict) -> list[dict]:
+    """取有效的分享史（顺带清理过期条目）。存于 state["news_shared"]。"""
+    history = state.setdefault("news_shared", [])
+    now = time.time()
+    history[:] = [h for h in history if now - h.get("ts", 0) < NEWS_HISTORY_TTL]
+    return history
+
+
+def _remember_shared_news(state: dict, topic: str, text: str) -> None:
+    """记录一条已分享/已刷到的新闻并立即持久化（防止重启后重复分享）。"""
+    if not text:
+        return
+    history = _get_news_history(state)
+    history.append({"topic": (topic or "")[:30], "text": text[:120], "ts": time.time()})
+    if len(history) > NEWS_HISTORY_CAP:
+        del history[: len(history) - NEWS_HISTORY_CAP]
+    cs.save()
+
+
+def _is_duplicate_news(text: str, state: dict) -> bool:
+    """新 summary 与历史 text 相似度 > NEWS_DUP_RATIO 视为同一事件，拦截。"""
+    if not text:
+        return False
+    norm = re.sub(r"\s+", "", (text or "").lower())
+    if len(norm) < 4:
+        return False
+    for h in _get_news_history(state):
+        old = re.sub(r"\s+", "", (h.get("text", "") or "").lower())
+        if not old:
+            continue
+        if difflib.SequenceMatcher(None, norm, old).ratio() > NEWS_DUP_RATIO:
+            return True
+    return False
+
+
+def _get_recent_topic_names(state: dict) -> set:
+    """48h 内用过的选题（不再重选）。存于 state["recent_topics"]。"""
+    rec = state.setdefault("recent_topics", [])
+    now = time.time()
+    rec[:] = [r for r in rec if now - r.get("ts", 0) < RECENT_TOPICS_TTL]
+    return {r.get("topic", "") for r in rec}
+
+
+def _remember_topic_used(state: dict, topic: str) -> None:
+    """记录一个刚用过的选题，供后续排除。"""
+    if not topic:
+        return
+    rec = state.setdefault("recent_topics", [])
+    rec.append({"topic": topic[:30], "ts": time.time()})
+    if len(rec) > RECENT_TOPICS_CAP:
+        del rec[: len(rec) - RECENT_TOPICS_CAP]
+
+
+def _pick_topic(state: dict, topics_pool: list) -> str:
+    """从候选里选一个选题，排除 48h 内用过的（全被排除才放回，保证总有得选）。"""
+    recent = _get_recent_topic_names(state)
+    fresh_pool = [t for t in topics_pool if t not in recent]
+    topic = random.choice(fresh_pool or topics_pool)
+    _remember_topic_used(state, topic)
+    return topic
+
+
+def _news_angles() -> list:
+    """搜索角度池：月份词用当前时间动态生成，随月份自然轮换，
+    替代写死的"最近/2026"（观感像模板的元凶之一）。"""
+    now_dt = timeutil.now_shanghai()
+    return ["最新", "今天", "本周", f"{now_dt.month}月", f"{now_dt.month % 12 + 1}月"]
+
+
+def _recent_shared_prompt(state: dict) -> str:
+    """构建"最近聊过这些别再选"的提示词块（提示词层去重，最省钱的拦截点）。"""
+    history = _get_news_history(state)
+    if not history:
+        return ""
+    lines = []
+    for h in reversed(history[-8:]):  # 最近 5-8 条，最新的排前面
+        t = (h.get("text", "") or "").strip()
+        if t:
+            lines.append(f"- {t[:40]}（主题：{h.get('topic', '') or '未知'}）")
+    if not lines:
+        return ""
+    return (
+        "\n🚫 重复豁免：下面是你最近几天已经搜过/聊过的事件，"
+        "不要再选同类或同一事件，也别再说差不多的话：\n" + "\n".join(lines) + "\n\n"
+    )
 
 
 async def _fetch_image_segment(image_url: str) -> Optional[dict]:
@@ -294,9 +403,11 @@ async def autonomous_learn(bot) -> Optional[dict]:
                     topics_pool.extend(user_topics)
         except Exception:
             pass
-    topic = random.choice(topics_pool)
-    # 好奇心越强，搜索越认真
-    angles = ["最新", "今天", "本周", "最近", "2026"]
+    # 去模板：选题时排除 48h 内用过的（近期老八股轮着抽就会被认出来）
+    topic = _pick_topic(state, topics_pool)
+    # angle 池：月份词动态生成，替代写死的"最近/2026"
+    now_dt = timeutil.now_shanghai()
+    angles = _news_angles()
     query = f"{topic} {random.choice(angles)}"
 
     ms = memory.load_model_settings()
@@ -316,18 +427,48 @@ async def autonomous_learn(bot) -> Optional[dict]:
             for i, r in enumerate(text_results[:3])
         )
 
+        time_hint = (
+            f"{now_dt.strftime('%m-%d %H:%M')}"
+            f"（{['周一','周二','周三','周四','周五','周六','周日'][now_dt.weekday()]}）"
+        )
+        # 身份锚定：不写死名字，从人设配置动态取（Web 面板改名即生效），
+        # 防止模型自报底层模型名（如"作为Qwythos"这种穿帮）
+        from . import personality as _personality
+        bot_name = _personality.load().get("name") or config.BOT_NAME
+
+        # 提示词层去重：把最近聊过的注入决策 prompt，同一事件反复被搜到时在这里拦住
+        recent_shared = _recent_shared_prompt(state)
+
         response = await llm_call.llm_create(
             model=ms.get("model", "gemini-3.5-flash-free"),
             max_tokens=200,
             temperature=0.8,
-            system=f"你现在{cs.get_dominant_mood(state)}。根据搜索结果做两件事：\n"
-                   "1. 判断这些新闻是否值得分享给群友（够新鲜、够有趣、与群友兴趣相关）\n"
-                   "2. 用一句话（50字内）总结其中最值得分享的一条，要有你的个人态度\n\n"
-                   "⚠️ 新鲜度硬约束：任何一条发布日期早于 7 天前都不能算\"够新鲜\"，必须 DECISION: no。\n"
-                   "只有发布日期在 7 天内的才算新。没有日期的可以放宽。\n\n"
-                   "输出格式:\n"
-                   "DECISION: yes 或 no\n"
-                   "SUMMARY: 你的总结（50字内）",
+            system=(
+                "你是QQ群的一个群友。根据用户消息给出的搜索结果做两件事：\n"
+                "1. 判断这些新闻是否值得分享给群友（够新鲜、够有趣、与群友兴趣相关）\n"
+                "2. 用一句话（15~30字）说出最值得说的一条，像跟熟人随口提一嘴\n\n"
+                "✍️ 说话方式（极重要）：像随手甩在群里的闲聊，不是新闻播报。\n"
+                "- 禁止播报腔词：「资讯」「更新了」「最新」「分享给大家」「推荐」\n"
+                "- 禁止：感叹号轰炸、任何emoji/符号开头、念来源网站名当开场\n"
+                "- 不要总结陈词，说你觉得有意思的那个点就行\n"
+                "- 说具体的数字/细节，别空泛\n"
+                "口吻参考：\n"
+                "「刚瞄到 OpenAI 放出新路线图 有点东西」\n"
+                "「下个月新番有两部能追 别问我怎么知道的」\n"
+                "「这新闻有点离谱 你们自己看」\n\n"
+                f"{recent_shared}"
+                "⚠️ 新鲜度硬约束：任何一条发布日期早于 7 天前都不能算\"够新鲜\"，必须 DECISION: no。\n"
+                "只有发布日期在 7 天内的才算新。没有日期的可以放宽。\n\n"
+                "⏰ 时段自觉：深夜到清晨（23点-次日8点）群友多半在睡觉，除非真正紧急重大的突发，"
+                "否则倾向 DECISION: no，别打扰大家休息。\n\n"
+                "输出格式:\n"
+                "DECISION: yes 或 no\n"
+                "SUMMARY: 你的总结（15~30字）\n\n"
+                "—— 以下为本次判断的数据 ——\n"
+                f"你的名字：{bot_name}。你现在的心情：{cs.get_dominant_mood(state)}。\n"
+                f"当前时间：{time_hint}。"
+                f"时段：{'深夜到清晨，别打扰大家' if (now_dt.hour >= 23 or now_dt.hour < 8) else '白天/晚间'}。"
+            ),
             messages=[{"role": "user", "content": f"搜索结果：\n{search_text}"}],
         )
         raw = response.content[0].text.strip()
@@ -346,42 +487,19 @@ async def autonomous_learn(bot) -> Optional[dict]:
             logger.info(f"AI 决定不分享: {query} → 不够有趣")
             cs.on_learned_something(state, topic)
             cs.add_diary(state, f"查了下「{query[:20]}」，没什么好分享的", "meh")
+            # 也记进分享史（记标题即可）：同一事件反复被搜到时，
+            # 上面注入的"重复豁免"提示词就能直接拦住，不用等发出去再拦
+            if text_results:
+                _remember_shared_news(state, topic, text_results[0].get("title", ""))
             return {"text": "", "image_url": "", "decision": "no", "topic": topic}
 
         news_text = summary[:120]
 
-        # 选图片：img_src 才是图片直链，url 是来源网页（当图片发会失败！）
-        # 并且要做图文相关性校验——不能随手发一张跟新闻无关的图
-        image_url = ""
-        if image_results:
-            # 提取新闻文本中的关键词用于匹配
-            import jieba as _jieba
-            news_keywords = set(
-                w for w in _jieba.lcut(news_text + topic)
-                if len(w) >= 2 and not w.isdigit() and w not in ("的", "了", "是", "在", "和", "有", "就", "不", "也", "都", "这", "我", "你", "他", "她", "它", "们", "个", "把", "被", "从", "到", "对", "让", "给", "跟", "为", "以", "可以", "没有", "知道", "觉得", "一个", "这个", "那个")
-            )
-            for img in image_results:
-                url = img.get("img_src") or img.get("thumbnail_src") or ""
-                if not url or url.lower().endswith(".svg"):
-                    continue
-                # 检查图片元数据与新闻的关联度
-                img_title = img.get("title", "") or img.get("alt", "") or ""
-                img_source = img.get("source", "") or img.get("origin", {}).get("title", "") or ""
-                img_meta_text = f"{img_title} {img_source}"
-                if img_meta_text.strip():
-                    img_keywords = set(
-                        w for w in _jieba.lcut(img_meta_text)
-                        if len(w) >= 2
-                    )
-                    overlap = news_keywords & img_keywords
-                    if len(overlap) >= 2:
-                        image_url = url
-                        logger.debug(f"图文匹配: overlap={overlap} img={img_title[:40]}")
-                        break
-                else:
-                    # 没有元数据时也先保留（老图片搜索引擎结果可能不带标题）
-                    image_url = url
-                    break
+        # 选图片：不再"没元数据就直接采用"——书封广告就是这么混进来的
+        # （2026-09-06 实录：FBI 驾照泄露新闻配了张《冷知识》书封）。
+        # 现在只产出候选列表（按元数据相关性排序），发送前还有视觉校验把关。
+        image_candidates = _rank_image_candidates(image_results, news_text, topic)
+        image_url = image_candidates[0] if image_candidates else ""
 
         # 日志：记录是否找到了匹配的图片
         if image_results and not image_url:
@@ -397,7 +515,8 @@ async def autonomous_learn(bot) -> Optional[dict]:
             pubs = [r.get("published", "") for r in text_results if r.get("published")]
             if pubs:
                 latest_pub = max(pubs)
-        return {"text": news_text, "image_url": image_url, "decision": "yes",
+        return {"text": news_text, "image_url": image_url,
+                "image_candidates": image_candidates, "decision": "yes",
                 "topic": topic, "latest_published": latest_pub}
 
     except Exception as e:
@@ -405,13 +524,153 @@ async def autonomous_learn(bot) -> Optional[dict]:
         return None
 
 
-async def share_news_if_ready(bot):
-    """分享新闻（无冷却硬限制，由软限速兜底）。返回消息(str 或消息段 list)或 None"""
-    state = cs.get_state()
+def _rank_image_candidates(image_results: list, news_text: str, topic: str) -> list[str]:
+    """把图片搜索结果按图文相关性排序，返回最多 3 个候选 URL。
 
+    - 有标题/来源元数据的：按与新闻关键词的重叠数排序，重叠 ≥2 的优先
+    - 没元数据的：只能垫底（旧版直接采用是图文不符的元凶），由视觉校验兜底
+    """
+    import jieba as _jieba
+    stopwords = {"的", "了", "是", "在", "和", "有", "就", "不", "也", "都", "这",
+                 "我", "你", "他", "她", "它", "们", "个", "把", "被", "从", "到",
+                 "对", "让", "给", "跟", "为", "以", "可以", "没有", "知道", "觉得",
+                 "一个", "这个", "那个"}
+    news_keywords = set(
+        w for w in _jieba.lcut(news_text + topic)
+        if len(w) >= 2 and not w.isdigit() and w not in stopwords
+    )
+    scored: list[tuple[int, str]] = []
+    unscored: list[str] = []
+    for img in image_results or []:
+        url = img.get("img_src") or img.get("thumbnail_src") or ""
+        if not url or url.lower().endswith(".svg"):
+            continue
+        img_title = img.get("title", "") or img.get("alt", "") or ""
+        img_source = img.get("source", "") or img.get("origin", {}).get("title", "") or ""
+        meta = f"{img_title} {img_source}".strip()
+        if not meta:
+            unscored.append(url)
+            continue
+        meta_kw = set(w for w in _jieba.lcut(meta) if len(w) >= 2)
+        scored.append((len(news_keywords & meta_kw), url))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    ranked = ([u for n, u in scored if n >= 2]
+              + [u for n, u in scored if 0 < n < 2]
+              + unscored)
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in ranked:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out[:3]
+
+
+async def _verify_image_match(img_b64: str, content_type: str,
+                              news_text: str, topic: str) -> bool:
+    """发送前让视觉模型看一眼：这张图配这条新闻吗？（vision 主渠道 = DeepSeek）
+
+    返回 False = 图文不符（不发图，只发文字）；LLM 不可用也返回 False（宁缺毋滥）。
+    """
+    ms = memory.load_model_settings()
+    if not ms.get("api_key"):
+        return False
+    try:
+        response = await llm_call.llm_create(
+            priority="P2",
+            model=ms.get("model", "gemini-3.5-flash-free"),
+            max_tokens=8,
+            temperature=0.0,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64",
+                                             "media_type": content_type or "image/jpeg",
+                                             "data": img_b64}},
+                {"type": "text", "text": (
+                    "你要给一条新闻配图。判断这张图片是否与新闻内容直接相关。\n"
+                    f"新闻：{news_text[:150]}（主题：{topic}）\n"
+                    "相关 = 同一事件、同一领域的人物/场景/实物。\n"
+                    "书籍封面、商品广告、二维码、无关风景、纯文字截图、表情包 → 一律 NO。\n"
+                    "只回答一个词：MATCH 或 NO"
+                )},
+            ]}],
+        )
+        raw = response.content[0].text.strip().upper()
+        ok = raw.startswith("MATCH")
+        logger.info(f"新闻配图视觉校验: {'✓ MATCH' if ok else '✗ NO'} ({raw[:12]})")
+        return ok
+    except Exception as e:
+        logger.debug(f"配图视觉校验失败: {e}")
+        return False
+
+
+async def _pick_verified_image_segment(result: dict) -> Optional[dict]:
+    """从候选里挑第一张【视觉校验通过】的图，返回消息段；全不合适 → None（只发文字）。"""
+    candidates = list(result.get("image_candidates") or [])
+    first = result.get("image_url", "")
+    if first and first not in candidates:
+        candidates.insert(0, first)
+    if not candidates:
+        return None
+
+    news_text = result.get("text", "")
+    topic = result.get("topic", "")
+    import base64 as _b64
+    import html as _html
+    from urllib.parse import urlparse
+
+    for url in candidates[:3]:
+        try:
+            clean_url = _html.unescape(url)
+            p = urlparse(clean_url)
+            referer = f"{p.scheme}://{p.netloc}/" if p.scheme and p.netloc else clean_url
+            import httpx
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as http:
+                resp = await http.get(clean_url, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                    "Referer": referer,
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                })
+            if resp.status_code != 200:
+                continue
+            data = resp.content
+            ct = resp.headers.get("content-type", "").lower()
+            # 校验确实是图片，且大小合理（太小是占位图，太大超 WS 帧）
+            if "image" not in ct or len(data) < 1024 or len(data) > 3 * 1024 * 1024:
+                continue
+            b64 = _b64.b64encode(data).decode("utf-8")
+            if await _verify_image_match(b64, ct, news_text, topic):
+                return {"type": "image", "data": {"file": f"base64://{b64}"}}
+            logger.info(f"新闻配图文图不符，弃用: {clean_url[:60]}")
+        except Exception as e:
+            logger.debug(f"配图候选校验异常: {e}")
+    logger.info("新闻配图全部候选未通过视觉校验，本次只发文字")
+    return None
+
+
+def _strip_newsletter_prefix(text: str) -> str:
+    """剥掉模型偶发的简报腔前缀（📰📢🔥 等表情符号开头）——真人甩消息不会这么发。"""
+    import re as _re
+    text = (text or "").strip()
+    # 仅剥"行首的 emoji/符号连串"，消息中间的情绪表达不动
+    return _re.sub(r"^(?:[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D\s【】\[\]])+",
+                   "", text).strip() or text
+
+
+async def share_news_if_ready(bot):
+    """分享新闻。受 2 小时冷却硬限制（两条新闻路径共用 _last_news_share）。
+    返回消息(str 或消息段 list)或 None"""
+    global _last_news_share
+
+    state = cs.get_state()
     ok, why = cs.can_speak_proactively(state)
     if not ok:
         logger.debug(f"新闻分享跳过: {why}")
+        return None
+
+    if _news_on_cooldown():
+        logger.debug("新闻分享跳过: 2 小时冷却中")
         return None
 
     result = await autonomous_learn(bot)
@@ -431,16 +690,28 @@ async def share_news_if_ready(bot):
     if not text:
         return None
 
+    # ★ 二层去重（硬闸）：真正发出前，和历史分享比相似度，同一事件不重发
+    # （提示词层可能被弱模型无视，这里是最后一道）
+    if _is_duplicate_news(text, state):
+        logger.info(f"新闻去重拦截（与近期分享相似度 > {NEWS_DUP_RATIO}）: {text[:50]}")
+        cs.add_diary(state, f"「{text[:20]}」前几天刚聊过，不重复说了", "meh")
+        return None
+
     image_url = result.get("image_url", "")
     topic = result.get("topic", "")
     # 个性化推送：检查是否有群友的兴趣匹配这条新闻
     if topic and text:
         asyncio.create_task(_push_personalized_news(bot, topic, text, image_url))
 
-    seg = await _fetch_image_segment(image_url) if image_url else None
+    seg = await _pick_verified_image_segment(result)
+    # 即将真正发出去 → 刷新冷却时间戳（两条路径共用）
+    _last_news_share = time.time()
+    text = _strip_newsletter_prefix(text)
+    # 记入分享史并立即持久化（提示词层与相似度层后续都靠它去重）
+    _remember_shared_news(state, topic, text)
     if seg:
-        return [seg, {"type": "text", "data": {"text": f"\n📰 {text}"}}]
-    return f"📰 {text}"
+        return [seg, {"type": "text", "data": {"text": f"\n{text}"}}]
+    return text
 
 
 # ── 重大新闻检测（@全体用）──
@@ -531,17 +802,63 @@ async def _get_message_text_by_id(bot, group_id: int, message_id: int) -> str:
     return ""
 
 
+# 已被 LLM 判过"够不够格设精华"的 message_id，避免重复判定、重复调 LLM。
+# 用 set 存 int，超过上限就清空最旧的一半（按插入顺序）。
+_judged_essence_ids: set = set()
+_JUDGED_ESSENCE_CAP = 500
+
+
+async def _llm_judge_essence(text: str) -> bool:
+    """让 LLM 严格判断一条消息是否真的"够格设为群精华"。
+
+    旧逻辑只挡纯水（打招呼/过短/纯表情），其余一律放行 → 活跃成员随便一句话也被设精。
+    现在补上正向判断：只有真正精彩/搞笑/信息量大/说得特别到位的才返回 True。
+    """
+    if not text:
+        return False
+    try:
+        ms = memory.load_model_settings()
+        if not ms.get("api_key"):
+            return False
+        # 只看纯文本（剥 CQ 码），限长省 token
+        clean = re.sub(r"\[CQ:[^\]]+\]", "", text).strip()
+        if not clean or len(re.sub(r"\s+", "", clean)) <= 4:
+            return False
+
+        response = await llm_call.llm_create(
+            model=ms.get("model", "gemini-3.5-flash-free"),
+            max_tokens=8,
+            temperature=0.2,
+            system=(
+                "你判断这条群聊消息是否够格设为「群精华」。标准极严：只有真正精彩、搞笑、"
+                "信息量大、说得特别到位、值得群友回头再看一眼的才够格。\n"
+                "普通闲聊、陈述、提问、应答、客套、感慨、水一句、打招呼、日常报备——一律不够格。\n"
+                "只回一个字：1（够格）或 0（不够格）。"
+            ),
+            messages=[{"role": "user", "content": clean[:200]}],
+        )
+        raw = response.content[0].text.strip()
+        return raw.startswith("1")
+    except Exception as e:
+        logger.debug(f"精华 LLM 判定异常: {e}")
+        return False
+
+
+def _remember_judged(message_id) -> None:
+    """记录已判过的 message_id，防止重复判定。"""
+    if len(_judged_essence_ids) >= _JUDGED_ESSENCE_CAP:
+        _judged_essence_ids.clear()
+    _judged_essence_ids.add(int(message_id))
+
+
 async def maybe_auto_essence(bot) -> int:
     """扫所有群，对近 N 分钟高影响力消息主动设精华。返回设精数目。
 
-    适配说明：brief 假设有 `influence.score(text)`，实际没有。
-    influence 体系是"按作者互动次数"打分（mention_bot/reply/total_score 等），
-    没有"按文本质量"打分。所以这里改成：在最近消息窗口里，
-    挑出**作者影响力最高**且**超过阈值**的消息设精华——
-    即"尊重/活跃成员发的话优先被设为精华"，而非"最好的文本被设为精华"。
-
-    阈值经实测数据校准（data/member_influence.json top15: 144..6018），
-    默认 50.0 大约能覆盖每群 top 30-50 活跃成员。
+    三道闸门（任一不通过就跳过）：
+      1. 作者影响力 ≥ 阈值（尊重/活跃成员优先）
+      2. is_essence_worthy 反向过滤（挡纯水：打招呼/过短/纯表情/纯标点）
+      3. ★ LLM 正向判断（这是补的关键一环）——只有真正精彩/搞笑/信息量大的才设
+    旧版只做了 1+2，结果任何活跃成员 >4 字的非打招呼话都被设精，看起来像乱设。
     """
     count = 0
     try:
@@ -596,8 +913,23 @@ async def maybe_auto_essence(bot) -> int:
                     )
                     continue
 
+                # 已判过的不再重复判（省 token、防重复设精）
+                best_mid = best["message_id"]
+                if best_mid in _judged_essence_ids:
+                    continue
+
+                # ★ 第三道闸门：LLM 正向判断是否真的够格设精华
+                # （旧版只有上面两道，导致活跃成员随便一句话也被设精）
+                if not await _llm_judge_essence(best_text):
+                    _remember_judged(best_mid)
+                    logger.debug(
+                        f"自主设精华跳过 群{gid}: LLM 判定不够格 «{best_text[:20]}»"
+                    )
+                    continue
+                _remember_judged(best_mid)
+
                 try:
-                    ok = await bot.set_essence_msg(best["message_id"])
+                    ok = await bot.set_essence_msg(best_mid)
                     if ok:
                         count += 1
                         logger.info(
@@ -670,7 +1002,7 @@ async def _push_personalized_news(bot, topic: str, news_text: str, image_url: st
 
             # 发送私聊
             try:
-                msg = f"📰 刷到一条你可能感兴趣的：\n\n{news_text}\n\n（顺手分享，不感兴趣无视就好～）"
+                msg = f"诶 刚刷到这个 {news_text}"
                 await bot.send_private_msg(qq, msg)
                 logger.info(f"个性化推送: {qq} ← {topic}")
                 await asyncio.sleep(2)
@@ -684,6 +1016,56 @@ async def _push_personalized_news(bot, topic: str, news_text: str, image_url: st
 # ═══════════════════════════════════════════════════════════
 #  主动行为（由意识驱动）
 # ═══════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════
+#  主动发言防刷屏（硬闸）
+# ═══════════════════════════════════════════════════════════
+# 日志实录（2026-09-06）：「群里静悄悄，正合适摸鱼～」45 分钟内重复 4 次；
+# 连续 3 次被忽视后 LLM 虽选过一次 SILENT，8 分钟后又开始复读。
+# 结论：弱模型面前"只给被忽视事实"挡不住刷屏，需要代码层硬闸：
+#   1) 被忽视退避：连续 ≥3 次主动发话没人接 → 2 小时内不再主动开口
+#   2) 近重复拦截：与 6 小时内发过的主动发言高度相似 → 视为复读，不发送
+IGNORED_BACKOFF_THRESHOLD = 3
+IGNORED_BACKOFF_SECS = 2 * 60 * 60
+SPEAK_DEDUPE_WINDOW = 6 * 60 * 60
+SPEAK_SIMILARITY = 0.3
+
+_recent_speaks: list[dict] = []   # [{"ts": float, "norm": str}]，跨调用累积
+_last_speak_sent: float = 0.0
+
+
+def _normalize_speak(text: str) -> str:
+    """去掉标点/空白/大小写的规整文本，用于复读比对。"""
+    return re.sub(r"[^\w一-鿿]+", "", (text or "").lower())
+
+
+def _is_near_duplicate_speak(text: str) -> bool:
+    """判断主动发言是否与最近发过的高度相似（字符二元组 Jaccard）。"""
+    norm = _normalize_speak(text)
+    if len(norm) < 4:
+        return False
+    now = time.time()
+    while _recent_speaks and now - _recent_speaks[0]["ts"] > SPEAK_DEDUPE_WINDOW:
+        _recent_speaks.pop(0)
+    grams = {norm[i:i + 2] for i in range(len(norm) - 1)}
+    for old in _recent_speaks:
+        if old["norm"] == norm:
+            return True
+        on = old["norm"]
+        old_grams = {on[i:i + 2] for i in range(len(on) - 1)}
+        if old_grams and grams:
+            jaccard = len(grams & old_grams) / len(grams | old_grams)
+            if jaccard >= SPEAK_SIMILARITY:
+                return True
+    return False
+
+
+def _remember_speak(text: str):
+    """记录一条已发送的主动发言（近重复比对用）。"""
+    _recent_speaks.append({"ts": time.time(), "norm": _normalize_speak(text)})
+    if len(_recent_speaks) > 20:
+        del _recent_speaks[:-20]
+
 
 async def decide_and_speak(bot):
     """LLM 自主决定要不要主动发言（Volition 系统）。
@@ -701,12 +1083,24 @@ async def decide_and_speak(bot):
     只要 LLM 说 SPEAK 就立即发，无任何上限/冷却。
     返回消息(str 或消息段 list)或 None（SILENT）。
     """
+    global _last_speak_sent
     state = cs.get_state()
 
     # 睡觉/深夜静默时段/精力耗尽 → 什么都不发
     ok, why = cs.can_speak_proactively(state)
     if not ok:
         logger.debug(f"volition 跳过: {why}")
+        return None
+
+    # 硬闸 1：连续被忽视 → 退避期内不再主动开口
+    # （2026-09-06 日志：连续 3 次石沉大海后 LLM 只安静了 8 分钟又开始复读）
+    consecutive_ignored = (state.get("today") or {}).get("consecutive_ignored", 0)
+    if (consecutive_ignored >= IGNORED_BACKOFF_THRESHOLD
+            and time.time() - _last_speak_sent < IGNORED_BACKOFF_SECS):
+        logger.info(
+            f"🤫 Volition 退避: 连续被忽视 {consecutive_ignored} 次，"
+            f"{int(IGNORED_BACKOFF_SECS - (time.time() - _last_speak_sent))}s 内不再主动开口"
+        )
         return None
 
     ms = memory.load_model_settings()
@@ -770,10 +1164,16 @@ async def decide_and_speak(bot):
             # 去掉可能的换行（只取第一行）
             text = text.split("\n")[0].strip()
             if text and 2 <= len(text) <= 30:
+                # 硬闸 2：近重复拦截——复读机式发言直接咽回去
+                if _is_near_duplicate_speak(text):
+                    cs.add_diary(state, "想说的话跟刚才说的差不多，咽回去了", mood)
+                    logger.info(f"🤫 Volition 近重复拦截: {text}")
+                    return None
+                _remember_speak(text)
+                _last_speak_sent = time.time()
                 cs.add_diary(state, f"主动说：「{text}」", mood)
                 logger.info(f"🎙️ Volition SPEAK [{mood}]: {text}")
-                # 记录主动发言时间戳（用于被忽视追踪）
-                cs.record_proactive_message(state)
+                # 主动发言的逐群记录在 main.py 发送循环里做（record_proactive_message）
                 return text
             else:
                 logger.debug(f"Volition SPEAK 内容长度异常: «{text[:30]}»")
@@ -872,16 +1272,22 @@ async def maybe_proactive_action(bot):
     behavior = cs.decide_behavior(state)
 
     # 想学习 → 触发自主学习（保留原逻辑）
-    if behavior["action"] == "learn_something" and behavior["priority"] > 0.35:
+    # ★ 受 2 小时新闻冷却限制：冷却中直接跳过，不再搜网/调 LLM，落到 volition
+    if behavior["action"] == "learn_something" and behavior["priority"] > 0.35 and not _news_on_cooldown():
         result = await autonomous_learn(bot)
         if result and result.get("decision") == "yes" and result.get("text"):
-            global _last_news_share
-            _last_news_share = time.time()
-            image_url = result.get("image_url", "")
-            seg = await _fetch_image_segment(image_url) if image_url else None
-            if seg:
-                return [seg, {"type": "text", "data": {"text": f"\n💡 闲来无事刷到一条有意思的：{result['text']}"}}]
-            return f"💡 刷到一条：{result['text']}"
+            # 二层去重（硬闸）：与 share_news_if_ready 同一道，别让这条路径漏过去
+            if _is_duplicate_news(result["text"], state):
+                logger.info(f"新闻去重拦截（主动学习路径）: {result['text'][:50]}")
+                cs.add_diary(state, f"「{result['text'][:20]}」前几天说过了，咽回去", "meh")
+            else:
+                global _last_news_share
+                _last_news_share = time.time()
+                _remember_shared_news(state, result.get("topic", ""), result["text"])
+                seg = await _pick_verified_image_segment(result)
+                if seg:
+                    return [seg, {"type": "text", "data": {"text": f"\n💡 闲来无事刷到一条有意思的：{result['text']}"}}]
+                return f"💡 刷到一条：{result['text']}"
 
     # 其余情况交给 volition（LLM 自主决定说不说话）
     # 删除了原来"阈值过就自动发"的 initiate_chat / seek_attention 分支

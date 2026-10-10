@@ -26,6 +26,7 @@ DANGEROUS_TOOLS = {
     "bot_exit",
     "set_restart",
     "punish_violation",
+    "relay_db_execute",
 }
 
 
@@ -44,14 +45,20 @@ _ADMIN_ONLY_TOOLS = {
 
 def get_tools_for_group(bot_is_admin: bool, web_search_enabled: bool = True) -> list[dict]:
     """根据 Bot 权限和设置返回可用工具列表"""
+    from .config import config
+    relay_db_enabled = bool(getattr(config, "RELAY_DB_URL", ""))
+    _web_tools = {"web_search", "web_open", "web_click", "web_back"}
     tools = []
     for t in ALL_TOOLS:
         name = t["name"]
         # 管理员限制
         if name in _ADMIN_ONLY_TOOLS and not bot_is_admin:
             continue
-        # 搜索限制
-        if name == "web_search" and not web_search_enabled:
+        # 联网类限制（搜索+网页浏览共用一个开关）
+        if name in _web_tools and not web_search_enabled:
+            continue
+        # 中转站数据库限制（未配置连接串则全部隐藏）
+        if name.startswith("relay_db_") and not relay_db_enabled:
             continue
         tools.append(t)
     return tools
@@ -61,12 +68,47 @@ ALL_TOOLS = [
     # ── 信息查询类 ──
     {
         "name": "web_search",
-        "description": "搜索互联网获取最新信息。用于新闻、天气、实时数据等时效性问题。",
+        "description": "搜索互联网获取最新信息。用于新闻、天气、实时数据等时效性问题。"
+                       "需要细看某条结果、或群友发了想让你打开的链接时，接着用 web_open。",
         "input_schema": {
             "type": "object",
             "properties": {"query": {"type": "string", "description": "搜索关键词"}},
             "required": ["query"],
         },
+    },
+    {
+        "name": "web_open",
+        "description": (
+            "打开一个网页并阅读：返回页面正文和页内可点击的链接清单（带编号）。"
+            "用于细看 web_search 搜到的某条结果、或直接打开群友发的链接。"
+            "一次搜不到答案时，打开最相关的搜索结果点进去看正文，比只看摘要准得多。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "完整网址，http(s) 开头"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "web_click",
+        "description": (
+            "点击当前网页上的链接：传编号 N（来自 web_open / web_click 返回的"
+            "「[N] 锚文本」清单），跳转到那个页面。可以连续点几层深入找资料。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer", "description": "要点击的链接编号"},
+            },
+            "required": ["n"],
+        },
+    },
+    {
+        "name": "web_back",
+        "description": "返回上一页：从当前网页退回到上一个看过的页面。",
+        "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "count_members",
@@ -100,6 +142,17 @@ ALL_TOOLS = [
         },
     },
     {
+        "name": "get_user_status",
+        "description": "查某个群友的在线状态（在线/离开/忙碌/隐身）。时机：想戳人前看看在不在线、想确认对方是不是在忙。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "integer", "description": "要查询的QQ号"},
+            },
+            "required": ["user_id"],
+        },
+    },
+    {
         "name": "get_group_info",
         "description": "获取本群的基本信息（群名、群号、创建时间、成员数等）。",
         "input_schema": {"type": "object", "properties": {}},
@@ -118,6 +171,69 @@ ALL_TOOLS = [
         "name": "get_bot_info",
         "description": "查看Bot自己的信息（QQ号、昵称、在线状态等）。",
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_profile_like",
+        "description": "查今天谁赞了我的QQ资料卡（点赞数、赞我的人）。时机：闲聊话题，比如聊到人气、点赞。",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+
+    # ── 中转站数据库（LLM API 站）──
+    {
+        "name": "relay_db_schema",
+        "description": (
+            "查看中转站（LLM API 站）数据库的表结构清单：表名、列名、大约行数。"
+            "任何人对中转站数据有疑问时先用这个了解结构，再用 relay_db_query 查。"
+            "⚠️ 结构清单是给你看的参考，不要原样贴进群聊。"
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "relay_db_query",
+        "description": (
+            "查询中转站数据库（只读，单条 SELECT/WITH）。群友都能用。"
+            "适合：谁用量最大、某人用了多少 tokens/额度、哪个模型消耗最多、签到/充值记录等。"
+            "要点：时间列是 Unix 秒，用 to_timestamp(created_at) 转日期；"
+            "500000 quota ≈ $1；users.used_quota 是【历史累计】用量——"
+            "用户问'今天/最近/本月谁用的多'时，要查 quota_data 或 logs 并用 "
+            "created_at 过滤该时段，回答时必须说明统计的是哪个时间段（历史累计/今天/本月等）。"
+            "查用量排行看 users.used_quota 或按天聚合 quota_data。"
+            "⚠️ 返回的 username/display_name 是中转站注册用户名，与QQ无关——"
+            "照实念注册名回答，不要尝试对应到QQ或群友。"
+            "历史累计排行标准写法：SELECT username, display_name, used_quota, request_count "
+            "FROM users ORDER BY used_quota DESC LIMIT 10。"
+            "按时间段排行（今天/最近N天）标准写法：SELECT username, COUNT(*) cnt, "
+            "SUM(quota) 用量 FROM logs WHERE created_at >= extract(epoch from now()) - 86400 "
+            "GROUP BY username ORDER BY SUM(quota) DESC LIMIT 10"
+            "（86400=最近1天；最近7天就是 604800；logs 的时间列 created_at 是 Unix 秒）。"
+            "不确定表结构就先调 relay_db_schema。结果用自己的话总结着说，别原样甩表格。"
+            "⚠️ SQL 命令本身绝对不能出现在你回给群里的消息里——"
+            "群里只说大白话结论，一条查询语句都不要贴。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "单条只读 SQL（SELECT / WITH 开头）"},
+            },
+            "required": ["sql"],
+        },
+    },
+    {
+        "name": "relay_db_execute",
+        "description": (
+            "修改中转站数据库（INSERT/UPDATE/DELETE/DDL，单条）。"
+            "⚠️ 只有主人本人下的指令才能改；群友要求改时直接拒绝并说明只有主人可以。"
+            "改之前先把要改的行查出来确认，改完汇报影响行数；"
+            "执行的命令文本不要贴进群聊，说改了什么就行。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "单条写入 SQL"},
+                "reason": {"type": "string", "description": "主人要求做什么（审计用）"},
+            },
+            "required": ["sql"],
+        },
     },
 
     # ── 消息操作类 ──
@@ -182,7 +298,8 @@ ALL_TOOLS = [
             "返回一个表情的 CQ 码（QQ大黄脸/动图/收藏的GIF），你把它放在回复文本里就能发出去。"
             "适用场景：觉得对方可爱、被逗笑、想卖萌、表达情绪但文字不够时。"
             "emotion 传情绪关键词，工具会优先从你收藏的表情里选合适的，没有就用QQ自带大黄脸兜底。"
-            "常用 emotion：开心/大笑/害羞/生气/哭泣/惊讶/喜欢/撒娇/调皮/安慰/无奈/卖萌/赞/鄙视/尴尬/害怕/疑问/无语/庆祝"
+            "常用 emotion：开心/大笑/害羞/生气/哭泣/惊讶/喜欢/撒娇/调皮/安慰/无奈/卖萌/赞/鄙视/尴尬/害怕/疑问/无语/庆祝。"
+            "工具返回的 CQ 码原样放进回复文本即可，不要复述码以外的任何说明。"
         ),
         "input_schema": {
             "type": "object",
@@ -194,13 +311,57 @@ ALL_TOOLS = [
     },
     {
         "name": "send_forward",
-        "description": "发送合并转发消息。用于整理聊天记录、「总结」等场景。",
+        "description": (
+            "发送合并转发消息。用于整理聊天记录、「总结」等场景。"
+            "messages 必须是 JSON 数组，且每一项都必须是 node，混入非 node 会被拒绝。"
+            "最小示例："
+            '[{"type": "node", "data": {"user_id": 你的QQ号, "nickname": "你的群名片", '
+            '"content": [{"type": "text", "data": {"text": "要说的话"}}]}}]。'
+            "限速：每群每天最多 3 次，超频会被拒，改用普通消息分条发。"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "messages": {"type": "string", "description": "JSON格式的合并转发node数组"},
+                "messages": {"type": "string", "description": "JSON格式的合并转发node数组，每项都必须是 node"},
             },
             "required": ["messages"],
+        },
+    },
+    {
+        "name": "play_dice",
+        "description": (
+            "掷骰子，返回骰子 CQ 码，你把它放进回复文本里就能掷出。"
+            "时机：群友起哄要赌运气、比大小、抽签做裁决时。别没事乱掷。"
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "play_rps",
+        "description": (
+            "出猜拳（石头剪刀布），返回猜拳 CQ 码，你把它放进回复文本里就能出。"
+            "时机：有人要跟你猜拳、或大家起哄玩包剪锤时。"
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "send_music",
+        "description": (
+            "点歌发到群里（直接发送，不用拼进回复）。时机：有人求歌、聊到某首歌想分享时。"
+            "平台点歌：platform 传 qq/163/kugou/migu/kuwo 之一 + song_id（歌曲ID）。"
+            "自定义卡：platform 传 custom，title+url 必填（url 必须 http 开头），"
+            "image 必填（http 开头的封面图链接），audio 可选（http 音频链接）。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "platform": {"type": "string", "description": "qq/163/kugou/migu/kuwo 选一，或 custom"},
+                "song_id": {"type": "string", "description": "平台点歌的歌曲ID（custom 型不传）"},
+                "title": {"type": "string", "description": "custom 型：歌名"},
+                "url": {"type": "string", "description": "custom 型：点击跳转链接（http 开头）"},
+                "image": {"type": "string", "description": "custom 型：封面图链接（http 开头，必填）"},
+                "audio": {"type": "string", "description": "custom 型：音频链接（可选）"},
+            },
+            "required": ["platform"],
         },
     },
     {
@@ -466,6 +627,50 @@ ALL_TOOLS = [
             "required": ["user_id", "title"],
         },
     },
+    {
+        "name": "set_invite_policy",
+        "description": (
+            "设置群成员邀请好友进群的策略。⚠️ 改的是全群设置，仅在主人明确要求时使用，慎用。"
+            "policy: disabled=禁止成员邀请 / require_approval=邀请需管理员审核 / "
+            "no_approval=邀请无需审核 / no_approval_under_100=群成员少于100人时无需审核"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "policy": {"type": "string", "description": "disabled/require_approval/no_approval/no_approval_under_100"},
+            },
+            "required": ["policy"],
+        },
+    },
+    {
+        "name": "set_member_permissions",
+        "description": (
+            "设置群成员功能权限（传相册/临时会话/发起群聊三个开关，至少传一项，未传项不变）。"
+            "⚠️ 改的是全群设置，仅在主人明确要求时使用，慎用。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "allow_upload_album": {"type": "boolean", "description": "允许成员上传群相册"},
+                "allow_temporary_session": {"type": "boolean", "description": "允许成员发起临时会话"},
+                "allow_create_group": {"type": "boolean", "description": "允许成员发起新群聊"},
+            },
+        },
+    },
+    {
+        "name": "set_new_member_visibility",
+        "description": (
+            "设置新入群成员默认能否查看最近的聊天记录。"
+            "⚠️ 改的是全群设置，仅在主人明确要求时使用，慎用。visible: true=可见 false=不可见"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "visible": {"type": "boolean", "description": "true=新成员可看最近聊天记录"},
+            },
+            "required": ["visible"],
+        },
+    },
 
     # ── 群娱乐类 ──
     {
@@ -603,6 +808,20 @@ ALL_TOOLS = [
                 "message_id": {"type": "integer", "description": "语音消息的ID"},
             },
             "required": ["message_id"],
+        },
+    },
+    {
+        "name": "send_voice",
+        "description": (
+            "用 AI 音色说一段语音发到群里（直接发送）。时机：想用语音说话、氛围到位时"
+            "（比如唱歌梗、晚安、整活）。别连发刷屏，偶尔来一条就好。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "要说的话"},
+            },
+            "required": ["text"],
         },
     },
     {
@@ -757,6 +976,47 @@ ALL_TOOLS = [
 #  工具执行器
 # ═══════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════
+#  发送类工具限速 — 每群滑动窗口（语义对齐 guardian._check_rate，
+#  不引 guardian：本文件不依赖该模块，计数器自带清空入口便于测试）
+# ═══════════════════════════════════════════════════════════
+
+# send_sticker：主动发表情比自动表态（auto_emoji 8 次/小时/群）更扎眼，取 6 次/小时/群
+_STICKER_RATE: dict[int, list[float]] = {}
+_STICKER_RATE_LIMIT = 6
+_STICKER_RATE_WINDOW = 3600  # 秒
+
+# send_forward：整包卡片与设精华（2 次/24h）同属重显眼动作，比精华略宽，3 次/24h/群
+_FORWARD_RATE: dict[int, list[float]] = {}
+_FORWARD_RATE_LIMIT = 3
+_FORWARD_RATE_WINDOW = 86400  # 秒
+
+# send_music 平台白名单（与 NapCat supportedPlatforms 对齐，custom 单独处理）
+_MUSIC_PLATFORMS = {"qq", "163", "kugou", "migu", "kuwo"}
+
+# send_voice 的 AI 音色角色缓存: group_id → (characters, ts)，24h 过期
+_VOICE_CHARACTER_CACHE: dict[int, tuple] = {}
+_VOICE_CACHE_TTL = 86400  # 秒
+
+
+def _check_tool_rate(state: dict, group_id: int, limit: int, window_secs: int) -> bool:
+    """发送类工具的每群滑动窗口限速：过去 window_secs 秒内已用满 limit 次则拒绝。
+
+    返回 True=允许（并记账本次时间戳），False=超限。
+    state 由调用方持有（模块级 dict[int, list[float]]），直接清空即可重置。
+    """
+    import time as _time
+    key = int(group_id)
+    now = _time.time()
+    recent = [t for t in state.get(key, []) if t > now - window_secs]
+    if len(recent) >= limit:
+        state[key] = recent  # 顺手把过期时间戳清掉
+        return False
+    recent.append(now)
+    state[key] = recent
+    return True
+
+
 async def _gated(group_id, action, tool_input, caller_qq,
                  master_instructed, bot, member_info=None, mute_seconds=0):
     """对破坏性动作过 guardian 闸门。
@@ -781,7 +1041,56 @@ async def _gated(group_id, action, tool_input, caller_qq,
     return None
 
 
+def _looks_failed(text: str) -> bool:
+    """识别工具结果是否代表"操作没有生效"（含空结果——空对模型来说等于没说）。
+
+    "失败"只看开头一小段：失败类结果（点赞失败/撤回失败…）都在开头报错，
+    而网页浏览等工具的正常结果正文里也可能出现"失败"二字（教程标题等），
+    不能因为正文里有就误判成操作失败。
+    """
+    if not text or not text.strip():
+        return True
+    if text.startswith("【网页】"):
+        return False  # web_browse 的正常结果，正文内容不受此检查影响
+    return text.startswith("⨯") or ("失败" in text.strip()[:80])
+
+
 async def execute_tool(
+    bot, group_id: int, user_id: int, tool_name: str, tool_input: dict, message_id: int = 0,
+    caller_qq: int = None, master_instructed: bool = False,
+) -> str:
+    """执行 AI 调用的工具，并把失败如实回传给 AI。
+
+    底层 NapCat API 失败时只返回 None/False，真实原因（retcode/msg）在
+    bot.last_api_fail 里——这里统一补到结果文本里，让 AI 明确知道
+    "操作没有生效、原因是什么"，而不是以为消息已发出、把对方的沉默
+    错当成"别人不理我"。
+    """
+    try:
+        result = await _execute_tool_impl(
+            bot, group_id, user_id, tool_name, tool_input, message_id,
+            caller_qq=caller_qq, master_instructed=master_instructed,
+        )
+    except Exception as e:
+        result = f"操作失败: {str(e)[:60]}"
+
+    if _looks_failed(result):
+        reason = ""
+        if bot is not None and hasattr(bot, "last_fail_msg"):
+            try:
+                reason = bot.last_fail_msg()
+            except Exception:
+                reason = ""
+        note = "⚠️ 该操作未生效"
+        if reason:
+            note += f"（原因: {reason}）"
+        note += "。不要当作已成功；若是发消息/戳一戳等动作，对方没有收到，"
+        note += "不要把对方之后的沉默当成「别人不理你」。"
+        result = (result.strip() or f"工具 {tool_name} 执行失败") + "\n" + note
+    return result
+
+
+async def _execute_tool_impl(
     bot, group_id: int, user_id: int, tool_name: str, tool_input: dict, message_id: int = 0,
     caller_qq: int = None, master_instructed: bool = False,
 ) -> str:
@@ -800,6 +1109,10 @@ async def execute_tool(
             query = tool_input.get("query", "")
             result = await web_search.search_and_format(query)
             return result
+
+        elif tool_name in ("web_open", "web_click", "web_back"):
+            from . import web_browse
+            return await web_browse.handle(tool_name, tool_input, group_id, caller_qq)
 
         elif tool_name == "count_members":
             members = await bot.get_group_member_list(group_id)
@@ -870,6 +1183,79 @@ async def execute_tool(
                 return f"我是 {login.get('nickname','?')}({login.get('user_id','?')})"
             return "获取失败"
 
+        elif tool_name == "get_user_status":
+            uid = int(tool_input.get("user_id", 0))
+            if not uid:
+                return "需要提供 user_id"
+            data = await bot.get_user_status(uid)
+            if data:
+                status_map = {10: "在线", 30: "离开", 40: "隐身", 50: "忙碌"}
+                status = data.get("status", "?")
+                label = status_map.get(status, f"未知({status})")
+                ext = data.get("ext_status", 0)
+                ext_str = f"，扩展状态:{ext}" if ext else ""
+                return f"QQ {uid} 当前状态: {label}{ext_str}"
+            return "查询失败（对方可能不在线或 NapCat 未开启 packet 服务）"
+
+        elif tool_name == "get_profile_like":
+            data = await bot.get_profile_like()
+            if data:
+                fav = data.get("favoriteInfo", {}) or {}
+                vote = data.get("voteInfo", {}) or {}
+                lines = [f"今天收到 {fav.get('today_count', '?')} 个资料卡赞"]
+                total = vote.get("total_count", "?")
+                new = vote.get("new_count", "?")
+                lines.append(f"总赞数 {total}（新增 {new}）")
+                likers = []
+                for u in (fav.get("userInfos") or [])[:5]:
+                    who = u.get("uin") or u.get("nick") or u.get("nickname") or "?"
+                    likers.append(str(who))
+                if likers:
+                    lines.append("最近赞我的人: " + ", ".join(likers))
+                return "\n".join(lines)
+            return "查询失败"
+
+        # ── 中转站数据库 ──
+        elif tool_name == "relay_db_schema":
+            from . import relay_db
+            return await relay_db.describe_schema()
+
+        elif tool_name == "relay_db_query":
+            from . import relay_db
+            if not relay_db.is_configured():
+                return "未配置中转站数据库"
+            if not relay_db.check_query_cooldown(group_id or caller_qq):
+                return "⨯ 查询太频繁，稍等几秒再查"
+            sql = str(tool_input.get("sql", "") or "").strip()
+            ok, err = relay_db.check_read_sql(sql)
+            if not ok:
+                return f"⨯ {err}"
+            logger.info(f"中转站只读查询 caller={caller_qq} 群={group_id}: {sql[:120]}")
+            result = await relay_db.run_read(sql)
+            # 记录结果预览，方便排查"AI 答非所问"时对照模型实际看到的数据
+            logger.info(f"中转站查询结果: {result[:250]}")
+            return result
+
+        elif tool_name == "relay_db_execute":
+            from . import relay_db
+            from .config import config as _cfg
+            if not relay_db.is_configured():
+                return "未配置中转站数据库"
+            # 写权限：仅主人本人（master_instructed 与 caller QQ 双条件任一命中即可，
+            # 正常流程两者同源；不满足直接拒绝，不进入 LLM 重试空间）
+            if not (master_instructed or str(caller_qq) == str(_cfg.OWNER_QQ)):
+                logger.warning(f"拒绝非主人修改中转站数据库: caller={caller_qq}")
+                return "⨯ 数据库只能查询，修改操作只有主人本人才行"
+            sql = str(tool_input.get("sql", "") or "").strip()
+            reason = str(tool_input.get("reason", "") or "")[:200]
+            ok, err = relay_db.check_write_sql(sql)
+            if not ok:
+                return f"⨯ {err}"
+            logger.warning(f"主人修改中转站数据库 ({reason}): {sql[:300]}")
+            result = await relay_db.run_write(sql)
+            relay_db.invalidate_schema_cache()
+            return result
+
         # ── 消息操作 ──
         elif tool_name == "recall_msg":
             mid = int(tool_input.get("message_id", 0))
@@ -939,20 +1325,82 @@ async def execute_tool(
 
         elif tool_name == "send_sticker":
             emotion = str(tool_input.get("emotion", "") or "").strip() or "开心"
+            # 每群滑动窗口限速，避免 AI 高频刷表情（提示词软约束之外的硬闸）
+            if not _check_tool_rate(_STICKER_RATE, group_id,
+                                    _STICKER_RATE_LIMIT, _STICKER_RATE_WINDOW):
+                return "⨯ 本群表情发送太频繁了，先用 :14: 这类内置黄脸表达吧"
             from . import sticker as _st
             cq = _st.pick_emotion_face(emotion, group_id=group_id)
-            # 返回 CQ 码给 AI，让它拼进回复
+            # 只返回纯 CQ 码：不加任何括号说明——normalize_face_tags 只删裸 [表情]
+            # 占位，AI 照抄整串时会把括号里的说明一并发进群
             logger.info(f"AI 选表情: emotion={emotion} → {cq[:40]}")
-            return f"[表情] {cq}（把上面的 CQ 码直接放进你的回复文本里发出去）"
+            return cq
+
+        elif tool_name == "play_dice":
+            # 仿 send_sticker：返回 CQ 码让 AI 拼进回复（发送侧结果随机，无参数）
+            return "[CQ:dice]"
+
+        elif tool_name == "play_rps":
+            return "[CQ:rps]"
+
+        elif tool_name == "send_music":
+            platform = str(tool_input.get("platform", "") or "").strip().lower()
+            song_id = str(tool_input.get("song_id", "") or "").strip()
+            title = str(tool_input.get("title", "") or "").strip()[:50]
+            url = str(tool_input.get("url", "") or "").strip()
+            image = str(tool_input.get("image", "") or "").strip()
+            audio = str(tool_input.get("audio", "") or "").strip()
+
+            def _is_http(u: str) -> bool:
+                return u.lower().startswith(("http://", "https://"))
+
+            if platform == "custom" or (url and not song_id):
+                # 自定义卡：NapCat 要求 url 和 image 必填，且防 AI 乱编链接
+                if not _is_http(url):
+                    return "⨯ custom 型 url 必填且必须是 http(s) 开头的真实链接，不能自己编"
+                if not _is_http(image):
+                    return ("⨯ custom 型 image 必填且必须是 http(s) 开头的封面图链接，"
+                            "没有封面就改用平台点歌")
+                data: dict = {"type": "custom", "url": url, "image": image}
+                if title:
+                    data["title"] = title
+                if _is_http(audio):
+                    data["audio"] = audio
+            else:
+                if platform not in _MUSIC_PLATFORMS:
+                    return (f"⨯ platform 必须是 {'/'.join(sorted(_MUSIC_PLATFORMS))} 之一，"
+                            "或传 custom 走自定义卡")
+                if not song_id:
+                    return "⨯ 平台点歌需要提供 song_id（歌曲ID）"
+                data = {"type": platform, "id": song_id}
+            ok = await bot.send_group_music(group_id, data)
+            return f"已把「{title or song_id or '歌'}」发到群里 ✓" if ok else "点歌发送失败"
 
         elif tool_name == "send_forward":
             import json
+            # 入参校验：必须是 node 数组，格式不对直接打回，不调 API 浪费一次发送
             try:
                 messages = json.loads(tool_input.get("messages", "[]"))
-                ok = await bot.send_group_forward_msg(group_id, messages)
-                return "合并转发已发送 ✓" if ok else "发送失败"
             except json.JSONDecodeError:
-                return "消息格式错误"
+                return ("⨯ messages 不是合法 JSON。数组每项都要是 node，"
+                        '如 [{"type": "node", "data": {"user_id": 你的QQ号, '
+                        '"nickname": "你的群名片", "content": '
+                        '[{"type": "text", "data": {"text": "内容"}}]}}]')
+            if (not isinstance(messages, list) or not messages
+                    or any(not isinstance(n, dict) or n.get("type") != "node"
+                           for n in messages)):
+                return ("⨯ 合并转发格式错误：messages 必须是 JSON 数组，"
+                        "且每一项都必须是 node（user_id/nickname/content），"
+                        '如 [{"type": "node", "data": {"user_id": 你的QQ号, '
+                        '"nickname": "你的群名片", "content": '
+                        '[{"type": "text", "data": {"text": "内容"}}]}}]，'
+                        "混入非 node 会被拒")
+            # 每群滑动窗口限速：整包卡片显眼，3 次/24h（比设精华的 2 次/24h 略宽）
+            if not _check_tool_rate(_FORWARD_RATE, group_id,
+                                    _FORWARD_RATE_LIMIT, _FORWARD_RATE_WINDOW):
+                return "⨯ 合并转发发送太频繁了（每群每天有上限），改用普通消息分条发吧"
+            ok = await bot.send_group_forward_msg(group_id, messages)
+            return "合并转发已发送 ✓" if ok else "发送失败"
 
         elif tool_name == "reply_msg":
             mid = int(tool_input.get("message_id", 0))
@@ -1242,6 +1690,41 @@ async def execute_tool(
             text = await bot.fetch_ptt_text(mid)
             return f"语音转文字: {text}" if text else "语音转文字失败（可能不是语音消息或已过期）"
 
+        elif tool_name == "send_voice":
+            import os
+            text = str(tool_input.get("text", "")).strip()
+            if not text:
+                return "要说的话不能为空"
+            # 默认音色从环境变量读（config.py 未收录，按其 os.getenv 惯例就地读取）
+            import time as _time
+            default_character = os.environ.get("QQBOT_AI_VOICE_CHARACTER", "").strip()
+            now = _time.time()
+            characters = None
+            cached = _VOICE_CHARACTER_CACHE.get(group_id)
+            if cached and now - cached[1] < _VOICE_CACHE_TTL:
+                characters = cached[0]
+            if characters is None:
+                # 首次调用（或缓存过期）拉角色列表；NapCat 返回按类别嵌套，拍平
+                raw = await bot.get_ai_characters(group_id)
+                characters = []
+                for cat in raw or []:
+                    if isinstance(cat, dict):
+                        characters.extend(cat.get("characters", []) or [])
+                _VOICE_CHARACTER_CACHE[group_id] = (characters, now)
+            if not characters:
+                return "发送失败：拿不到 AI 语音角色列表（NapCat 需开启 packet 服务且登录支持 AI 语音）"
+            character_id = default_character
+            if not character_id:
+                character_id = str(characters[0].get("character_id", ""))
+            if not character_id:
+                return "发送失败：角色列表为空"
+            ok = await bot.send_group_ai_record(group_id, character_id, text)
+            if ok:
+                name = next((c.get("character_name", "") for c in characters
+                             if str(c.get("character_id", "")) == character_id), "")
+                return f"语音已发送 ✓（音色: {name or character_id}）"
+            return "语音发送失败（NapCat 需开启 packet 服务，或该音色不可用）"
+
         elif tool_name == "check_url_safety":
             url = str(tool_input.get("url", ""))
             level = await bot.check_url_safely(url)
@@ -1440,6 +1923,45 @@ async def execute_tool(
             title = str(tool_input.get("title", ""))[:20]
             ok = await bot.set_group_special_title(group_id, uid, title)
             return f"已设置头衔为「{title}」✓" if ok else "设置失败（Bot 不是群主？）"
+
+        # ── 全群设置三件套（仅主人） ──
+        elif tool_name in ("set_invite_policy", "set_member_permissions", "set_new_member_visibility"):
+            # 与 relay_db_execute 一致的主人校验：改的是全群设置，只放行主人
+            from .config import config as _cfg
+            if not (master_instructed or str(caller_qq) == str(_cfg.OWNER_QQ)):
+                logger.warning(f"拒绝非主人修改全群设置: caller={caller_qq} tool={tool_name}")
+                return "⨯ 这个改动影响全群设置，只有主人本人才行"
+
+            if tool_name == "set_invite_policy":
+                policy = str(tool_input.get("policy", "") or "").strip()
+                if policy not in ("disabled", "require_approval", "no_approval", "no_approval_under_100"):
+                    return ("⨯ policy 必须是 disabled/require_approval/"
+                            "no_approval/no_approval_under_100 之一")
+                ok = await bot.set_group_member_invite_policy(group_id, policy)
+                return f"成员邀请策略已设为 {policy} ✓" if ok else "设置失败"
+
+            elif tool_name == "set_member_permissions":
+                up = tool_input.get("allow_upload_album")
+                tmp = tool_input.get("allow_temporary_session")
+                cg = tool_input.get("allow_create_group")
+                if up is None and tmp is None and cg is None:
+                    return ("⨯ 至少传一项：allow_upload_album / "
+                            "allow_temporary_session / allow_create_group")
+                ok = await bot.set_group_member_permissions(
+                    group_id,
+                    allow_upload_album=up,
+                    allow_temporary_session=tmp,
+                    allow_create_group=cg,
+                )
+                return "成员功能权限已更新 ✓" if ok else "设置失败"
+
+            else:  # set_new_member_visibility
+                visible = tool_input.get("visible")
+                if visible is None:
+                    return "需要提供 visible（true=新成员可看最近聊天记录）"
+                ok = await bot.set_group_new_member_history_visibility(group_id, bool(visible))
+                state_cn = "可见" if visible else "不可见"
+                return f"新成员对最近聊天记录已设为{state_cn} ✓" if ok else "设置失败"
 
         # ── 撤销最近动作（主人自然语言撤销） ──
         elif tool_name == "undo_recent_action":

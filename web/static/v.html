@@ -7,65 +7,216 @@
 <style>
   :root {
     --accent: #2f6f57;
+    --accent2: #3a8c6c;
     --accent3: #5fa286;
     --accent-soft: #eaf3ee;
-    --red: #c2363d;
+    --bg1: #1d5741;
+    --bg2: #3f8c6e;
+    --red: #d64545;
+    --red-soft: #fdecec;
+    --green: #2f9e44;
+    --green-soft: #f0f9f1;
     --fg: #1c1d22;
     --fg2: #5b5d68;
     --fg3: #8d8f99;
+    --line: #e4e7ee;
+    --radius: 14px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
   body {
-    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: linear-gradient(135deg, var(--accent) 0%, var(--accent3) 100%);
-    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: radial-gradient(ellipse at 50% 0%, var(--bg2) 0%, var(--bg1) 75%);
+    min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
     padding: 20px; color: var(--fg);
+    -webkit-font-smoothing: antialiased;
+    -webkit-tap-highlight-color: transparent;
   }
   .card {
-    background: #fff; border-radius: 16px; padding: 32px 24px;
-    max-width: 360px; width: 100%; text-align: center;
-    box-shadow: 0 10px 40px rgba(0,0,0,.15);
+    background: #fff;
+    border-radius: 22px;
+    padding: 40px 32px 28px;
+    max-width: 380px; width: 100%;
+    text-align: center;
+    box-shadow: 0 24px 64px rgba(0,0,0,.22), 0 4px 12px rgba(0,0,0,.06);
+    animation: cardIn .45s cubic-bezier(.2,.8,.2,1);
   }
-  .brand { font-size: 40px; margin-bottom: 8px; }
-  h1 { font-size: 20px; margin-bottom: 6px; }
-  .sub { font-size: 13px; color: var(--fg3); margin-bottom: 24px; }
-  #step-captcha { margin-bottom: 20px; display: flex; justify-content: center; min-height: 65px; }
-  #step-code { display: none; }
+  @keyframes cardIn {
+    from { opacity: 0; transform: translateY(24px) scale(.97); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .brand {
+    width: 56px; height: 56px; margin: 0 auto 16px;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent3) 100%);
+    border-radius: 16px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 28px;
+    box-shadow: 0 8px 22px rgba(47,111,87,.4);
+  }
+  h1 { font-size: 22px; font-weight: 600; margin-bottom: 6px; letter-spacing: -.01em; }
+  .sub { font-size: 13px; color: var(--fg3); margin-bottom: 26px; }
+
+  /* ── 类 Turnstile 验证框 ── */
+  .captcha-slot { min-height: 72px; margin-bottom: 4px; }
+  .captcha-box {
+    position: relative;
+    background: var(--accent-soft);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    display: flex; align-items: center; gap: 14px;
+    transition: border-color .2s, background .2s, box-shadow .2s;
+  }
+  .captcha-box.verifying { border-color: var(--accent3); box-shadow: 0 0 0 3px rgba(95,162,134,.15); }
+  .captcha-box.success { border-color: var(--green); background: var(--green-soft); }
+  .captcha-box.error { border-color: var(--red); background: var(--red-soft); animation: shake .35s; }
+  @keyframes shake {
+    0%,100% { transform: translateX(0); }
+    25% { transform: translateX(-6px); }
+    75% { transform: translateX(6px); }
+  }
+
+  .cb-check {
+    width: 28px; height: 28px; flex-shrink: 0;
+    border-radius: 7px;
+    border: 2px solid var(--accent);
+    background: #fff;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: background .2s, border-color .2s, transform .12s;
+    user-select: none;
+  }
+  .cb-check:hover { background: #fff; }
+  .cb-check:active { transform: scale(.94); }
+  .captcha-box.verifying .cb-check,
+  .captcha-box.success .cb-check { background: var(--accent); border-color: var(--accent); }
+  .captcha-box.success .cb-check { background: var(--green); border-color: var(--green); }
+
+  .cb-check svg {
+    width: 16px; height: 16px;
+    color: #fff; stroke-width: 3.2;
+    opacity: 0; transform: scale(.4);
+    transition: opacity .2s, transform .25s cubic-bezier(.2,.9,.3,1.4);
+  }
+  .captcha-box.success .cb-check svg { opacity: 1; transform: scale(1); }
+
+  .cb-label {
+    flex: 1; text-align: left;
+    font-size: 15px; color: var(--fg);
+    user-select: none; line-height: 1.3;
+  }
+  .cb-brand {
+    font-size: 10.5px; color: var(--fg3);
+    padding-left: 10px; margin-left: auto;
+    border-left: 1px solid var(--line);
+    line-height: 1.35; text-align: right;
+    align-self: center;
+  }
+  .cb-brand b { color: var(--accent); font-weight: 600; display: block; font-size: 11px; }
+
+  .spinner {
+    position: absolute; top: 50%; left: 22px;
+    width: 24px; height: 24px; margin-top: -12px;
+    border: 2.5px solid rgba(47,111,87,.2);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+    display: none;
+  }
+  .captcha-box.verifying .spinner { display: block; }
+  .captcha-box.verifying .cb-check { background: var(--accent); border-color: var(--accent); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── 验证词区 ── */
+  .code-block { margin-top: 22px; display: none; animation: fadeUp .4s cubic-bezier(.2,.8,.2,1); }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .code-label {
+    font-size: 11px; color: var(--fg3); margin-bottom: 8px;
+    letter-spacing: .08em; text-transform: uppercase; font-weight: 600;
+  }
   .code-word {
-    font-size: 48px; font-weight: 700; letter-spacing: 8px;
-    color: var(--accent); margin: 16px 0; padding: 16px;
-    background: var(--accent-soft); border-radius: 12px;
+    font-size: 42px; font-weight: 700;
+    color: var(--accent);
+    padding: 16px 8px;
+    background: var(--accent-soft);
+    border-radius: 12px;
+    margin-bottom: 14px;
+    font-family: ui-monospace, "SF Mono", "PingFang SC", monospace;
+    letter-spacing: .15em;
+    text-indent: .15em;
   }
-  .hint { font-size: 13px; color: var(--fg2); line-height: 1.6; margin-top: 12px; }
-  .err { color: var(--red); font-size: 14px; margin-top: 12px; }
-  .loading { color: var(--fg3); font-size: 13px; }
+  .hint { font-size: 13px; color: var(--fg2); line-height: 1.6; }
+  .hint strong { color: var(--accent); }
+  .hint .warn { color: var(--red); }
+
+  .err {
+    color: var(--red); font-size: 13.5px;
+    margin-top: 12px; min-height: 18px; line-height: 1.4;
+  }
+  .footer {
+    margin-top: 22px; padding-top: 16px;
+    border-top: 1px dashed var(--line);
+    font-size: 11px; color: var(--fg3); line-height: 1.7;
+  }
+  .footer code {
+    background: var(--accent-soft); padding: 1px 5px;
+    border-radius: 4px; color: var(--accent); font-size: 11px;
+  }
+
+  #turnstile-slot { display: none; }
+  #turnstile-slot .cf-turnstile { display: inline-block; }
+
+  @media (max-width: 380px) {
+    .card { padding: 32px 22px 24px; }
+    .code-word { font-size: 34px; letter-spacing: .1em; }
+    h1 { font-size: 20px; }
+  }
 </style>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" async defer></script>
 </head>
 <body>
 <div class="card">
   <div class="brand">🔐</div>
   <h1>加群验证</h1>
-  <div class="sub">完成下方验证获取验证词</div>
+  <div class="sub">完成下方验证以获取验证词</div>
 
-  <div id="step-captcha">
-    <div id="turnstile-box"></div>
+  <div class="captcha-slot">
+    <!-- 自托管按钮（未配 Turnstile 时显示） -->
+    <div class="captcha-box" id="cb-box">
+      <div class="cb-check" id="cb-check" role="checkbox" aria-checked="false" tabindex="0">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="5 12 10 17 19 7"></polyline>
+        </svg>
+        <div class="spinner"></div>
+      </div>
+      <div class="cb-label" id="cb-label">我是人类</div>
+      <div class="cb-brand"><b>qqbot</b>安全验证</div>
+    </div>
+
+    <!-- Turnstile slot（配了 sitekey 时显示） -->
+    <div id="turnstile-slot">
+      <div id="turnstile-box"></div>
+    </div>
   </div>
 
-  <div id="step-code">
-    <div class="loading" id="loading-tip">正在获取验证词…</div>
-    <div class="code-word" id="code-display" style="display:none"></div>
-    <div class="hint" id="code-hint" style="display:none">
-      请把上方的词 <strong>@机器人</strong> 发到群里完成验证<br>
-      <span style="color:var(--red)">词必须完全一致（空格标点可忽略）</span>
+  <div class="code-block" id="code-block">
+    <div class="code-label">你的验证词</div>
+    <div class="code-word" id="code-display"></div>
+    <div class="hint">
+      把上方的词 <strong>@机器人</strong> 发到群里完成验证<br>
+      <span class="warn">词必须完全一致（空格标点可忽略）</span>
     </div>
   </div>
 
   <div class="err" id="err-tip"></div>
 
-  <div class="hint" style="margin-top:20px;color:#aaa">
-    打不开？复制链接到系统浏览器打开<br>
-    链接失效？在群里联系管理员
+  <div class="footer">
+    链接 5 分钟内有效 · 失效请在群里重新触发<br>
+    打不开？复制链接到 <code>系统浏览器</code> 打开
   </div>
 </div>
 
@@ -73,80 +224,181 @@
 (function() {
   var m = location.pathname.match(/^\/v\/([A-Za-z0-9_-]+)/);
   var token = m ? m[1] : "";
-  var errEl = document.getElementById("err-tip");
-  var captchaStep = document.getElementById("step-captcha");
-  var codeStep = document.getElementById("step-code");
-  var codeDisplay = document.getElementById("code-display");
-  var codeHint = document.getElementById("code-hint");
-  var loadingTip = document.getElementById("loading-tip");
-  var sitekey = "";
-  var rendered = false;
+  var errEl  = document.getElementById("err-tip");
+  var box    = document.getElementById("cb-box");
+  var check  = document.getElementById("cb-check");
+  var label  = document.getElementById("cb-label");
+  var codeBlock  = document.getElementById("code-block");
+  var codeDisplay= document.getElementById("code-display");
+  var tsSlot     = document.getElementById("turnstile-slot");
+  var sitekey    = null;
+  var rendered   = false;
+  var locked     = false;
+  var loadedAt   = Date.now();
+
+  // ─── 行为采集 ───
+  var evMoves = 0, evPath = 0, lastX = -1, lastY = -1;
+  var evTouch = 0, evKeys = 0;
+  document.addEventListener("mousemove", function(e) {
+    evMoves++;
+    if (lastX >= 0) {
+      var dx = e.clientX - lastX, dy = e.clientY - lastY;
+      evPath += Math.sqrt(dx*dx + dy*dy);
+    }
+    lastX = e.clientX; lastY = e.clientY;
+  }, { passive: true });
+  document.addEventListener("touchstart", function() { evTouch++; }, { passive: true });
+  document.addEventListener("touchmove",  function() { evTouch++; }, { passive: true });
+  document.addEventListener("keydown",    function() { evKeys++; });
 
   if (!token) {
     errEl.textContent = "验证链接无效，请重新触发";
-    captchaStep.style.display = "none";
+    box.style.display = "none";
     return;
   }
 
-  // 拉取 sitekey 配置
-  fetch("/api/verify/config").then(function(r) { return r.json(); }).then(function(d) {
+  // ─── 渲染调度：等 sitekey 拉到决定走哪条路 ───
+  function tryRender() {
+    if (rendered || sitekey === null) return;
+    if (sitekey && !window.turnstile) return;   // 等 api.js
+    rendered = true;
+    if (sitekey) {
+      // 配了 Turnstile：隐藏自托管按钮，渲染真的
+      box.style.display = "none";
+      tsSlot.style.display = "block";
+      turnstile.render("#turnstile-box", {
+        sitekey: sitekey,
+        callback: function(cfToken) { submitCode({ cf_token: cfToken }); },
+        "error-callback": function() {
+          errEl.textContent = "人机验证失败，请刷新重试";
+        }
+      });
+    }
+    // 没配 sitekey：自托管按钮默认就显示，等用户点
+  }
+
+  fetch("/api/verify/config").then(function(r){return r.json();}).then(function(d) {
     sitekey = d.sitekey || "";
-    if (window.turnstile) { renderTs(); }
+    tryRender();
   }).catch(function() {
-    // 拉配置失败，继续（sitekey 为空时后端降级）
-    if (window.turnstile) { renderTs(); }
+    sitekey = "";
+    tryRender();
   });
 
-  // Turnstile api.js 加载完且 sitekey 就绪后 render
-  window.onloadTurnstileCallback = function() {
-    if (sitekey !== null && !rendered) { renderTs(); }
-  };
-  // 兜底：如果 api.js 已加载（event 漏触发）
-  if (window.turnstile) { renderTs(); }
+  window.onloadTurnstileCallback = function() { tryRender(); };
 
-  function renderTs() {
-    if (rendered) return;
-    rendered = true;
-    if (!sitekey) {
-      // 未配置 sitekey → 直接拉词（后端降级）
-      fetchCode(token, "");
-      return;
-    }
-    turnstile.render("#turnstile-box", {
-      sitekey: sitekey,
-      callback: function(cfToken) { fetchCode(token, cfToken); },
-      "error-callback": function() {
-        errEl.textContent = "人机验证失败，请刷新重试";
+  // ─── 自托管按钮点击 ───
+  function handleClick() {
+    if (locked || rendered && sitekey) return;
+    locked = true;
+    box.classList.remove("error");
+    box.classList.add("verifying");
+    errEl.textContent = "";
+
+    buildProof().then(function(proof) {
+      return fetch("/api/verify/code/" + token, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proof: proof })
+      });
+    }).then(function(r) {
+      if (!r.ok) {
+        return r.json().then(function(j) {
+          throw new Error((j && j.detail) || "验证失败");
+        });
       }
+      return r.json();
+    }).then(function(d) {
+      onSuccess(d);
+    }).catch(function(e) {
+      locked = false;
+      box.classList.remove("verifying");
+      box.classList.add("error");
+      label.textContent = "点击重试";
+      errEl.textContent = e.message || "验证失败，请重试";
+    });
+  }
+  check.addEventListener("click", handleClick);
+  check.addEventListener("keydown", function(e) {
+    if (e.key === " " || e.key === "Enter") { e.preventDefault(); handleClick(); }
+  });
+
+  // ─── 构造证明 ───
+  function buildProof() {
+    var bits = 14;
+    return solvePow(token, bits).then(function(nonce) {
+      return {
+        pow: { nonce: nonce, bits: bits },
+        ts: Date.now(),
+        loadedAt: loadedAt,
+        events: {
+          mouseMoves: evMoves,
+          mousePath: Math.round(evPath * 10) / 10,
+          touchEvents: evTouch,
+          keysPressed: evKeys
+        },
+        env: {
+          webdriver: navigator.webdriver === true,
+          pluginCount: (navigator.plugins || { length: 0 }).length,
+          langCount: (navigator.languages || []).length,
+          screenW: screen.width,
+          screenH: screen.height,
+          tz: (Intl.DateTimeFormat().resolvedOptions() || {}).timeZone || ""
+        }
+      };
     });
   }
 
-  function fetchCode(token, cfToken) {
-    captchaStep.style.display = "none";
-    codeStep.style.display = "block";
+  // ─── PoW：sha256(token + ":" + nonce) 前 N 位为 0 ───
+  function solvePow(challenge, bits) {
+    var target = Math.pow(2, 32 - bits);
+    var nonce = 0;
+    var enc = new TextEncoder();
+    var start = Date.now();
+    function step() {
+      var data = enc.encode(challenge + ":" + nonce);
+      return crypto.subtle.digest("SHA-256", data).then(function(hash) {
+        var view = new DataView(hash);
+        if (view.getUint32(0) < target) return nonce;
+        nonce++;
+        if (nonce > 5_000_000) throw new Error("计算异常");
+        if (Date.now() - start > 8000) throw new Error("求解超时");
+        // 每 256 次让出一次事件循环，避免卡死 UI / spinner
+        if ((nonce & 0xff) === 0) {
+          return new Promise(function(resolve) { setTimeout(resolve, 0); }).then(step);
+        }
+        return step();
+      });
+    }
+    return step();
+  }
+
+  function submitCode(payload) {
     fetch("/api/verify/code/" + token, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cf_token: cfToken })
-    })
-    .then(function(r) {
+      body: JSON.stringify(payload)
+    }).then(function(r) {
       if (!r.ok) {
         return r.json().then(function(j) {
           throw new Error((j && j.detail) || "获取验证词失败");
         });
       }
       return r.json();
-    })
-    .then(function(d) {
-      loadingTip.style.display = "none";
+    }).then(function(d) {
+      codeBlock.style.display = "block";
       codeDisplay.textContent = d.code;
-      codeDisplay.style.display = "block";
-      codeHint.style.display = "block";
-    })
-    .catch(function(e) {
-      loadingTip.style.display = "none";
+    }).catch(function(e) {
       errEl.textContent = e.message || "获取失败";
     });
+  }
+  function onSuccess(d) {
+    box.classList.remove("verifying");
+    box.classList.add("success");
+    label.textContent = "已验证";
+    check.setAttribute("aria-checked", "true");
+    codeBlock.style.display = "block";
+    codeDisplay.textContent = d.code;
   }
 })();
 </script>

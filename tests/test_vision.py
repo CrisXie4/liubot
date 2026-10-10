@@ -14,10 +14,22 @@ except Exception:
     pass
 
 import httpx
+from dotenv import load_dotenv
 
-API_URL = "https://api.ccode.vip/v1/messages"
-API_KEY = "sk-CFUDbSygYY8yvdL2tuNzllwkJs696XGTYLVTmr0KX333oRLO"
-IMG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "baidu.png")
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
+API_URL = os.getenv("LLM_API_URL", "https://api.ccode.vip") + "/v1/messages"
+API_KEY = os.getenv("LLM_API_KEY", "")
+if not API_KEY:
+    # 回退：从 bot 的模型设置里取（data/model_settings.json）
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from bot import memory as _mem
+        API_KEY = _mem.load_model_settings().get("api_key", "")
+    except Exception:
+        pass
+
+IMG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "baidu.png")
 
 
 async def test_vision(model: str) -> tuple[bool, str]:

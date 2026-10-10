@@ -4,7 +4,7 @@ Bot 配置管理模块
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(encoding="utf-8-sig")
 
 
 class Config:
@@ -25,6 +25,11 @@ class Config:
     LLM_FALLBACK_MODEL: str = os.getenv("LLM_FALLBACK_MODEL", "minimax-m3-free")
     # 图片审核/理解专用模型（必须支持 vision 输入）
     LLM_VISION_MODEL: str = os.getenv("LLM_VISION_MODEL", "minimax-m3-free")
+    # 额外 provider 注入（JSON 数组字符串，格式见 .env.example）：
+    # 免密钥公共端点 / 本地 llama.cpp 等。加渠道只需改 .env，不用动 data/。
+    LLM_EXTRA_PROVIDERS: str = os.getenv("LLM_EXTRA_PROVIDERS", "")
+    # true = 只用 LLM_EXTRA_PROVIDERS 注入的渠道，默认渠道和 data/ 里的 JSON 渠道全部停用
+    LLM_PROVIDERS_EXCLUSIVE: bool = os.getenv("LLM_PROVIDERS_EXCLUSIVE", "false").lower() == "true"
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.8"))
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "300"))
 
@@ -44,6 +49,10 @@ class Config:
     WEB_ALLOWED_IPS: list[str] = [
         ip.strip() for ip in os.getenv("WEB_ALLOWED_IPS", "").split(",") if ip.strip()
     ]  # IP 白名单（逗号分隔）
+
+    # --- 中转站数据库（Neon Postgres）---
+    # AI 只读查询用（写操作仅限主人）。留空则不启用中转站数据库工具。
+    RELAY_DB_URL: str = os.getenv("RELAY_DB_URL", "")
 
     # --- 网站认证（加群验证网站模式）---
     TURNSTILE_SITE_KEY: str = os.getenv("TURNSTILE_SITE_KEY", "")

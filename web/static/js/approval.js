@@ -18,7 +18,7 @@ async function apLoad() {
         <button class="btn xs danger" onclick="apOK('${attr(p.id)}','reject')">拒绝</button>
       </div></td>
     </tr>`,
-    '📋', '没有待审批');
+    'audit', '没有待审批');
 }
 
 async function apOK(id, act) {

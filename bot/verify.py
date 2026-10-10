@@ -11,6 +11,7 @@
 题目会记录去重，避免重复出题。
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -56,6 +57,13 @@ _WEB_CODE_FALLBACK = [
     "星空", "咖啡", "晚风", "远山", "清风",
     "晚霞", "月光", "晨雾", "海浪", "竹林",
 ]
+
+# ─── 自托管人机验证（未配 Turnstile 时启用）───
+# PoW 难度：sha256(token + ":" + nonce) 前 LOCAL_POW_BITS 位为 0
+LOCAL_POW_BITS = 14        # 平均 16384 次迭代，真实浏览器 200-800ms
+LOCAL_POW_MAXWAIT_MS = 10000   # 单次求解最长时间（防 DoS）
+LOCAL_MIN_HUMAN_MS = 1200      # 页面加载到提交的最短时间（太快=脚本）
+LOCAL_MAX_HUMAN_MS = 300_000   # 最长时间（超过即过期）
 
 
 def _get_client():
@@ -232,6 +240,121 @@ async def reveal_web_code(token: str, cf_token: str, remote_ip: str = "") -> dic
     return {"ok": True, "code": entry["code"]}
 
 
+# ═══════════════════════════════════════════════════════════
+#  自托管人机证明校验（未配 Turnstile 时使用）
+# ═══════════════════════════════════════════════════════════
+
+def _count_leading_zero_bits(b: bytes) -> int:
+    """统计 bytes 的前导 0 位"""
+    bits = 0
+    for byte in b:
+        if byte == 0:
+            bits += 8
+            continue
+        v = byte
+        while (v & 0x80) == 0:
+            bits += 1
+            v <<= 1
+        break
+    return bits
+
+
+def _verify_pow(token: str, nonce: int, bits: int) -> bool:
+    """校验 PoW：sha256(token + ':' + nonce) 前导 0 位 >= bits"""
+    if bits < 8 or bits > 24:
+        return False                       # 难度异常范围拒绝
+    if not isinstance(nonce, int) or nonce < 0 or nonce > 5_000_000:
+        return False
+    h = hashlib.sha256(f"{token}:{nonce}".encode()).digest()
+    return _count_leading_zero_bits(h) >= bits
+
+
+def _verify_local_proof(token: str, proof: dict) -> tuple[bool, str]:
+    """
+    校验自托管人机证明。返回 (ok, reason)。
+
+    证据组合：
+      1. PoW（核心抗脚本批量调用）
+      2. 时间窗（页面停留过短=机器人）
+      3. 行为指纹（鼠标轨迹 / 触摸事件）
+      4. 环境检测（webdriver / 无插件 / 无语言）
+    任何一项硬失败就拒绝；行为打分累计 < -1 也拒绝。
+    """
+    if not isinstance(proof, dict):
+        return False, "证明格式无效"
+
+    # ── 1. PoW（硬校验）──
+    pow_obj = proof.get("pow") or {}
+    nonce = pow_obj.get("nonce")
+    bits = pow_obj.get("bits", LOCAL_POW_BITS)
+    if nonce is None:
+        return False, "工作量证明缺失"
+    if not _verify_pow(token, nonce, bits):
+        return False, "工作量证明不通过"
+
+    # ── 2. 时间窗 ──
+    try:
+        ts = int(proof.get("ts", 0))
+        loaded_at = int(proof.get("loadedAt", 0))
+    except (TypeError, ValueError):
+        return False, "时间戳无效"
+    if not ts or not loaded_at:
+        return False, "时间戳缺失"
+
+    now_ms = int(time.time() * 1000)
+    if abs(now_ms - ts) > 60_000:
+        return False, "请求已过期"           # 时钟漂移容忍 60s
+    elapsed = ts - loaded_at
+    if elapsed < LOCAL_MIN_HUMAN_MS:
+        return False, "响应过快"
+    if elapsed > LOCAL_MAX_HUMAN_MS:
+        return False, "请求超时"
+
+    # ── 3 & 4. 行为 + 环境打分 ──
+    env = proof.get("env") or {}
+    events = proof.get("events") or {}
+
+    # 硬失败：webdriver
+    if env.get("webdriver") is True:
+        return False, "自动化环境检测"
+
+    score = 0
+    # headless 嫌疑
+    if env.get("pluginCount", -1) == 0 and env.get("langCount", -1) == 0:
+        score -= 2
+    # 行为：桌面端需要鼠标轨迹，移动端需要触摸
+    mouse_moves = events.get("mouseMoves", 0)
+    touch_events = events.get("touchEvents", 0)
+    mouse_path = events.get("mousePath", 0)
+    if mouse_moves < 2 and touch_events < 2:
+        score -= 3                          # 几乎没有任何指针活动
+    elif mouse_path < 20 and touch_events < 2:
+        score -= 2                          # 路径过短（直线/无移动）
+    # 键盘活动作为弱信号
+    if events.get("keysPressed", 0) > 0:
+        score += 1
+
+    if score < -1:
+        return False, "行为特征异常"
+
+    return True, "OK"
+
+
+async def _record_proof_failure(token: str) -> dict:
+    """记录一次本地证明失败，返回状态。
+    返回 {kicked: bool, attempts: int, max: int}。kicked=True 表示失败次数已满。
+    """
+    entry = _web_pending.get(token)
+    if not entry:
+        return {"kicked": True, "attempts": MAX_WRONG_ATTEMPTS_WEB, "max": MAX_WRONG_ATTEMPTS_WEB}
+    entry["wrong_attempts"] += 1
+    a = entry["wrong_attempts"]
+    if a >= MAX_WRONG_ATTEMPTS_WEB:
+        _cleanup_web_token(token)
+        return {"kicked": True, "attempts": a, "max": MAX_WRONG_ATTEMPTS_WEB}
+    return {"kicked": False, "attempts": a, "max": MAX_WRONG_ATTEMPTS_WEB}
+
+
 async def consume_web_challenge(group_id: int, user_id: int, user_answer: str) -> dict:
     """新人群里发词时调，本地比对。返回 verdict + 元信息。
 
@@ -301,10 +424,21 @@ async def _handle_web_answer(bot, event: dict, group_id: int, user_id: int, raw:
 
     # 查用户名（从 entry 拿）
     user_name = str(user_id)
+    entry = None
     for e in _web_pending.values():
         if e["group_id"] == group_id and e["user_id"] == user_id:
+            entry = e
             user_name = e.get("user_name", user_name)
             break
+
+    # 过期兜底：超时任务没接住时，这里也要撤回+踢，别让它带着消息赖着不走
+    if entry and time.time() - entry["created_at"] > VERIFY_TIMEOUT:
+        _cleanup_web_user(group_id, user_id)
+        logger.info(f"🌐 网站验证超时(答题兜底): {user_name}({user_id}) → 撤回+踢出")
+        _log_verification(user_id, user_name, group_id, "timeout_web",
+                          "", "", "超时未完成", method="web", attempts=0)
+        await _recall_and_kick(bot, group_id, user_id, reason="网站验证超时")
+        return True
 
     logger.info(f"🌐 网站验证回答: {user_name}({user_id}) → \"{raw[:30]}\"")
 
@@ -324,12 +458,14 @@ async def _handle_web_answer(bot, event: dict, group_id: int, user_id: int, raw:
             await send_human_like(
                 bot, group_id,
                 f"{at_seg} 请把网站上的词发到群里哦~ 📝",
+                priority=True,
             )
         except Exception:
             pass
         return True
 
     if verdict == "correct":
+        _forget_pending_messages(group_id, user_id)  # 通过了，之前的消息不用撤
         attempts = result.get("attempts", 1)
         logger.info(f"✅ 网站验证通过: {user_name}({user_id}) 群{group_id} (第{attempts}次)")
         _log_verification(user_id, user_name, group_id, "approved_web",
@@ -339,6 +475,7 @@ async def _handle_web_answer(bot, event: dict, group_id: int, user_id: int, raw:
             await send_human_like(
                 bot, group_id,
                 f"✅ {at_seg} 回答正确，欢迎入群~ :96:",
+                priority=True,
             )
         except Exception:
             pass
@@ -372,13 +509,11 @@ async def _handle_web_answer(bot, event: dict, group_id: int, user_id: int, raw:
                 await send_human_like(
                     bot, group_id,
                     f"❌ {at_seg} 答错了，再见~ :178:",
+                    priority=True,
                 )
             except Exception:
                 pass
-            try:
-                await bot._call("set_group_kick", {"group_id": group_id, "user_id": user_id})
-            except Exception as e:
-                logger.error(f"踢人失败: {e}")
+            await _recall_and_kick(bot, group_id, user_id, reason="网站验证失败")
         else:
             remaining = max_a - attempts
             logger.info(f"❌ 网站验证答错({attempts}/{max_a}): {user_name}({user_id})")
@@ -386,6 +521,7 @@ async def _handle_web_answer(bot, event: dict, group_id: int, user_id: int, raw:
                 await send_human_like(
                     bot, group_id,
                     f"❌ {at_seg} 码不对哦，再去网站仔细看看~ 还有 {remaining} 次机会",
+                    priority=True,
                 )
             except Exception:
                 pass
@@ -446,6 +582,28 @@ async def handle_group_add_request(bot, event: dict):
 #  入口 2: 成员入群通知 → 群里 @ 出题
 # ═══════════════════════════════════════════════════════════
 
+# 最近被验证接管的新人: group_id -> {user_id: (名字, 时间戳)}。
+# 决策引擎据此避让 —— 验证系统已经单行 @ 出题，AI 聊天若对
+# "XX 进群了"再补一句欢迎，两条叠一起就是连环刷屏（09-25 反馈）。
+_recent_joins: dict[int, dict[int, tuple[str, float]]] = {}
+JOIN_AVOID_WINDOW = 180.0
+
+
+def note_recent_join(group_id: int, user_id: int, user_name: str):
+    _recent_joins.setdefault(group_id, {})[user_id] = (user_name, time.time())
+
+
+def get_recent_joins(group_id: int) -> list[tuple[int, str]]:
+    """返回 JOIN_AVOID_WINDOW 秒内被验证接管的新人 [(user_id, 名字)]"""
+    now = time.time()
+    d = _recent_joins.get(group_id, {})
+    hits = [(uid, name) for uid, (name, ts) in d.items() if now - ts < JOIN_AVOID_WINDOW]
+    if len(hits) < len(d):  # 顺手清过期条目，防长期运行膨胀
+        for uid in [u for u, (_, ts) in d.items() if now - ts >= JOIN_AVOID_WINDOW]:
+            d.pop(uid, None)
+    return hits
+
+
 async def handle_member_increase(bot, event: dict) -> bool:
     """
     新人入群 → 群里 @ 出题。
@@ -467,6 +625,18 @@ async def handle_member_increase(bot, event: dict) -> bool:
 
     if not group_id or not user_id or user_id == bot_qq:
         return False
+
+    # 取昵称（提前到所有分流之前：避让登记和每条路径都用得上）
+    user_name = str(user_id)
+    try:
+        info = await bot.get_group_member_info(group_id, user_id)
+        if info:
+            card = (info.get("card", "") or "").strip()
+            nick = (info.get("nickname", "") or "").strip()
+            user_name = card or nick or user_name
+    except Exception:
+        pass
+    note_recent_join(group_id, user_id, user_name)
 
     # 免验证白名单 → 直接放行（Task 5 新增）
     if is_whitelisted(user_id, group_id):
@@ -501,17 +671,6 @@ async def handle_member_increase(bot, event: dict) -> bool:
             pass
         return True  # 已踢，阻止 handler 发欢迎
 
-    # 取昵称
-    user_name = str(user_id)
-    try:
-        info = await bot.get_group_member_info(group_id, user_id)
-        if info:
-            card = (info.get("card", "") or "").strip()
-            nick = (info.get("nickname", "") or "").strip()
-            user_name = card or nick or user_name
-    except Exception:
-        pass
-
     # ── 模式分流：网站认证 or AI 出题 ──
     if _pick_web_mode():
         # ── 网站认证模式 ──
@@ -525,22 +684,28 @@ async def handle_member_increase(bot, event: dict) -> bool:
             from .humanizer import send_human_like
             at_seg = f"[CQ:at,qq={user_id}]"
             site_url = _build_site_url(token)
+            # 单行单条 —— 多行文案会被 humanizer 拆成几条连发，进群就是刷屏
             msg = (
-                f"{at_seg} 欢迎入群~\n"
-                f"请打开下面的链接完成验证（5分钟内）：\n\n"
-                f"🌐 {site_url}\n\n"
-                f"打开后点击「我是人类」按钮，\n"
-                f"把看到的词发到群里告诉我\n"
-                f"答对留下 :96:\n"
-                f"答错3次踢出 :178:"
+                f"{at_seg} 欢迎入群~ 请在5分钟内打开链接完成验证，"
+                f"把看到的词发到群里：{site_url}"
             )
+            sent: list = []
             try:
-                await send_human_like(bot, group_id, msg)
-                logger.info(f"网站验证: 已向 {user_name}({user_id}) 群{group_id} 发链接 token={token[:_TOKEN_LOG_LEN]}...")
+                sent = await send_human_like(bot, group_id, msg, priority=True, max_bubbles=1)
             except Exception as e:
                 logger.error(f"群内发送网站验证链接失败: {e}")
-                _cleanup_web_user(group_id, user_id)
-                return True  # 已尝试接管（虽失败），避免再发欢迎制造噪音
+            if not sent:
+                # 验证链接丢了新人就是无题被踢 → 不经冷却裸发兜底
+                mid = None
+                try:
+                    mid = await bot.send_group_msg(group_id, msg)
+                except Exception as e:
+                    logger.error(f"网站验证链接兜底发送异常: {e}")
+                if not mid:
+                    logger.error(f"网站验证链接兜底发送也失败，放弃接管: {user_name}({user_id}) 群{group_id}")
+                    _cleanup_web_user(group_id, user_id)
+                    return True  # 完全发不出去：不启动超时踢人，宁可放过不可错杀
+            logger.info(f"网站验证: 已向 {user_name}({user_id}) 群{group_id} 发链接 token={token[:_TOKEN_LOG_LEN]}...")
             asyncio.create_task(_timeout_kick_web(bot, group_id, user_id, user_name, token))
             return True  # 网站模式已发链接，阻止 handler 发欢迎
 
@@ -566,23 +731,31 @@ async def handle_member_increase(bot, event: dict) -> bool:
     }
     _used_questions.add(question)
 
-    # 群里 @ 新人出题（走 humanizer 拆条 + 拟人节奏）
+    # 群里 @ 新人出题 —— 固定单行单条（09-25 反馈：多行文案拆条连发=刷屏，
+    # 进群一句 @欢迎+题目 带过就够了），max_bubbles=1 保证 humanizer 不拆条
     from .humanizer import send_human_like
     at_seg = f"[CQ:at,qq={user_id}]"
-    msg = (
-        f"{at_seg} 欢迎入群~\n"
-        f"请回答验证题（5分钟内）：\n\n"
-        f"📝 {question}\n\n"
-        f"答对留下 :96:\n"
-        f"答错踢出 :178:"
-    )
+    msg = f"{at_seg} 欢迎入群~ 请回答验证题（5分钟内）：{question}"
+    sent: list = []
     try:
-        await send_human_like(bot, group_id, msg)
-        logger.info(f"加群验证: 已向 {user_name}({user_id}) 在群{group_id} 出题: {question[:30]}")
+        sent = await send_human_like(bot, group_id, msg, priority=True, max_bubbles=1)
     except Exception as e:
         logger.error(f"群内发送验证题失败: {e}")
-        _cleanup_user(group_id, user_id)
-        return True  # 已尝试接管（虽失败），避免再发欢迎
+    if not sent:
+        # 验证题丢了新人就是无题被踢（9-13 事故）→ 不经冷却裸发兜底
+        mid = None
+        try:
+            mid = await bot.send_group_msg(group_id, msg)
+            if mid:
+                logger.info(f"验证题裸发兜底: {user_name}({user_id}) 群{group_id}")
+        except Exception as e:
+            logger.error(f"验证题兜底发送异常: {e}")
+        if not mid:
+            logger.error(f"验证题兜底发送也失败，放弃接管: {user_name}({user_id}) 群{group_id}")
+            _cleanup_user(group_id, user_id)
+            return True  # 完全发不出去：不启动超时踢人，宁可放过不可错杀
+
+    logger.info(f"加群验证: 已向 {user_name}({user_id}) 在群{group_id} 出题: {question[:30]}")
 
     # 启动超时任务
     asyncio.create_task(_timeout_kick(bot, group_id, user_id, user_name))
@@ -596,15 +769,13 @@ async def _timeout_kick(bot, group_id: int, user_id: int, user_name: str):
         return  # 已经处理掉了
     logger.info(f"加群验证超时: {user_name}({user_id}) → 自动踢出")
     _log_verification(user_id, user_name, group_id, "timeout", "", "", "超时未回答")
-    try:
-        await bot._call("set_group_kick", {"group_id": group_id, "user_id": user_id})
-    except Exception as e:
-        logger.error(f"超时踢人失败: {e}")
+    await _recall_and_kick(bot, group_id, user_id, reason="验证超时")
     try:
         from .humanizer import send_human_like
         await send_human_like(
             bot, group_id,
             f"⏰ [CQ:at,qq={user_id}] 验证超时，已请出群聊~",
+            priority=True,
         )
     except Exception:
         pass
@@ -619,15 +790,13 @@ async def _timeout_kick_web(bot, group_id: int, user_id: int, user_name: str, to
     logger.info(f"🌐 网站验证超时: {user_name}({user_id}) → 自动踢出")
     _log_verification(user_id, user_name, group_id, "timeout_web",
                       "", "", "超时未完成", method="web", attempts=0)
-    try:
-        await bot._call("set_group_kick", {"group_id": group_id, "user_id": user_id})
-    except Exception as e:
-        logger.error(f"超时踢人失败: {e}")
+    await _recall_and_kick(bot, group_id, user_id, reason="网站验证超时")
     try:
         from .humanizer import send_human_like
         await send_human_like(
             bot, group_id,
             f"⏰ [CQ:at,qq={user_id}] 验证超时，已请出群聊~",
+            priority=True,
         )
     except Exception:
         pass
@@ -641,6 +810,64 @@ def _build_site_url(token: str) -> str:
     """
     site = os.getenv("WEB_VERIFY_SITE", "https://qqbot.crisxie.top")
     return f"{site.rstrip('/')}/v/{token}"
+
+
+# ═══════════════════════════════════════════════════════════
+#  待验证成员消息追踪 — 离场统一撤回
+# ═══════════════════════════════════════════════════════════
+#
+# 广告机器人套路：进群 → 刷广告 → 不答验证被踢/自己退群。
+# 自动审核漏掉的消息会永远留在群里，广告目的照样达成。
+# 所以待验证期间它发的每条消息都记下 message_id，
+# 不管以什么方式离场（答错踢/超时踢/被管理员踢/自己退群）全部撤回。
+
+_pending_msgs: dict[int, dict[int, list[int]]] = {}
+_PENDING_MSG_KEEP = 30  # 每人最多记 30 条，防刷屏撑爆内存
+
+
+def _track_pending_message(group_id: int, user_id: int, message_id: int) -> None:
+    """记录待验证成员发出的一条消息 id"""
+    ids = _pending_msgs.setdefault(group_id, {}).setdefault(user_id, [])
+    if message_id not in ids:
+        ids.append(message_id)
+        if len(ids) > _PENDING_MSG_KEEP:
+            del ids[: len(ids) - _PENDING_MSG_KEEP]
+
+
+def _forget_pending_messages(group_id: int, user_id: int) -> None:
+    """验证通过后调用：消息不撤回，停止追踪"""
+    g = _pending_msgs.get(group_id)
+    if g:
+        g.pop(user_id, None)
+        if not g:
+            _pending_msgs.pop(group_id, None)
+
+
+async def recall_pending_messages(bot, group_id: int, user_id: int, reason: str = "") -> int:
+    """撤回待验证成员在验证期间发的所有消息，返回成功条数。撤完停止追踪。"""
+    ids = list(_pending_msgs.get(group_id, {}).get(user_id) or [])
+    if not ids:
+        return 0
+    ok = 0
+    for mid in ids:
+        try:
+            if await bot.delete_msg(mid):
+                ok += 1
+        except Exception as e:
+            logger.debug(f"撤回未验证成员消息失败 msg={mid}: {e}")
+    _forget_pending_messages(group_id, user_id)
+    if ok:
+        logger.info(f"🧹 已撤回未验证成员 {user_id} 群{group_id} 的 {ok}/{len(ids)} 条消息（{reason or '离场'}）")
+    return ok
+
+
+async def _recall_and_kick(bot, group_id: int, user_id: int, reason: str) -> None:
+    """先撤回验证期间的全部消息，再踢人。验证失败/超时统一走这里。"""
+    await recall_pending_messages(bot, group_id, user_id, reason=reason)
+    try:
+        await bot._call("set_group_kick", {"group_id": group_id, "user_id": user_id})
+    except Exception as e:
+        logger.error(f"踢人失败: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -667,17 +894,28 @@ async def handle_group_verify_answer(bot, event: dict) -> bool:
         e["group_id"] == group_id and e["user_id"] == user_id
         for e in _web_pending.values()
     )
+    pending = _pending.get(group_id, {}).get(user_id)
+
+    if not web_entry_exists and not pending:
+        return False
+
+    # 待验证成员发的每条消息都记下 id —— 离场（踢出/退群）时统一撤回，
+    # 断掉广告机器人"刷完广告就退场"的路子
+    msg_id = event.get("message_id", 0)
+    if msg_id:
+        _track_pending_message(group_id, user_id, msg_id)
+
     if web_entry_exists:
         return await _handle_web_answer(bot, event, group_id, user_id, raw)
 
-    pending = _pending.get(group_id, {}).get(user_id)
-    if not pending:
-        return False
-
-    # 超时检查（理论上超时任务会清掉，这里兜底）
+    # 超时检查（理论上超时任务会清掉，这里兜底；兜底也要撤回+踢，别让消息留着）
     if time.time() - pending["created_at"] > VERIFY_TIMEOUT:
+        user_name_fb = pending["user_name"]
         _cleanup_user(group_id, user_id)
-        return False
+        _log_verification(user_id, user_name_fb, group_id, "timeout", "", "", "超时未回答")
+        logger.info(f"加群验证超时(答题兜底): {user_name_fb}({user_id}) → 撤回+踢出")
+        await _recall_and_kick(bot, group_id, user_id, reason="验证超时")
+        return True
 
     question = pending["question"]
     expected = pending["answer"]
@@ -695,6 +933,7 @@ async def handle_group_verify_answer(bot, event: dict) -> bool:
             await send_human_like(
                 bot, group_id,
                 f"{at_seg} 请直接回答验证题哦~ 📝 {question}",
+                priority=True,
             )
         except Exception:
             pass
@@ -715,6 +954,7 @@ async def handle_group_verify_answer(bot, event: dict) -> bool:
             await send_human_like(
                 bot, group_id,
                 f"✅ {at_seg} 回答正确，欢迎入群~ :96:",
+                priority=True,
             )
         except Exception:
             pass
@@ -740,6 +980,7 @@ async def handle_group_verify_answer(bot, event: dict) -> bool:
             await send_human_like(
                 bot, group_id,
                 f"{at_seg} 请回答验证题~ 📝 {question}",
+                priority=True,
             )
         except Exception:
             pass
@@ -756,6 +997,7 @@ async def handle_group_verify_answer(bot, event: dict) -> bool:
                 await send_human_like(
                     bot, group_id,
                     f"❌ {at_seg} 答错啦，还有 {remaining} 次机会~ 📝 {question}",
+                    priority=True,
                 )
             except Exception:
                 pass
@@ -767,15 +1009,16 @@ async def handle_group_verify_answer(bot, event: dict) -> bool:
             await send_human_like(
                 bot, group_id,
                 f"❌ {at_seg} 答错了，再见~ :178:",
+                priority=True,
             )
         except Exception:
             pass
-        try:
-            await bot._call("set_group_kick", {"group_id": group_id, "user_id": user_id})
-        except Exception as e:
-            logger.error(f"踢人失败: {e}")
+        await _recall_and_kick(bot, group_id, user_id, reason="验证失败")
 
+    # 走到这里的只剩"答对"和"答错被踢"两种，统一清验证记录和消息追踪
+    # （答错被踢时 recall 已经清过，这里再清一次无妨；答对则保住消息不撤）
     _cleanup_user(group_id, user_id)
+    _forget_pending_messages(group_id, user_id)
     return True
 
 
@@ -1185,6 +1428,7 @@ async def approve_pending(bot, group_id: int, user_id: int) -> bool:
         _cleanup_web_token(web_token)
     if pending:
         _cleanup_user(group_id, user_id)
+    _forget_pending_messages(group_id, user_id)  # 主人放行，之前的消息不撤
 
     method = "web" if web_entry else "quiz"
     _log_verification(user_id, user_name, group_id, "manual_approved",
@@ -1193,7 +1437,7 @@ async def approve_pending(bot, group_id: int, user_id: int) -> bool:
     try:
         from .humanizer import send_human_like
         from . import welcome as _welcome
-        await send_human_like(bot, group_id, f"✅ [CQ:at,qq={user_id}] 主人已放行，欢迎入群~ :96:")
+        await send_human_like(bot, group_id, f"✅ [CQ:at,qq={user_id}] 主人已放行，欢迎入群~ :96:", priority=True)
         welcome_msg = _welcome.get_welcome_message(group_id, user_name, user_id)
         if welcome_msg:
             await send_human_like(bot, group_id, welcome_msg)
