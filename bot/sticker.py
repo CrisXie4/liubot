@@ -193,6 +193,31 @@ def get_group_stickers(group_id: int, limit: int = 30) -> list[dict]:
     """获取某群常用表情"""
     return list_stickers(group_id=group_id, limit=limit)
 
+
+def recent_stickers_summary(group_id: int = 0, limit: int = 6) -> str:
+    """最近收藏的表情一览（给 AI「发同款」定位 sticker_id 用），按收藏先后倒序。
+
+    只列 face/image——mface 的 url 会过期（发送侧也禁用），列出来只会误导。
+    空库返回空串。
+    """
+    rows = [
+        s for s in _load_stickers().values()
+        if (not group_id or s.get("group_id") in (0, group_id))
+        and s.get("sticker_type") != "mface"
+    ]
+    rows.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
+    lines = []
+    for s in rows[:limit]:
+        stype = s.get("sticker_type", "?")
+        kind = {"image": "图/GIF", "face": "黄脸"}.get(stype, stype)
+        tags = "/".join((s.get("tags") or [])[:4]) or "无标签"
+        desc = (s.get("description") or "").strip()
+        line = f"#{s.get('id')} [{kind}] 标签:{tags}"
+        if desc:
+            line += f" {desc[:24]}"
+        lines.append(line)
+    return "\n".join(lines)
+
 def get_sticker_stats() -> dict:
     """表情库统计"""
     data = _load_stickers()
@@ -348,7 +373,17 @@ def pick_emotion_face(emotion: str, group_id: int = 0) -> str:
             if cq:
                 return cq
 
-    # 2) 内置黄脸（语义正确的兜底）
+    # 2) 表情目录含义直配：内置情绪表没覆盖的语义词先查目录
+    #    （2026-10-10 实录：吃瓜 兜底成 14 微笑，而目录里明明有 271:吃瓜——
+    #    语义跑偏不如直配；开心/尴尬这类情绪表已覆盖的词保持原路径不动）
+    from . import face_catalog as _fc
+    if emo not in EMOTION_FACE_MAP and emotion not in EMOTION_FACE_MAP:
+        for probe in {emo, emotion} - {""}:
+            for fid, meaning in _fc.FACE_CATALOG.items():
+                if probe == meaning or (len(probe) >= 2 and probe in meaning):
+                    return build_face_cq(fid)
+
+    # 3) 内置黄脸（语义正确的兜底）
     ids = EMOTION_FACE_MAP.get(emo, EMOTION_FACE_MAP.get(emotion, [14]))
     return build_face_cq(random.choice(ids))
 

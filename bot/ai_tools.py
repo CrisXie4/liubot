@@ -295,17 +295,18 @@ ALL_TOOLS = [
     {
         "name": "send_sticker",
         "description": (
-            "直接把一个表情发到群里（QQ大黄脸/动图/收藏的GIF），发送后你只需配一句话自然收尾。"
+            "直接把一个表情发到群里（收藏的GIF/图 > QQ大黄脸），发送后你只需配一句话自然收尾。"
             "适用场景：觉得对方可爱、被逗笑、想卖萌、表达情绪但文字不够时。"
-            "群友发了表情让你「也来一个/发同款/学一下」时，优先用本工具选相近情绪的，"
+            "群友发了表情让你「也来一个/发同款/学一下」时：优先从对话里的【最近收藏的表情】"
+            "找对应的 sticker_id 精准发那张图；找不到再用 emotion 选相近情绪，"
             "绝不要自己手写 CQ 码格式（会变成文字露馅）。"
-            "emotion 传情绪关键词，工具会优先从你收藏的表情里选合适的，没有就用QQ自带大黄脸兜底。"
-            "常用 emotion：开心/大笑/害羞/生气/哭泣/惊讶/喜欢/撒娇/调皮/安慰/无奈/卖萌/赞/鄙视/尴尬/害怕/疑问/无语/庆祝。"
+            "emotion 传情绪关键词（如 吃瓜/开心/无奈/赞/无语），会优先从收藏里语义匹配。"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "emotion": {"type": "string", "description": "情绪关键词，如 开心/无奈/赞/哭。空则随机选一个"},
+                "emotion": {"type": "string", "description": "情绪关键词，如 开心/无奈/赞/吃瓜。空则随机选一个"},
+                "sticker_id": {"type": "integer", "description": "可选：收藏表情编号（见【最近收藏的表情】列表）。传了就精确发这一张，忽略 emotion"},
             },
             "required": [],
         },
@@ -1346,12 +1347,22 @@ async def _execute_tool_impl(
             return f"表情表态 {'取消' if cancel else '已'}✓" if ok else "表态失败"
 
         elif tool_name == "send_sticker":
+            sid = str(tool_input.get("sticker_id", "") or "").strip()
             emotion = str(tool_input.get("emotion", "") or "").strip() or "开心"
             # 每群滑动窗口限速，避免 AI 高频刷表情（提示词软约束之外的硬闸）
             if not _check_tool_rate(_STICKER_RATE, group_id,
                                     _STICKER_RATE_LIMIT, _STICKER_RATE_WINDOW):
                 return "⨯ 本群表情发送太频繁了，先用 :14: 这类内置黄脸表达吧"
             from . import sticker as _st
+            if sid:
+                # 精准发收藏里的某一张（「发同款」场景，见 recent_stickers_summary 注入）
+                s = _st.get_sticker(int(sid))
+                cq = _st._build_sticker_cq(s) if s else ""
+                if not cq:
+                    return f"⨯ 收藏表情 #{sid} 不存在或链接已失效，改用 emotion 选一个吧"
+                _st.use_sticker(int(sid))
+                logger.info(f"AI 精准发收藏表情: #{sid}")
+                return await _send_direct_cq(bot, group_id, caller_qq, cq, "表情")
             cq = _st.pick_emotion_face(emotion, group_id=group_id)
             logger.info(f"AI 选表情: emotion={emotion} → {cq[:40]}")
             return await _send_direct_cq(bot, group_id, caller_qq, cq, "表情")

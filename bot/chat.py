@@ -871,6 +871,19 @@ async def chat_reply(
         if _emoji_block:
             dynamic_blocks.append(_emoji_block)
 
+        # ★ 最近收藏的表情：群友发的表情自动收藏并带编号——别人让你「发同款/
+        # 也来一个」时，AI 才知道该用 send_sticker(sticker_id=?) 精准发哪张
+        # （2026-10-10 实录：同款请求兜底成小黄脸微笑，收藏里明明有刚收的那张）
+        try:
+            _recent_stickers = sticker.recent_stickers_summary(group_id, limit=6)
+        except Exception:
+            _recent_stickers = ""
+        if _recent_stickers:
+            dynamic_blocks.append(
+                "【最近收藏的表情】群友发的表情会被自动收藏，让你「发同款/也来一个」"
+                "就用 send_sticker 传对应 sticker_id：\n" + _recent_stickers
+            )
+
         # 注入长期记忆（重要回忆/相关往事/对群友的了解等）
         memory_context = memory.get_relevant_context_for_chat(group_id, message)
         if memory_context:
