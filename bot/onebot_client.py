@@ -141,6 +141,7 @@ def cq_text_to_segments(text: str) -> list[dict]:
     send_forward 工具等）都经过这里，此前快捷码只在 send_group_msg 的
     字符串路径被展开，走段路径时 ":178:" 会原样漏进群里。
     """
+    text = _fix_cq_typos(text)
     text = expand_face_shortcuts(text)
     parts = _CQ_SPLIT_RE.split(text)
     segments = []
@@ -206,8 +207,33 @@ def expand_face_shortcuts(text: str) -> str:
 # 群里就会看到裸露的 "[CQ:face,id=14" 字样。发送前统一修复/清理。
 _DANGLING_FACE_RE = re.compile(r'(\[CQ:face,id=\d{1,4})(?![\d\],=])')
 
+# ─── LLM 手滑变体归一化 ───
+# 模型偶尔会把「快捷码 :178:」和「CQ 码 [CQ:face,id=178]」两种写法揉在一起，
+# 产出 :CQ:face,id=317: 这类四不像（2026-10-10 线上实录），或写全角括号/全角标点。
+# 这些变体解析不出来，会原样发进群里变成裸文字。发送前统一归一化成合法 CQ 码。
+_CQ_HYBRID_RE = re.compile(
+    r"[：:]?\s*CQ\s*[：:]\s*([A-Za-z]+)\s*[,，]\s*([^\s:：\[\]【】,，]+?)\s*[：:](?=\s|$)",
+    re.IGNORECASE,
+)
+_CQ_FULLWIDTH_RE = re.compile(r"[\[【]\s*CQ\s*[:：]\s*([^\]】]+?)\s*[】\]]")
+
+
+def _fix_cq_typos(text: str) -> str:
+    # 1) 冒号包裹的混合体：:CQ:face,id=317: → [CQ:face,id=317]。
+    #    结尾冒号后必须紧跟空白/行尾，"CQ" 字面量足够特殊，正常聊天不会误伤
+    text = _CQ_HYBRID_RE.sub(
+        lambda m: "[CQ:" + m.group(1) + "," + m.group(2).replace("，", ",") + "]", text)
+    # 2) 全角括号或码内全角标点：【CQ：face，id=317】 → [CQ:face,id=317]
+    #    （对本来就是半角的合法码幂等：原样重排一遍）
+    text = _CQ_FULLWIDTH_RE.sub(
+        lambda m: "[CQ:" + m.group(1).replace("，", ",").replace("：", ":") + "]", text)
+    return text
+
+
 def sanitize_cq_codes(text: str) -> str:
-    """修复残缺 CQ 码: face 码缺 ] 则补全；其他修不了的残码整段剥除"""
+    """修复残缺/变形 CQ 码: 先归一化 LLM 手滑变体，face 码缺 ] 则补全；其他修不了的残码整段剥除"""
+    # 0) LLM 手滑变体：:CQ:face,id=317: / 【CQ：face，id=317】 → 合法码
+    text = _fix_cq_typos(text)
     # 1) face 码缺 ]：id 是纯数字，数字结束处就是码的边界，直接补 ]
     text = _DANGLING_FACE_RE.sub(r'\1]', text)
     # 2) 其余 [CQ: 开头但到结尾都没有 ] 的片段：丢弃（无法安全补全）
