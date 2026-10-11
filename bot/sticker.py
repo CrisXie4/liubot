@@ -5,6 +5,7 @@ AI 表情/贴纸管理系统
 - AI 自动选用表情回复
 - 按群/标签管理
 """
+import asyncio
 import html
 import json
 import logging
@@ -504,7 +505,7 @@ def pick_context_sticker(group_id: int, message: str, tags: list[str] = None) ->
     return _build_sticker_cq(choice)
 
 def _build_sticker_cq(sticker: dict) -> str:
-    """构建表情 CQ 码，优先本地缓存，回退原始 CQ 码"""
+    """构建表情 CQ 码，优先本地缓存，回退远程 URL；坏记录返回空串"""
     sid = sticker["id"]
     stype = sticker.get("sticker_type", "")
 
@@ -517,8 +518,44 @@ def _build_sticker_cq(sticker: dict) -> str:
     if cached:
         return f"[CQ:image,file={cached}]"
 
-    # 回退原始 CQ 码（URL 可能已过期；先反转义 &amp;，否则 NapCat 拉不到图）
-    return html.unescape(sticker.get("cq_code", ""))
+    cq = html.unescape(sticker.get("cq_code", ""))
+    mfile = re.search(r"file=([^,\]]+)", cq)
+    if mfile:
+        fv = mfile.group(1)
+        if fv.startswith("http"):
+            return cq  # 远程直发形态，原样用
+        local = fv[5:] if fv.startswith("file:") else fv
+        if local.startswith("/"):
+            # 存量坏记录：cq_code 指向本地缓存文件但文件已不存在
+            # （2026-10-11 实录 ENOENT sticker_cache/89.gif——当年下载失败那批）
+            if os.path.exists(local) and os.path.getsize(local) > 100:
+                return f"[CQ:image,file={local}]"
+            # 本地文件丢了 → 远程 URL 兜底直发，顺手后台补缓存（下次能发本地文件）
+            m = re.search(r"url=(https?://[^,\]]+)", cq)
+            if m:
+                _schedule_cache_repair(sid, m.group(1))
+                return f"[CQ:image,file={m.group(1)}]"
+            # 没有任何远程地址：判死返回空串，让调用方如实报"链接失效"，
+            # 别把必然 ENOENT 的本地路径发给 NapCat（AI 会误转述成"网络问题"）
+            return ""
+    # file 不是本地路径（QQ 内部文件名等）→ 原样返回，NapCat 会自己按 url= 拉图
+    return cq
+
+
+def _schedule_cache_repair(sid: int, url: str):
+    """运行中事件循环里后台补下载缓存；失败静默，下次发送再试"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _dl():
+        try:
+            await download_to_cache(sid, url)
+        except Exception as e:
+            logger.debug(f"表情缓存修复失败 #{sid}: {e}")
+
+    loop.create_task(_dl())
 
 # ═══════════════════════════════════════════════════════════
 #  AI 自动收藏

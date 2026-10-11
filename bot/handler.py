@@ -1148,6 +1148,18 @@ async def check_dormant_conversations(bot: OneBotClient):
                 continue
             if not guardian.check_proactive_rate(group_id):
                 continue
+            # 刚重连不久就别接话：断线窗口里的消息漏看了，话头大概率不完整
+            # （2026-10-11 实录：掉线4分钟重连后 17s 就接出"别求放过"这种没头没尾）
+            ws_ts = getattr(bot, "_last_ws_connect_ts", 0)
+            if not isinstance(ws_ts, (int, float)):
+                ws_ts = 0  # 测试用假 bot 的自动属性是 Mock，不能当数字用
+            if ws_ts and time.time() - ws_ts < 180:
+                logger.debug(
+                    f"沉寂唤醒跳过 [群{group_id}]: 刚重连 {time.time()-ws_ts:.0f}s，"
+                    "断线窗口可能漏了消息"
+                )
+                g["woken"] = True  # 同样只试一次，免得过会又冷不丁冒一句
+                continue
 
             g["woken"] = True  # 无论成败，这个会话只试一次
             line = await chat.generate_dormant_wake(group_id, g)

@@ -177,6 +177,28 @@ class TestDormantConversation(unittest.TestCase):
         # humanizer 被 handler 导入为模块属性 → patch bot.handler 命名空间
         self.assertTrue(g.get("woken"))
 
+    def test_reconnect_guard_skips_wake(self):
+        """刚重连（<3分钟）不接话：断线窗口可能漏了消息（2026-10-11 实录）"""
+        g = self._make_session(idle_s=300, bot_replied_before=True)
+        bot = AsyncMock()
+        bot.bot_qq = "10000"
+        bot._last_ws_connect_ts = time.time() - 17  # 17s 前刚重连
+        fake_cs = MagicMock()
+        fake_cs.get_state.return_value = {"sleeping": False, "emotions": {"energy": 0.8}}
+        fake_cs.can_speak_proactively.return_value = (True, "")
+        fake_cs.record_proactive_message = MagicMock()
+        fake_guardian = MagicMock()
+        fake_guardian.check_proactive_rate.return_value = True
+        with patch("bot.consciousness.get_state", new=fake_cs.get_state), \
+             patch("bot.consciousness.can_speak_proactively",
+                   new=fake_cs.can_speak_proactively), \
+             patch("bot.guardian.check_proactive_rate",
+                   new=fake_guardian.check_proactive_rate), \
+             patch("bot.humanizer.send_human_like") as fake_send:
+            _run(self.hd.check_dormant_conversations(bot))
+        self.assertTrue(g.get("woken"), "机会应被消耗（不反复骚扰）")
+        fake_send.assert_not_called()
+
     def test_quiet_hours_no_wake(self):
         """深夜静默 → 不冒泡，且不消耗 woken 机会以外的东西"""
         g = self._make_session(idle_s=300)

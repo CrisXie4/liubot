@@ -117,5 +117,47 @@ class TestSendStickerById(unittest.TestCase):
         self.assertIn("sticker_id", schema_props)
 
 
+class TestBuildStickerCqBadCache(unittest.TestCase):
+    """存量坏记录：cq 指向本地路径但文件缺失 → URL 兜底/判死，不再必 ENOENT
+
+    2026-10-11 实录：#89 的 cq_code 是 file=//www/.../89.gif 且文件不存在，
+    NapCat ENOENT 发送失败，AI 把失败转述成"网络问题"。
+    """
+
+    def test_dead_local_path_without_url_dies(self):
+        """纯本地路径且文件丢失、无 url → 返回空串判死（不发必败的码）"""
+        s = {"id": 424242, "sticker_type": "image",
+             "cq_code": "[CQ:image,file=/nonexistent/qqbot_cache/424242.gif]"}
+        self.assertEqual(sticker._build_sticker_cq(s), "")
+
+    def test_dead_local_path_with_url_falls_back(self):
+        """本地文件丢失但有 url → 用 URL 直发兜底（同步上下文无循环，补缓存静默跳过）"""
+        s = {"id": 424243, "sticker_type": "image",
+             "cq_code": "[CQ:image,file=/nonexistent/x/424243.gif,url=https://x.example/a.gif]"}
+        self.assertEqual(sticker._build_sticker_cq(s),
+                         "[CQ:image,file=https://x.example/a.gif]")
+
+    def test_qq_internal_filename_kept(self):
+        """file= 是 QQ 内部文件名（非本地路径）→ 原样保留，NapCat 自己按 url 拉"""
+        s = {"id": 424244, "sticker_type": "image",
+             "cq_code": "[CQ:image,file=abc.gif,url=https://x.example/b.gif]"}
+        self.assertEqual(sticker._build_sticker_cq(s),
+                         "[CQ:image,file=abc.gif,url=https://x.example/b.gif]")
+
+    def test_existing_local_file_used(self):
+        """本地路径且文件真实存在 → 原样使用"""
+        import os as _os
+        import tempfile
+        fd, p = tempfile.mkstemp(suffix=".gif")
+        try:
+            _os.write(fd, b"x" * 200)
+            _os.close(fd)
+            s = {"id": 424245, "sticker_type": "image",
+                 "cq_code": f"[CQ:image,file={p}]"}
+            self.assertEqual(sticker._build_sticker_cq(s), f"[CQ:image,file={p}]")
+        finally:
+            _os.remove(p)
+
+
 if __name__ == "__main__":
     unittest.main()

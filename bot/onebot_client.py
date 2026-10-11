@@ -267,6 +267,9 @@ class OneBotClient:
         # 最近一次 API 调用失败的原始原因（NapCat 返回的 msg），供工具层
         # 把真实错误回传给 AI——否则 AI 只看到"失败"，会把对方沉默当成"不理我"
         self.last_api_fail: dict | None = None
+        # 最近一次 WS 连接成功的时间——刚重连就别接"沉寂唤醒"的话头，
+        # 断线窗口里的消息漏看了，上下文不完整
+        self._last_ws_connect_ts: float = 0.0
 
     def last_fail_msg(self) -> str:
         """返回最近一次 API 失败的简要原因（无失败返回空串）。"""
@@ -1496,6 +1499,7 @@ class OneBotClient:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=10, max_size=2**23) as ws:
                     self._ws = ws
+                    self._last_ws_connect_ts = time.time()
                     logger.info("NapCat WebSocket 已连接")
                     delay = 1
 

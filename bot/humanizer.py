@@ -352,13 +352,12 @@ async def send_human_like(
     now_ts = time.time()
     last = _last_send_time.get(ctx_key, 0)
     if not priority and ctx_key and now_ts - last < SEND_COOLDOWN:
-        ctx = f"私聊{ctx_key}" if group_id == 0 else f"群{ctx_key}"
-        reason = (f"发送冷却中（距上次发送 {now_ts - last:.1f}s < {SEND_COOLDOWN}s），"
-                  f"整条消息未发出")
-        logger.warning(f"拟人发送丢弃 [{ctx}]: {reason} | {text[:40]}")
-        last_send_failure = {"ctx": ctx, "gid": ctx_key, "is_private": group_id == 0,
-                             "failed": len(bubbles), "total": len(bubbles), "reason": reason}
-        return []
+        # 等过冷却再发，而不是丢弃——丢弃会让 bot 对提问"已读不回"：
+        # 生成的回复整条蒸发，发出去的只剩别的路径的主动发言，
+        # 外人看就是答非所问（2026-10-11 实录：连丢 3 条对 mimo 音频的正经回答）
+        wait = min(SEND_COOLDOWN - (now_ts - last), SEND_COOLDOWN)
+        await asyncio.sleep(max(wait, 0.1))
+        now_ts = time.time()
     _last_send_time[ctx_key] = now_ts
 
     is_private = (group_id == 0)

@@ -77,16 +77,15 @@ class TestCooldownDrop(unittest.TestCase):
             p.start()
         self.addCleanup(lambda: [p.stop() for p in self._patches])
 
-    def test_normal_message_dropped_within_cooldown(self):
-        """事故原样复刻：4 秒前发过消息，普通消息整条被吞。"""
+    def test_normal_message_within_cooldown_sent_after_wait(self):
+        """冷却期内等一等再发，不再丢弃（2026-10-11 实录改版：丢弃让 bot
+        对提问"已读不回"，连丢 3 条正经回答，外人看就是答非所问）。"""
         bot = _FakeBot()
         humanizer._last_send_time[GID] = time.time() - 4.0
         r = asyncio.run(humanizer.send_human_like(bot, GID, "Cris谢，昨天那编程问题解决没？"))
-        self.assertEqual(r, [])
-        self.assertEqual(bot.msg_calls, [])
-        # 丢弃必须对 handler 可见（原来只记 debug 日志）
-        self.assertIsNotNone(humanizer.last_send_failure)
-        self.assertEqual(humanizer.last_send_failure["total"], 1)
+        self.assertTrue(r, "冷却期内应等待后发出，不得整条丢弃")
+        self.assertTrue(bot.msg_calls)
+        self.assertIsNone(humanizer.last_send_failure, "等待后成功发送，不算失败")
 
     def test_priority_message_bypasses_cooldown(self):
         """priority=True（验证题）：同窗口内不丢弃、照常发出。"""
