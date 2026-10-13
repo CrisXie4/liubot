@@ -116,13 +116,22 @@ class TestBuildStickerCqUnescape(unittest.TestCase):
         self.assertNotIn("&amp;", cq)
         self.assertIn(REAL_URL, cq)
 
-    def test_with_cache_returns_file_path(self):
-        # 造一个 >100B 的本地缓存文件 → 返回 file:/// 路径
+    def test_with_cache_synced_to_napcat_container(self):
+        # 本地缓存存在 → 同步进 NapCat 挂载目录，发容器侧路径
+        # （NapCat 在 docker 容器里，宿主路径它看不见——2026-10-12 实录 ENOENT）
+        import tempfile
         cache_file = os.path.join(sticker.STICKER_CACHE_DIR, "7.gif")
         with open(cache_file, "wb") as f:
             f.write(b"x" * 200)
-        cq = sticker._build_sticker_cq(self.sticker)
-        self.assertTrue(cq.startswith("[CQ:image,file=file:///"))
+        with tempfile.TemporaryDirectory() as sync_dir:
+            old = sticker.NAPCAT_SYNC_DIR
+            sticker.NAPCAT_SYNC_DIR = sync_dir
+            try:
+                cq = sticker._build_sticker_cq(self.sticker)
+            finally:
+                sticker.NAPCAT_SYNC_DIR = old
+            self.assertEqual(cq, "[CQ:image,file=/app/napcat/plugins/sticker_cache/7.gif]")
+            self.assertTrue(os.path.exists(os.path.join(sync_dir, "7.gif")))
 
     def test_face_type_untouched(self):
         s = {"id": 8, "sticker_type": "face", "cq_code": "[CQ:face,id=14]"}

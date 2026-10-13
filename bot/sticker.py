@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -504,8 +505,32 @@ def pick_context_sticker(group_id: int, message: str, tags: list[str] = None) ->
     use_sticker(choice["id"])
     return _build_sticker_cq(choice)
 
+# NapCat 跑在 docker 容器里（napcat_fsbt-napcat-1），宿主机的 data/sticker_cache
+# 在容器内不存在——直接发 file:///宿主路径 必 ENOENT（2026-10-12 实录 #96，
+# 文件明明在宿主机上）。容器把 napcat_FsBt/plugins 挂载在 /app/napcat/plugins，
+# 发送前把缓存文件同步过去，用容器侧路径发。目录可用 env 覆盖。
+NAPCAT_SYNC_DIR = os.getenv(
+    "NAPCAT_STICKER_SYNC_DIR",
+    "/www/dk_project/dk_app/napcat/napcat_FsBt/plugins/sticker_cache",
+)
+NAPCAT_CONTAINER_DIR = "/app/napcat/plugins/sticker_cache"
+
+
+def _sync_for_napcat(sid: int, src: str) -> Optional[str]:
+    """把缓存文件同步到 NapCat 容器可见的挂载目录，返回容器侧路径；失败返回 None"""
+    try:
+        os.makedirs(NAPCAT_SYNC_DIR, exist_ok=True)
+        dst = os.path.join(NAPCAT_SYNC_DIR, f"{sid}{os.path.splitext(src)[1]}")
+        if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
+            shutil.copyfile(src, dst)
+        return f"{NAPCAT_CONTAINER_DIR}/{os.path.basename(dst)}"
+    except Exception as e:
+        logger.debug(f"NapCat 缓存同步失败 #{sid}: {e}")
+        return None
+
+
 def _build_sticker_cq(sticker: dict) -> str:
-    """构建表情 CQ 码，优先本地缓存，回退远程 URL；坏记录返回空串"""
+    """构建表情 CQ 码：本地缓存（同步进 NapCat 容器）> 远程 URL；坏记录返回空串"""
     sid = sticker["id"]
     stype = sticker.get("sticker_type", "")
 
@@ -516,7 +541,11 @@ def _build_sticker_cq(sticker: dict) -> str:
     # image/mface → 优先本地缓存文件
     cached = get_cached_path(sid)
     if cached:
-        return f"[CQ:image,file={cached}]"
+        src = cached[8:] if cached.startswith("file:///") else cached
+        cpath = _sync_for_napcat(sid, src)
+        if cpath:
+            return f"[CQ:image,file={cpath}]"
+        # 同步失败（挂载点不可写等）→ 掉到下面的 URL 兜底
 
     cq = html.unescape(sticker.get("cq_code", ""))
     mfile = re.search(r"file=([^,\]]+)", cq)
@@ -529,8 +558,10 @@ def _build_sticker_cq(sticker: dict) -> str:
             # 存量坏记录：cq_code 指向本地缓存文件但文件已不存在
             # （2026-10-11 实录 ENOENT sticker_cache/89.gif——当年下载失败那批）
             if os.path.exists(local) and os.path.getsize(local) > 100:
-                return f"[CQ:image,file={local}]"
-            # 本地文件丢了 → 远程 URL 兜底直发，顺手后台补缓存（下次能发本地文件）
+                cpath = _sync_for_napcat(sid, local)
+                if cpath:
+                    return f"[CQ:image,file={cpath}]"
+            # 本地文件丢失或同步失败 → 远程 URL 兜底直发，顺手后台补缓存
             m = re.search(r"url=(https?://[^,\]]+)", cq)
             if m:
                 _schedule_cache_repair(sid, m.group(1))

@@ -144,19 +144,60 @@ class TestBuildStickerCqBadCache(unittest.TestCase):
         self.assertEqual(sticker._build_sticker_cq(s),
                          "[CQ:image,file=abc.gif,url=https://x.example/b.gif]")
 
-    def test_existing_local_file_used(self):
-        """本地路径且文件真实存在 → 原样使用"""
+    def test_existing_local_file_synced_to_napcat(self):
+        """本地文件存在 → 同步进 NapCat 挂载目录，返回容器侧路径
+        （2026-10-12 实录：NapCat 在容器里，宿主机路径直接发必 ENOENT）"""
         import os as _os
         import tempfile
         fd, p = tempfile.mkstemp(suffix=".gif")
+        _os.write(fd, b"x" * 200)
+        _os.close(fd)
+        sync_dir = tempfile.mkdtemp()
+        old_dir = sticker.NAPCAT_SYNC_DIR
+        sticker.NAPCAT_SYNC_DIR = sync_dir
         try:
-            _os.write(fd, b"x" * 200)
-            _os.close(fd)
             s = {"id": 424245, "sticker_type": "image",
                  "cq_code": f"[CQ:image,file={p}]"}
-            self.assertEqual(sticker._build_sticker_cq(s), f"[CQ:image,file={p}]")
+            with mock.patch.object(sticker, "get_cached_path",
+                                   return_value="file:///" + p):
+                r = sticker._build_sticker_cq(s)
+            self.assertEqual(r, "[CQ:image,file=/app/napcat/plugins/sticker_cache/424245.gif]")
+            self.assertTrue(_os.path.exists(_os.path.join(sync_dir, "424245.gif")))
         finally:
+            sticker.NAPCAT_SYNC_DIR = old_dir
             _os.remove(p)
+
+    def test_sync_copies_and_returns_container_path(self):
+        """_sync_for_napcat：把缓存文件复制进挂载目录，返回容器侧路径"""
+        import os as _os
+        import tempfile
+        fd, src = tempfile.mkstemp(suffix=".gif")
+        _os.write(fd, b"x" * 200)
+        _os.close(fd)
+        sync_dir = tempfile.mkdtemp()
+        old = sticker.NAPCAT_SYNC_DIR
+        sticker.NAPCAT_SYNC_DIR = sync_dir
+        try:
+            r = sticker._sync_for_napcat(424247, src)
+            self.assertEqual(r, "/app/napcat/plugins/sticker_cache/424247.gif")
+            self.assertTrue(_os.path.exists(_os.path.join(sync_dir, "424247.gif")))
+        finally:
+            sticker.NAPCAT_SYNC_DIR = old
+            _os.remove(src)
+
+    def test_sync_failure_returns_none(self):
+        """挂载点不可写（如目标是被占用的文件）→ 返回 None，由调用方走 URL 兜底"""
+        import os as _os
+        import tempfile
+        bfd, blocker = tempfile.mkstemp()
+        _os.close(bfd)  # 已存在的文件，对它 makedirs 必失败
+        old = sticker.NAPCAT_SYNC_DIR
+        sticker.NAPCAT_SYNC_DIR = blocker
+        try:
+            self.assertIsNone(sticker._sync_for_napcat(424248, "/tmp/x.gif"))
+        finally:
+            sticker.NAPCAT_SYNC_DIR = old
+            _os.remove(blocker)
 
 
 if __name__ == "__main__":
