@@ -119,7 +119,11 @@ def spoke_recently(group_id: int, user_qq: int, within: int = 3) -> bool:
 
 def should_quote(group_id: int, target_mid: int, *, trigger_mid: int = 0) -> bool:
     """
-    该不该引用 target_mid 这条消息。
+    该不该引用 target_mid 这条消息（参考判定）。
+
+    2026-10-13 起 sanitize 不再按此强制剥引用——引用是 AI 自己的选择
+    （回旧消息必须引、回新消息随它），规则由提示词引导。本函数保留作
+    外部参考/测试。
 
     引用的唯一意义是"消除歧义"——如果对方刚说完话、你马上回，
     没有任何歧义，引用纯属多余。
@@ -160,10 +164,12 @@ def sanitize_targeting(
     trigger_user_name: str = "",
 ) -> str:
     """
-    发送前把多余的引用/@ 剥掉。
+    发送前清洗引用/@。
 
-    - [CQ:reply,id=N]: 逐个用 should_quote 过一遍；留下的最多 max_quotes 个，
-      并统一挪到整段开头（QQ 只认开头的 reply 码）
+    - [CQ:reply,id=N]: 引用是 AI 自己的选择（2026-10-13 起不再按"新旧话头"
+      强制剥除——回旧消息必须引、回新消息随它引，规则由提示词引导）。
+      这里只做：最多保留 max_quotes 个、统一挪到整段开头（QQ 只认开头的
+      reply 码）、无效 id 丢弃
     - [CQ:at,qq=X]:    用 should_at 过一遍
     - 开头手打的 "@名字 " 前缀: 如果名字就是当前说话人，直接去掉
     """
@@ -181,12 +187,14 @@ def sanitize_targeting(
             mid = int(m.group(1))
         except (TypeError, ValueError):
             return ""
-        if quota > 0 and should_quote(group_id, mid, trigger_mid=trigger_message_id):
+        if mid <= 0:
+            return ""
+        if quota > 0:
             quota -= 1
             if not kept_quote:
                 kept_quote = f"[CQ:reply,id={mid}]"
             return ""      # 先摘掉，最后统一放到开头
-        return ""
+        return ""          # 超出配额的引用丢弃
 
     text = _REPLY_RE.sub(_reply_sub, text)
 

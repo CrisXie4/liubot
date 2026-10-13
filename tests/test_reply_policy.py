@@ -103,14 +103,14 @@ class TestShouldQuote(ReplyPolicyBase):
 
 class TestSanitizeTargeting(ReplyPolicyBase):
 
-    def test_fresh_quote_stripped(self):
-        """引用还在话头上的新消息 → 剥掉"""
+    def test_fresh_quote_kept_now(self):
+        """2026-10-13 起：引用新消息也是 AI 自己的选择 → 保留（挪到开头）"""
         rp.note_message(GID, 10, 100)
         out = rp.sanitize_targeting(
             "[CQ:reply,id=10]好的 就这么办",
             group_id=GID, trigger_message_id=10, trigger_user_qq=100,
         )
-        self.assertNotIn("[CQ:reply", out)
+        self.assertTrue(out.startswith("[CQ:reply,id=10]"))
         self.assertIn("好的 就这么办", out)
 
     def test_old_quote_kept_and_moved_to_front(self):
@@ -140,8 +140,7 @@ class TestSanitizeTargeting(ReplyPolicyBase):
         self.assertTrue(out.startswith("[CQ:reply,id=1]"))
 
     def test_no_double_space_or_blank_lines_left(self):
-        """剥离后不残留空行/双空格"""
-        rp.note_message(GID, 10, 100)
+        """清洗后不残留空行/双空格（引用码已挪走不再剥除）"""
         out = rp.sanitize_targeting(
             "[CQ:reply,id=10]   多   空格\n\n\n后面一段",
             group_id=GID, trigger_message_id=10, trigger_user_qq=100,

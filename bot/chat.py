@@ -317,11 +317,15 @@ def add_context(group_id: int, role: str, content: str, importance: float = 0.5,
                 msg_id: int = 0):
     """添加消息到上下文。
     importance: 0.0-1.0，被 @/被夸/关键话题 → 高分；普通寒暄 → 低分。
-    msg_id: QQ 消息 ID，用于回复时去重（避免当前消息在历史里和富文本回合重复出现）。
+    msg_id: QQ 消息 ID，用于回复时去重（避免当前消息在历史里和富文本回合重复出现），
+    同时烤进正文尾部 (msg:ID)——AI 看得到编号才能引用旧消息（reply_msg 用）。
+    历史一旦写入就不再改写（保前缀缓存），所以编号必须在入库时拼进去。
     """
     # 超长内容入上下文前机械修剪：历史一旦写入就不再改写（保前缀缓存），
     # 必须在写入时就把刷屏长文/超长粘贴控制住。
     content = _prune_long_text(content)
+    if msg_id:
+        content = f"{content} (msg:{int(msg_id)})"
     _chat_contexts[group_id].append({
         "role": role,
         "content": content,
@@ -849,8 +853,10 @@ async def chat_reply(
             + "\n用哪个由你自己判断：按当前情绪选含义最贴切的那一个，"
               "偶尔点缀（不是每条都要带）。\n"
               "⚠️ 表情只准用 :id: 写法，id 必须来自上面菜单（菜单里没有贴切的就别发，"
-              "禁止自己编 id）。严禁输出 [CQ:...] 或 CQ: 开头的码——那是系统内部格式，"
-              "写出来会被当纯文字发到群里露馅。\n"
+              "禁止自己编 id）。严禁输出表情类的 [CQ:...] 码或任何 CQ: 开头的裸码——"
+              "那是系统内部格式，写出来会被当纯文字发到群里露馅。"
+              "唯一例外：reply_msg 工具返回的引用码 [CQ:reply,id=...]，"
+              "按它的说明原样放进回复开头即可。\n"
         )
 
         # 动态上下文块（每次调用都变 → 注入 user 消息尾部）
@@ -1438,7 +1444,7 @@ async def chat_private_reply(user_id: int, user_name: str, message: str) -> Opti
 - 回复短小自然，别长篇大论
 - 可以用表情偶尔点缀，写 :数字: 即发出对应表情，按情绪自选：
 {face_menu}
-  （表情只准用上面菜单里的 :id: 写法，禁止编造 id、禁止输出 [CQ:...] 内部码格式）
+  （表情只准用上面菜单里的 :id: 写法，禁止编造 id、禁止输出表情类 [CQ:...] 内部码格式；唯一例外是 reply_msg 工具返回的引用码）
 - 可以开玩笑、吐槽、八卦
 - 对方说的每句话都认真听，但不用每条都追问{time_facts}{memory_context}"""
 

@@ -57,12 +57,17 @@ class TestCapture(unittest.TestCase):
     def tearDown(self):
         web_shot._rate.clear()
 
+    def _patch_ssrf(self):
+        # _url_allowed 会做真实 DNS 解析——单测不依赖外网 DNS，统一放行
+        # （SSRF 拒绝路径在 test_internal_url_rejected 用真实实现覆盖）
+        return patch.object(web_shot, "_url_allowed", return_value=True)
+
     def test_thum_success_first_try(self):
         calls = []
         img = b"x" * 8000
         routes = {"thum.io": _FakeResp(img)}
-        with patch.object(web_shot.httpx, "AsyncClient",
-                          lambda **kw: _FakeClient(routes, calls)):
+        with self._patch_ssrf(), patch.object(web_shot.httpx, "AsyncClient",
+                                              lambda **kw: _FakeClient(routes, calls)):
             data = _run(web_shot.capture("https://example.com/page"))
         self.assertEqual(data, img)
         self.assertEqual(len(calls), 1)  # thum 一次成功，mShots 不再试
@@ -74,8 +79,8 @@ class TestCapture(unittest.TestCase):
             "thum.io": _FakeResp(b"tiny", "image/png"),   # 占位小图
             "mshots": _FakeResp(img),
         }
-        with patch.object(web_shot.httpx, "AsyncClient",
-                          lambda **kw: _FakeClient(routes, calls)), \
+        with self._patch_ssrf(), patch.object(web_shot.httpx, "AsyncClient",
+                                              lambda **kw: _FakeClient(routes, calls)), \
              patch.object(web_shot.asyncio, "sleep", new=AsyncMock()):
             data = _run(web_shot.capture("https://example.com/page"))
         self.assertEqual(data, img)
@@ -104,7 +109,7 @@ class TestCapture(unittest.TestCase):
             raise RuntimeError("thum down")
 
         client.get = fake_get
-        with patch.object(web_shot.httpx, "AsyncClient", lambda **kw: client), \
+        with self._patch_ssrf(), patch.object(web_shot.httpx, "AsyncClient", lambda **kw: client), \
              patch.object(web_shot.asyncio, "sleep", new=AsyncMock()) as ms:
             data = _run(web_shot.capture("https://example.com/"))
         self.assertEqual(data, img)
@@ -113,8 +118,8 @@ class TestCapture(unittest.TestCase):
     def test_all_fail_returns_none(self):
         calls = []
         routes = {"thum.io": RuntimeError("x"), "mshots": RuntimeError("y")}
-        with patch.object(web_shot.httpx, "AsyncClient",
-                          lambda **kw: _FakeClient(routes, calls)), \
+        with self._patch_ssrf(), patch.object(web_shot.httpx, "AsyncClient",
+                                              lambda **kw: _FakeClient(routes, calls)), \
              patch.object(web_shot.asyncio, "sleep", new=AsyncMock()):
             self.assertIsNone(_run(web_shot.capture("https://example.com/")))
 
