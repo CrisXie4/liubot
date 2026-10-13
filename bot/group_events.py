@@ -30,6 +30,10 @@ _TYPE_LABEL = {
     "kick": "被踢出群",
     "leave": "退群了",
     "join": "加入了群",
+    "upload": "上传了文件",
+    "essence": "的消息被设为精华",
+    "essence_del": "的消息被移出精华",
+    "gray": "触发了一条系统提示",
 }
 
 

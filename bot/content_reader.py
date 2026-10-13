@@ -8,6 +8,8 @@
 消除"不对称 bug"。
 """
 import asyncio
+import html as _html
+import json
 import logging
 import re
 import time
@@ -28,6 +30,94 @@ _forward_cache: dict[str, tuple] = {}
 _CQ_FORWARD_RE = re.compile(r"\[CQ:forward,id=([^\],]+)\]")
 
 
+# ═══════════════════════════════════════════════════════════
+#  分享卡片解析 — json/xml 消息段（B站/音乐/小程序/网页链接卡片）
+#  此前这两种段完全不解析：AI 看不见群友分享了什么，违规词库
+#  也扫不到卡片内容（json 里的中文是 \uXXXX 转义，裸扫 raw
+#  必然漏）。这里把卡片拍平成《标题》+简介+跳转链接。
+# ═══════════════════════════════════════════════════════════
+
+def _parse_json_card(raw: str) -> Optional[dict]:
+    """解析 json 段的分享卡片。meta 下各节点（news/miniapp/audio/video/
+    detail_1...）字段结构一致，取第一个带 title/jumpUrl 的节点。"""
+    raw = (raw or "").strip()
+    if not raw or raw[0] not in "{[":
+        return None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    meta = obj.get("meta")
+    node: dict = {}
+    if isinstance(meta, dict):
+        for v in meta.values():
+            if isinstance(v, dict) and (v.get("jumpUrl") or v.get("title") or v.get("desc")):
+                node = v
+                break
+    appinfo = meta.get("appinfo") if isinstance(meta, dict) else {}
+    card = {
+        "title": str(node.get("title") or obj.get("title") or "").strip(),
+        "desc": str(node.get("desc") or obj.get("desc") or "").strip(),
+        "url": str(node.get("jumpUrl") or obj.get("jumpUrl") or "").strip(),
+        "source": str(obj.get("appname") or (appinfo or {}).get("appname") or "").strip(),
+    }
+    if not (card["title"] or card["desc"] or card["url"]):
+        return None
+    return card
+
+
+def _parse_xml_card(raw: str) -> Optional[dict]:
+    """解析 xml 段的老式卡片：只抠 title/jumpUrl/des 属性，不做完整 XML 解析。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+
+    def _attr(name: str) -> str:
+        m = re.search(rf'\b{name}\s*=\s*"([^"]*)"', raw)
+        return _html.unescape(m.group(1)).strip() if m else ""
+
+    card = {
+        "title": _attr("title") or _attr("name"),
+        "desc": _attr("des") or _attr("summary") or _attr("brief"),
+        "url": _attr("jumpUrl") or _attr("url"),
+        "source": "xml卡片",
+    }
+    if not (card["title"] or card["desc"] or card["url"]):
+        return None
+    return card
+
+
+def parse_card_segment(seg_type: str, data: str) -> Optional[dict]:
+    """按 segment 类型分发卡片解析，非卡片类型返回 None。"""
+    if seg_type == "json":
+        return _parse_json_card(data)
+    if seg_type == "xml":
+        return _parse_xml_card(data)
+    return None
+
+
+def format_cards_text(cards: list) -> str:
+    """卡片列表 → AI/审核可读文本。无内容返回空串。"""
+    parts = []
+    for c in (cards or [])[:3]:
+        if not isinstance(c, dict):
+            continue
+        seg = "[分享卡片]"
+        if c.get("title"):
+            seg += f"《{str(c['title'])[:60]}》"
+        if c.get("desc"):
+            seg += f" {str(c['desc'])[:80]}"
+        if c.get("url"):
+            seg += f" 链接:{str(c['url'])[:100]}"
+        if c.get("source"):
+            seg += f" (来源:{str(c['source'])[:20]})"
+        if len(seg) > len("[分享卡片]"):
+            parts.append(seg)
+    return "\n".join(parts)
+
+
 async def extract_full_content(bot, raw_message: str, segments: list[dict]) -> dict:
     """
     把任意 OneBot 消息拍平。
@@ -42,11 +132,12 @@ async def extract_full_content(bot, raw_message: str, segments: list[dict]) -> d
     text_parts: list[str] = []
     images: list[dict] = []
     stickers: list[dict] = []
+    cards: list[dict] = []
     errors: list[str] = []
     has_forward = False
     forward_block: Optional[dict] = None
 
-    # 1. 从 segments 提取文本/图片/表情
+    # 1. 从 segments 提取文本/图片/表情/卡片
     for seg in segments or []:
         t = seg.get("type", "")
         data = seg.get("data", {})
@@ -61,6 +152,10 @@ async def extract_full_content(bot, raw_message: str, segments: list[dict]) -> d
             url = data.get("url", "")
             if url:
                 stickers.append({"url": url, "summary": data.get("summary", "")})
+        elif t in ("json", "xml"):
+            card = parse_card_segment(t, data.get("data", ""))
+            if card:
+                cards.append(card)
         # face / record / video 等：本期 images/stickers 不收
 
     # 2. 兜底：如果 segments 没有 text，从 raw_message 剥 CQ 码取纯文本
@@ -68,6 +163,23 @@ async def extract_full_content(bot, raw_message: str, segments: list[dict]) -> d
         clean = re.sub(r"\[CQ:[^\]]+\]", "", raw_message).strip()
         if clean:
             text_parts.append(clean)
+
+    # 2b. 卡片兜底：segments 缺失/不完整时从 raw_message 直接抠 json/xml 卡片。
+    # 贪心匹配到最后一个 ]：卡片 JSON 的标题/简介里可能带未转义的 ]，
+    # 非贪心会在半截截断（"[[分享]]震惊" 这类标题必踩）。
+    if not cards and raw_message:
+        for seg_type in ("json", "xml"):
+            m = re.search(rf"\[CQ:{seg_type},data=(.*)\]", raw_message)
+            if not m:
+                continue
+            data_str = _html.unescape(m.group(1))
+            end_ch = "}" if seg_type == "json" else ">"
+            idx = data_str.rfind(end_ch)
+            if idx != -1:
+                data_str = data_str[:idx + 1]
+            card = parse_card_segment(seg_type, data_str)
+            if card:
+                cards.append(card)
 
     # 3. 检测合并转发
     forward_ids = _CQ_FORWARD_RE.findall(raw_message or "")
@@ -103,6 +215,7 @@ async def extract_full_content(bot, raw_message: str, segments: list[dict]) -> d
         "text": "".join(text_parts).strip(),
         "images": images,
         "stickers": stickers,
+        "cards": cards,
         "has_forward": has_forward,
         "forward": forward_block,
         "errors": errors,
@@ -174,6 +287,10 @@ async def _unfold_forward(bot, forward_id: str, depth: int) -> tuple:
                 url = d.get("url", "")
                 if url:
                     stickers.append({"url": url, "summary": d.get("summary", "")})
+            elif t in ("json", "xml"):
+                card = parse_card_segment(t, d.get("data", ""))
+                if card:
+                    sub_text_parts.append(format_cards_text([card]))
             elif t == "forward":
                 nested = True
                 nested_id = d.get("id", "")

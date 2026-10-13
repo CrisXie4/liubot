@@ -2,9 +2,10 @@
 消息引用/回复处理模块
 - 解析被引用的消息内容
 - AI 可使用引用格式回复
-- 支持引用文本、图片、视频、合并转发
+- 支持引用文本、图片、视频、合并转发、分享卡片
 """
 import logging
+import re
 from typing import Optional
 
 from . import db
@@ -56,6 +57,32 @@ async def get_quoted_context(bot: OneBotClient, reply_msg_id: int) -> Optional[d
                     result["forward_text"] = fwd_text[:500]
             except Exception as e:
                 logger.debug(f"引用的转发内容展开失败: {e}")
+
+        # 被引用的是分享卡片（json/xml 段）→ 拍平成《标题》+链接给 AI
+        if "[CQ:json," in raw or "[CQ:xml," in raw:
+            try:
+                import html as _html
+                from . import content_reader as _cr
+                for seg_type in ("json", "xml"):
+                    if f"[CQ:{seg_type}," not in raw:
+                        continue
+                    # 贪心匹配到最后一个 ]：卡片内容里可能带未转义的 ]，
+                    # 再按 json 的 } / xml 的 > 截掉 CQ 码尾部
+                    m = re.search(rf"\[CQ:{seg_type},data=(.*)\]", raw)
+                    if not m:
+                        continue
+                    data_str = _html.unescape(m.group(1))
+                    end_ch = "}" if seg_type == "json" else ">"
+                    idx = data_str.rfind(end_ch)
+                    if idx != -1:
+                        data_str = data_str[:idx + 1]
+                    card = _cr.parse_card_segment(seg_type, data_str)
+                    card_text = _cr.format_cards_text([card]) if card else ""
+                    if card_text:
+                        result["card_text"] = card_text
+                        break
+            except Exception as e:
+                logger.debug(f"引用卡片解析失败: {e}")
 
         # 被引用的是图片 → 补视觉描述（get_quoted_media_description 内部走
         # describe_image，自带 &amp; 反转义与 24h 缓存，同一张图只烧一次配额）
@@ -109,5 +136,10 @@ def format_quoted_context_for_ai(quoted: dict) -> str:
     forward_text = (quoted.get("forward_text") or "").strip()
     if forward_text:
         parts.append(f"> [转发记录] {forward_text}")
+
+    # 被引用的是分享卡片 → 附卡片内容
+    card_text = (quoted.get("card_text") or "").strip()
+    if card_text:
+        parts.append(f"> {card_text}")
 
     return "\n".join(parts)

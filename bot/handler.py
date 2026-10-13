@@ -3,6 +3,7 @@
 新增: 表情收藏、图片/视频理解、消息引用、自动回复决策、群友影响力
 """
 import asyncio
+import json
 import logging
 import random
 import re
@@ -156,6 +157,19 @@ def _forward_aware_text(raw_message: str, forward_block: dict | None) -> str:
     # 摘录按字面插入：用可调用替换，防止转发言里含 \1、\g<1> 等序列时
     # 被 re.sub 当组引用（轻则吞字，重则 PatternError 炸掉整个消息处理）
     return re.sub(r"\[CQ:forward,[^\]]*\]", lambda _m: summary, raw_message)
+
+
+def _visible_message_text(raw_message: str, forward_block: dict | None,
+                          card_summary: str = "") -> str:
+    """AI/记忆/决策可见的消息文本 = 原文（转发已换摘要）+ 分享卡片摘要。
+
+    json/xml 分享卡片此前只有裸 [CQ:json,...] 进可见文本，AI 看不见
+    里面是什么。这里把解析出的《标题》+链接附在消息尾部。
+    """
+    txt = _forward_aware_text(raw_message, forward_block)
+    if card_summary:
+        txt = f"{txt}\n{card_summary}".strip() if txt else card_summary
+    return txt
 
 
 async def _forward_images_to_media_ctx(images: list[dict], limit: int = 2) -> list[dict]:
@@ -756,6 +770,27 @@ async def handle_notice(bot: OneBotClient, event: dict):
             op_name = str(operator)
         group_events.record(group_id, "recall", operator, op_name)
 
+    # ── 群文件上传感知 + 文件名审核 ──
+    # OB11GroupUploadNoticeEvent: {group_id, user_id, file: {id, name, size, busid}}
+    elif notice_type == "group_upload":
+        try:
+            await _handle_group_upload(bot, group_id, user_id, event.get("file") or {})
+        except Exception as e:
+            logger.debug(f"群文件上传处理异常: {e}")
+
+    # ── 精华消息变动感知 ──
+    # OB11GroupEssenceEvent: {group_id, message_id, sender_id=消息作者,
+    # operator_id=操作者, sub_type: add/delete}
+    elif notice_type == "essence":
+        try:
+            _handle_essence(bot, group_id, event)
+        except Exception as e:
+            logger.debug(f"精华事件处理异常: {e}")
+
+    elif notice_type == "friend_add":
+        # 新好友 —— 只记日志（主动打招呼容易变成骚扰，交给私聊 AI 自然接）
+        logger.info(f"新增好友: {user_id}")
+
     # ── 表情回应感知 ──
     # NapCat 的 group_msg_emoji_like 通知事件（OB11MsgEmojiLikeEvent）：
     # {notice_type, group_id, user_id=回应者, message_id=被回应的消息,
@@ -797,9 +832,188 @@ async def handle_notice(bot: OneBotClient, event: dict):
                     logger.debug(f"回戳失败: {e}")
         return
 
+    # ── 资料赞感知 → 回赞（真人感：别人赞你，顺手赞回去）──
+    # OB11ProfileLikeEvent: {notice_type=notify, sub_type=profile_like,
+    # operator_id, operator_nick, times}（无 group_id——资料赞没有群上下文）
+    if notice_type == "notify" and event.get("sub_type") == "profile_like":
+        try:
+            _handle_profile_like(bot, event)
+        except Exception as e:
+            logger.debug(f"资料赞处理异常: {e}")
+        return
+
+    # ── 灰条提示感知（撤回附带原因/红包/戳一戳变体等系统灰条）──
+    # OB11GroupGrayTipEvent: {group_id, user_id, message_id, content=JSON字符串}
+    if notice_type == "notify" and event.get("sub_type") == "gray_tip":
+        try:
+            _handle_gray_tip(group_id, user_id, event)
+        except Exception as e:
+            logger.debug(f"灰条处理异常: {e}")
+        return
+
     if notice_type == "notify" and event.get("sub_type") == "honor":
         # 群荣誉变更（龙王/群聊之火等）→ 无视
         return
+
+
+# 资料赞回赞限速：同一人 24h 只回一次；全局每日上限（防全群连环赞触发风控）
+_profile_like_last: dict[int, float] = {}
+_profile_like_daily: dict[str, int] = {}
+
+
+async def _handle_group_upload(bot: OneBotClient, group_id: int,
+                               uploader_qq: int, file_info: dict):
+    """群文件上传：文件名违规审核 + 事件感知。
+
+    判罚口径与昵称检测一致：learner 学习打分 + 必须有真实违规词命中
+    （防"形状"信号误伤正常文件名）。管理员时删文件 + @警告，满 3 次转踢人审批。
+    """
+    name = (file_info.get("name") or "").strip()
+    if not name:
+        return
+    short = name[:60]
+    try:
+        uploader_name = _get_identity().peek_name(group_id, uploader_qq) or str(uploader_qq)
+    except Exception:
+        uploader_name = str(uploader_qq)
+    # 事件感知：AI 知道"谁传了什么文件"
+    group_events.record(group_id, "upload", uploader_qq, uploader_name, detail=short)
+
+    if _is_owner(uploader_qq) or _is_official_account(uploader_qq):
+        return
+
+    score = learner.score_with_learning(name)
+    kw_list = [h["keyword"] for h in score.get("details", {}).get("keyword_hits", [])]
+    if not (score.get("is_violation") and score.get("confidence", 0) >= 0.7 and kw_list):
+        return
+
+    conf = score["confidence"]
+    v_records = db.query_violations(group_id=group_id, violator_qq=uploader_qq)
+    violation_count = len(v_records) + 1
+    db.add_violation(
+        message_id=0, group_id=group_id, group_name="",
+        violator_qq=uploader_qq, violator_name=uploader_name,
+        raw_message=f"[文件名违规] {name[:100]}",
+        violation_note=f"文件名检测 置信度{conf:.0%} 第{violation_count}次",
+        keywords=kw_list,
+        recorded_by=int(config.BOT_QQ or 0),
+        confidence=conf, source="auto",
+    )
+    learner.learn_from_violation(name, kw_list, source="auto")
+    logger.warning(f"违规文件名: 群{group_id} {uploader_name}({uploader_qq}) "
+                   f"「{short}」 命中{kw_list[:3]}")
+
+    bot_is_admin = await _is_bot_admin(bot, group_id)
+    if not bot_is_admin:
+        return
+    # 1. 删违规文件（file.id 来自上传事件）
+    file_id = str(file_info.get("id", "") or "")
+    if file_id:
+        try:
+            await bot.delete_group_file(group_id, file_id)
+        except Exception as e:
+            logger.debug(f"违规文件删除失败: {e}")
+    # 2. @警告；满 3 次转踢人审批
+    if violation_count < 3:
+        warn = (f"[CQ:at,qq={uploader_qq}] ⚠️ 你上传的文件「{short}」命中违规词："
+                f"{', '.join(kw_list[:3])}，文件已删除。请勿传播违规内容。"
+                f"（第{violation_count}/3 次）")
+    else:
+        warn = (f"[CQ:at,qq={uploader_qq}] 🚫 多次上传违规文件（{', '.join(kw_list[:3])}），"
+                f"文件已删除，并已提交移出群聊审批。")
+    try:
+        await bot.send_group_msg(group_id, warn)
+    except Exception as e:
+        logger.debug(f"文件违规警告发送失败: {e}")
+
+    if violation_count >= 3 and not guardian.has_pending_action(group_id, uploader_qq, "kick"):
+        aid = guardian.create_action_request(
+            group_id, uploader_qq, uploader_name,
+            action="kick",
+            reason=f"文件名违规(第{violation_count}次): {', '.join(kw_list[:3])}",
+            message=f"[文件名] {short}",
+        )
+        try:
+            nid = await bot.send_private_msg(int(config.OWNER_QQ),
+                f"🚨 **待审批: 踢人（文件名违规）**\n"
+                f"群: {group_id}\n"
+                f"用户: {uploader_name}({uploader_qq})\n"
+                f"文件: {short}\n"
+                f"违规词: {', '.join(kw_list[:5])}\n"
+                f"累计: 第{violation_count}次\n"
+                f"置信度: {conf:.0%}\n\n"
+                f"回复 \"同意 {aid}\" 执行踢人\n"
+                f"回复 \"拒绝 {aid}\" 取消")
+            guardian.set_notify_msg(aid, nid)
+        except Exception:
+            pass
+
+
+def _handle_essence(bot: OneBotClient, group_id: int, event: dict):
+    """精华消息变动 → 事件感知。自己的消息被设精华时 AI 能看见这份认可。"""
+    sub = event.get("sub_type", "add")
+    sender_id = int(event.get("sender_id") or 0)
+    if not group_id or not sender_id:
+        return
+    bot_qq = int(bot.bot_qq or 0)
+    if sender_id == bot_qq:
+        name = group_personality.get_group_bot_name(group_id)
+    else:
+        try:
+            name = _get_identity().peek_name(group_id, sender_id) or str(sender_id)
+        except Exception:
+            name = str(sender_id)
+    group_events.record(group_id, "essence" if sub == "add" else "essence_del",
+                        sender_id, name)
+    if sender_id == bot_qq and sub == "add":
+        logger.info(f"群{group_id} 我的消息被设为精华（操作者 {event.get('operator_id', '?')}）")
+
+
+def _handle_profile_like(bot: OneBotClient, event: dict):
+    """收到资料赞 → 记日志 + 回赞（同一人 24h 一次，全局每日上限）。"""
+    operator_id = int(event.get("operator_id") or 0)
+    times = int(event.get("times") or 0)
+    nick = (event.get("operator_nick") or "").strip() or str(operator_id)
+    if not operator_id or operator_id == int(bot.bot_qq or 0):
+        return
+    logger.info(f"收到资料赞: {nick}({operator_id}) ×{times}")
+    now = time.time()
+    if now - _profile_like_last.get(operator_id, 0) < 86400:
+        return
+    today = time.strftime("%Y-%m-%d")
+    for k in [k for k in _profile_like_daily if k != today]:
+        _profile_like_daily.pop(k, None)
+    if _profile_like_daily.get(today, 0) >= 20:
+        return
+    _profile_like_last[operator_id] = now
+    if len(_profile_like_last) > 500:
+        recent = sorted(_profile_like_last.items(), key=lambda kv: kv[1], reverse=True)[:300]
+        _profile_like_last.clear()
+        _profile_like_last.update(recent)
+    _profile_like_daily[today] = _profile_like_daily.get(today, 0) + 1
+    asyncio.create_task(bot.send_like(operator_id, 1))
+
+
+def _handle_gray_tip(group_id: int, user_id: int, event: dict):
+    """灰条提示 → 事件感知（content 是 JSON 字符串，尽量抠出可读文本）。"""
+    content = event.get("content", "") or ""
+    text = ""
+    try:
+        obj = json.loads(content)
+        if isinstance(obj, list):
+            text = "".join(str(e.get("text", "")) for e in obj if isinstance(e, dict))
+        elif isinstance(obj, dict):
+            text = str(obj.get("text", "") or "")
+    except Exception:
+        text = content
+    text = text.strip()[:60]
+    if not text:
+        return
+    try:
+        name = _get_identity().peek_name(group_id, user_id) or str(user_id)
+    except Exception:
+        name = str(user_id)
+    group_events.record(group_id, "gray", user_id, name, detail=text)
 
 
 def _name_processed_recently(v_records: list[dict], nickname: str, window: int = 86400) -> bool:
@@ -1236,14 +1450,16 @@ async def handle_group_message(bot: OneBotClient, event: dict):
         quoted_context = await quote_handler.get_quoted_context(bot, reply_msg_id)
 
     # ── 提取消息中的媒体内容（用于 AI 上下文）──
-    # 新增：统一内容提取（合并转发 + 图片 + 表情）
+    # 新增：统一内容提取（合并转发 + 图片 + 表情 + 分享卡片）
+    card_summary = ""
     try:
         from . import content_reader
         content = await content_reader.extract_full_content(bot, raw_message, message)
+        card_summary = content_reader.format_cards_text(content.get("cards"))
     except Exception as e:
         logger.debug(f"content_reader 异常: {e}")
         content = {"text": _extract_text(message), "images": [], "stickers": [],
-                   "has_forward": False, "forward": None, "errors": []}
+                   "cards": [], "has_forward": False, "forward": None, "errors": []}
 
     # 保留旧 media_ctx 给"自动收藏表情"/影响力追踪用（不破坏现有功能）
     media_ctx = []
@@ -1256,11 +1472,12 @@ async def handle_group_message(bot: OneBotClient, event: dict):
     has_sticker_code = any(m.get("type") == "sticker" for m in media_ctx)
 
     # ── 并行审核：文本 + 全量图片/表情/GIF ──
-    # 构造 effective_text（含合并转发子消息）
+    # 构造 effective_text（含合并转发子消息 + 分享卡片内容）
     effective_text = content["text"]
     if content["has_forward"] and content["forward"]:
         effective_text = (effective_text + "\n[合并转发]\n" + content["forward"]["text"]).strip()
-
+    if card_summary:
+        effective_text = (effective_text + "\n" + card_summary).strip()
     # 收集所有待审媒体（本条 + 转发包内）
     audit_images = list(content["images"])
     for _s in content["stickers"]:
@@ -1327,11 +1544,13 @@ async def handle_group_message(bot: OneBotClient, event: dict):
     should_recall = False
     score_info = {"confidence": 0, "keywords_matched": [], "violation_count": 0, "threshold": 0, "is_violation": False}
     if not _is_owner(user_id) and not _is_official_account(user_id):
-        should_recall, score_info = automod.should_auto_recall(raw_message)
+        # 审核用 effective_text（含转发子消息+卡片解码文本），不再用裸 raw——
+        # json 卡片的中文是 \uXXXX 转义、转发正文只在 CQ 码里，裸扫必然漏
+        should_recall, score_info = automod.should_auto_recall(effective_text)
 
     # ── LLM 增强审核: 关键词可疑区间 → MiniMax 终审 ──
     llm_result = None
-    if config.LLM_MOD_ENABLED and not _is_owner(user_id) and not _is_official_account(user_id) and raw_message:
+    if config.LLM_MOD_ENABLED and not _is_owner(user_id) and not _is_official_account(user_id) and effective_text:
         kw_conf = score_info.get("confidence", 0)
         # 关键词置信度在灰色区间(0.25-0.85)或低命中数时走LLM
         # LLM 审核：关键词可疑区间 + 随机抽检（防黑话绕过）
@@ -1339,7 +1558,7 @@ async def handle_group_message(bot: OneBotClient, event: dict):
         if kw_conf >= 0.25 or should_recall or llm_sample:
             try:
                 llm_result = await llm_mod.llm_moderate(
-                    raw_message, group_id=group_id, user_id=user_id,
+                    effective_text, group_id=group_id, user_id=user_id,
                     force_llm=should_recall,  # 如果关键词认为违规，强制走LLM确认
                 )
                 if llm_result and llm_result.get("source", "").startswith("llm_"):
@@ -1589,8 +1808,8 @@ async def handle_group_message(bot: OneBotClient, event: dict):
 
     # ===== AI 记忆：记住用户 + 缓冲消息 + 事实提取 =====
     if raw_message and len(raw_message) > 2:
-        # 转发可见性：合并转发以摘要进记忆，而不是裸 [CQ:forward,id=..]
-        fwd_visible = _forward_aware_text(raw_message, content.get("forward"))
+        # 转发/卡片可见性：合并转发以摘要、分享卡片以《标题》进记忆，而不是裸 CQ 码
+        fwd_visible = _visible_message_text(raw_message, content.get("forward"), card_summary)
         memory.remember_user(user_id, group_id, user_name, fwd_visible)
         memory.buffer_message(group_id, user_id, user_name, fwd_visible)
         memory.window_add_message(group_id, user_id, user_name, fwd_visible, message_id=message_id)
@@ -1629,7 +1848,7 @@ async def handle_group_message(bot: OneBotClient, event: dict):
         if user_id != int(bot.bot_qq or 0):
             chat.add_context(
                 group_id, "user",
-                f"[{user_name}] 说: {_forward_aware_text(raw_message, content.get('forward'))}",
+                f"[{user_name}] 说: {_visible_message_text(raw_message, content.get('forward'), card_summary)}",
                 importance=0.4, msg_id=message_id,
             )
 
@@ -2476,10 +2695,10 @@ async def handle_group_message(bot: OneBotClient, event: dict):
 
             # 走决策引擎判断这条消息是否值得接话
             # （会话态 + Bot 刚说完话 → 决策引擎走"热对话续聊"高概率层）
-            # 转发可见性：决策引擎拿到的是转发摘要而不是裸 CQ 码
+            # 转发/卡片可见性：决策引擎拿到的是摘要而不是裸 CQ 码
             should_follow, reason = await decision_engine.should_reply_to_message(
                 bot, group_id, user_id, user_name,
-                _forward_aware_text(raw_message, content.get("forward")) or text,
+                _visible_message_text(raw_message, content.get("forward"), card_summary) or text,
                 is_at_bot=False, is_reply_to_bot=False, quoted_context=quoted_context,
                 in_followup=True,
                 bot_last_reply_ts=_followup.get(group_id, {}).get("last_bot_reply_ts", 0.0),
@@ -2516,6 +2735,10 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                     chat_text = resolved_clean
             except Exception:
                 pass
+
+        # 分享卡片：@+卡片 的消息剥 CQ 后卡片内容会丢，把摘要补进 AI 可见文本
+        if card_summary and card_summary not in (chat_text or ""):
+            chat_text = f"{chat_text}\n{card_summary}".strip()
 
         t0 = time.time()
 
@@ -2617,10 +2840,10 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             except Exception:
                 pass
         else:
-            # 转发可见性：主动决策同样看转发摘要，纯转发消息才有机会被接话
+            # 转发/卡片可见性：主动决策同样看摘要，纯转发/纯卡片消息才有机会被接话
             should_reply, reason = await decision_engine.should_reply_to_message(
                 bot, group_id, user_id, user_name,
-                _forward_aware_text(raw_message, content.get("forward")),
+                _visible_message_text(raw_message, content.get("forward"), card_summary),
                 is_at_bot=False,
                 # 真·回复Bot判定：群友互回不再被当成回复 Bot 触发必回分支
                 is_reply_to_bot=_is_reply_to_bot(quoted_context, bot.bot_qq),
@@ -2629,8 +2852,9 @@ async def handle_group_message(bot: OneBotClient, event: dict):
             if should_reply:
                 logger.info(f"主动回复决策: 群{group_id} {user_name} — {reason}")
                 asyncio.create_task(_auto_reply(
-                    bot, group_id, user_id, user_name, raw_message, quoted_context,
-                    media_ctx, message_id,
+                    bot, group_id, user_id, user_name,
+                    _visible_message_text(raw_message, content.get("forward"), card_summary),
+                    quoted_context, media_ctx, message_id,
                 ))
 
 

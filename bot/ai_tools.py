@@ -40,6 +40,7 @@ _ADMIN_ONLY_TOOLS = {
     "set_admin", "at_all", "send_notice", "send_essence",
     "change_group_name", "delete_file",
     "upload_group_file", "create_group_folder",
+    "move_group_file", "rename_group_file",
     "set_member_card", "set_member_title",
 }
 
@@ -775,6 +776,43 @@ ALL_TOOLS = [
                 "parent_id": {"type": "string", "description": "父文件夹 ID（默认根目录）"},
             },
             "required": ["name"],
+        },
+    },
+    {
+        "name": "move_group_file",
+        "description": "把群文件移动到另一个文件夹。文件夹 ID 从 get_group_files 结果里拿。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string", "description": "文件 ID"},
+                "current_folder_id": {"type": "string", "description": "文件当前所在文件夹 ID（根目录传空字符串）"},
+                "target_folder_id": {"type": "string", "description": "目标文件夹 ID（根目录传空字符串）"},
+            },
+            "required": ["file_id", "target_folder_id"],
+        },
+    },
+    {
+        "name": "rename_group_file",
+        "description": "重命名群文件。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string", "description": "文件 ID"},
+                "current_folder_id": {"type": "string", "description": "文件当前所在文件夹 ID（根目录传空字符串）"},
+                "new_name": {"type": "string", "description": "新文件名（含扩展名）"},
+            },
+            "required": ["file_id", "new_name"],
+        },
+    },
+    {
+        "name": "get_private_chat_history",
+        "description": "翻看自己和当前私聊对象的历史消息。聊过但记不清的事用这个查。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message_seq": {"type": "integer", "description": "起始消息序号，0=最新"},
+                "count": {"type": "integer", "description": "拉取数量，默认20"},
+            },
         },
     },
 
@@ -1700,6 +1738,38 @@ async def _execute_tool_impl(
             if ok:
                 logger.warning(f"AI 执行了删除文件: file={file_id} 理由:{reason}")
             return f"已删除文件 ({reason}) ✓" if ok else "删除失败"
+
+        elif tool_name == "move_group_file":
+            file_id = str(tool_input.get("file_id", ""))
+            cur_folder = str(tool_input.get("current_folder_id", "") or "")
+            tgt_folder = str(tool_input.get("target_folder_id", "") or "")
+            ok = await bot.move_group_file(group_id, file_id, cur_folder, tgt_folder)
+            return "已移动文件 ✓" if ok else "移动失败"
+
+        elif tool_name == "rename_group_file":
+            file_id = str(tool_input.get("file_id", ""))
+            cur_folder = str(tool_input.get("current_folder_id", "") or "")
+            new_name = str(tool_input.get("new_name", "")).strip()
+            if not new_name:
+                return "缺少新文件名"
+            ok = await bot.rename_group_file(group_id, file_id, cur_folder, new_name)
+            return f"已重命名为「{new_name}」✓" if ok else "重命名失败"
+
+        elif tool_name == "get_private_chat_history":
+            if group_id:
+                return "该工具只在私聊里可用（群聊用 get_chat_history）"
+            seq = int(tool_input.get("message_seq", 0))
+            count = min(int(tool_input.get("count", 20)), 50)
+            history = await bot.get_friend_msg_history(user_id, seq, count)
+            if history:
+                msgs = history.get("messages", [])[:10]
+                lines = []
+                for m in msgs:
+                    sender = m.get("sender", {}).get("nickname", "?")
+                    text = (m.get("message", "") or m.get("raw_message", ""))[:50]
+                    lines.append(f"[{m.get('time', '?')}] {sender}: {text}")
+                return "私聊历史:\n" + "\n".join(lines) if lines else "无消息"
+            return "获取私聊历史失败"
 
         # ── OCR / 翻译 / 语音 ──
         elif tool_name == "ocr_image":

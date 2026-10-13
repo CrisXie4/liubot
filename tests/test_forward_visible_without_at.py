@@ -73,27 +73,33 @@ class TestForwardAwareText(unittest.TestCase):
 
 
 class TestConsumptionPointsWired(unittest.TestCase):
-    """handle_group_message 的 4 个消费点已改用 _forward_aware_text"""
+    """handle_group_message 的 4 个消费点已改用 _visible_message_text
+    （转发摘要 + 分享卡片摘要，比旧 _forward_aware_text 多卡片维度）"""
 
     def setUp(self):
         self.src = inspect.getsource(handler.handle_group_message)
 
     def test_memory_point(self):
-        self.assertIn("_forward_aware_text(raw_message, content.get(\"forward\"))", self.src)
+        self.assertIn(
+            "_visible_message_text(raw_message, content.get(\"forward\"), card_summary)",
+            self.src)
         self.assertIn("fwd_visible", self.src)
 
     def test_add_context_point(self):
         self.assertIn("chat.add_context", self.src)
-        self.assertIn("_forward_aware_text(raw_message, content.get('forward'))", self.src)
+        self.assertIn(
+            "_visible_message_text(raw_message, content.get('forward'), card_summary)",
+            self.src)
 
     def test_decision_engine_points(self):
-        """followup 决策与主动决策两处的 message 实参都改用该函数"""
+        """记忆、上下文、followup 决策、主动决策、_auto_reply 实参都用该函数"""
+        count = (self.src.count(
+            "_visible_message_text(raw_message, content.get(\"forward\"), card_summary)")
+            + self.src.count(
+            "_visible_message_text(raw_message, content.get('forward'), card_summary)"))
         self.assertEqual(
-            self.src.count("_forward_aware_text(raw_message, content.get(\"forward\"))")
-            + self.src.count("_forward_aware_text(raw_message, content.get('forward'))"),
-            4,
-            "记忆/上下文/会话决策/主动决策 4 个消费点都应使用 _forward_aware_text",
-        )
+            count, 5,
+            "记忆/上下文/会话决策/主动决策/auto_reply 5 个消费点都应使用 _visible_message_text")
 
 
 if __name__ == "__main__":
