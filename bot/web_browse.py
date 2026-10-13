@@ -285,6 +285,14 @@ def _get_session(key: str) -> _Session:
     return s
 
 
+def current_url(group_id: int, caller_qq: int) -> str:
+    """当前浏览栈栈顶页面的 URL（没有会话/栈空返回空串）。web_screenshot 用。"""
+    sess = _sessions.get(f"{int(group_id or 0)}:{int(caller_qq or 0)}")
+    if sess and sess.stack:
+        return sess.stack[-1].url
+    return ""
+
+
 def _format_page(page: _Page, note: str = "") -> str:
     """渲染成 AI 可读的页面文本。控制在 ~3.5K 字符内，低于裁剪阈值。"""
     lines = []

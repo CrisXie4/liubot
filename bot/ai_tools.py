@@ -48,7 +48,7 @@ def get_tools_for_group(bot_is_admin: bool, web_search_enabled: bool = True) -> 
     """根据 Bot 权限和设置返回可用工具列表"""
     from .config import config
     relay_db_enabled = bool(getattr(config, "RELAY_DB_URL", ""))
-    _web_tools = {"web_search", "web_open", "web_click", "web_back"}
+    _web_tools = {"web_search", "web_open", "web_click", "web_back", "web_screenshot"}
     tools = []
     for t in ALL_TOOLS:
         name = t["name"]
@@ -110,6 +110,20 @@ ALL_TOOLS = [
         "name": "web_back",
         "description": "返回上一页：从当前网页退回到上一个看过的页面。",
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "web_screenshot",
+        "description": (
+            "给网页截图并直接发到群里。刚用 web_open/web_click 打开了什么网站、"
+            "或群友发链接想看页面长什么样时用——一张图比转述直观得多。"
+            "不传 url 就截当前浏览的页面。失败（纯JS/需登录的页面截不了）就改用文字讲。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "要截图的网址；不传则截当前打开的页面"},
+            },
+        },
     },
     {
         "name": "count_members",
@@ -1078,6 +1092,36 @@ async def _send_direct_cq(bot, group_id: int, caller_qq: int, cq: str, label: st
     return f"⨯ {label}发送失败（{fail or 'NapCat 无响应'}），换个方式表达吧"
 
 
+async def _web_screenshot(bot, group_id: int, caller_qq: int, tool_input: dict) -> str:
+    """网页截图直发群：web_shot 出图 → base64:// CQ 直接发。
+
+    base64 而不是文件路径——NapCat 在 docker 容器里看不见宿主机路径；
+    直接发而不是返回 CQ 码让下一轮拼——截图是用户点名要的东西，不能陪葬。
+    """
+    import base64 as _b64
+    from . import web_browse, web_shot
+
+    rate = web_shot.check_rate(group_id)
+    if rate:
+        return rate
+
+    url = str(tool_input.get("url", "") or "").strip()
+    if not url:
+        url = web_browse.current_url(group_id, caller_qq)
+        if not url:
+            return "⨯ 没有正在浏览的页面，传个 url 或者先 web_open 打开一个"
+
+    data = await web_shot.capture(url)
+    if not data:
+        return ("⨯ 截图服务没出图（页面可能是纯 JS 渲染或需要登录），"
+                "直接用文字给群友讲吧")
+
+    b64 = _b64.b64encode(data).decode()
+    return await _send_direct_cq(bot, group_id, caller_qq,
+                                 f"[CQ:image,file=base64://{b64}]",
+                                 f"网页截图({url[:60]})")
+
+
 async def _gated(group_id, action, tool_input, caller_qq,
                  master_instructed, bot, member_info=None, mute_seconds=0):
     """对破坏性动作过 guardian 闸门。
@@ -1174,6 +1218,9 @@ async def _execute_tool_impl(
         elif tool_name in ("web_open", "web_click", "web_back"):
             from . import web_browse
             return await web_browse.handle(tool_name, tool_input, group_id, caller_qq)
+
+        elif tool_name == "web_screenshot":
+            return await _web_screenshot(bot, group_id, caller_qq, tool_input)
 
         elif tool_name == "count_members":
             members = await bot.get_group_member_list(group_id)
