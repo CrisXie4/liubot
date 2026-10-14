@@ -994,6 +994,65 @@ def _handle_profile_like(bot: OneBotClient, event: dict):
     asyncio.create_task(bot.send_like(operator_id, 1))
 
 
+async def _recall_contact_card(bot: OneBotClient, group_id: int, user_id: int,
+                               user_name: str, message_id: int, raw_message: str) -> bool:
+    """名片分享（个人名片/群名片）一律撤回——导流拉人套路，主人/官方豁免。
+
+    返回 True=已按名片处理（撤回+记档+警告），调用方直接 return；
+    False=bot 非管理员撤不动，走正常流程。
+    """
+    bot_is_admin = await _is_bot_admin(bot, group_id)
+    if not bot_is_admin:
+        logger.info(f"群{group_id} {user_name}({user_id}) 发了名片但Bot非管理员，撤不了")
+        return False
+    kind = "群名片" if "type=group" in (raw_message or "") else "个人名片"
+    try:
+        await bot.delete_msg(message_id)
+    except Exception as e:
+        logger.warning(f"名片撤回失败(继续记档警告): {e}")
+    v_records = db.query_violations(group_id=group_id, violator_qq=user_id)
+    violation_count = len(v_records) + 1
+    db.add_violation(
+        message_id=message_id, group_id=group_id, group_name="",
+        violator_qq=user_id, violator_name=user_name or str(user_id),
+        raw_message=(raw_message or "")[:200],
+        violation_note=f"名片分享 一律撤回 第{violation_count}次",
+        keywords=["[名片]"],
+        recorded_by=int(config.BOT_QQ or 0),
+        confidence=1.0, source="auto",
+    )
+    if violation_count < 3:
+        warn = (f"[CQ:at,qq={user_id}] ⚠️ 群里不发{kind}哈（防导流），已撤回。"
+                f"（第{violation_count}/3 次）")
+    else:
+        warn = f"[CQ:at,qq={user_id}] 🚫 多次发名片，已撤回并提交移出群聊审批。"
+    try:
+        await bot.send_group_msg(group_id, warn)
+    except Exception as e:
+        logger.debug(f"名片警告发送失败: {e}")
+    if violation_count >= 3 and not guardian.has_pending_action(group_id, user_id, "kick"):
+        aid = guardian.create_action_request(
+            group_id, user_id, user_name or str(user_id),
+            action="kick",
+            reason=f"多次发名片(第{violation_count}次)",
+            message=f"[名片] {(raw_message or '')[:80]}",
+        )
+        try:
+            nid = await bot.send_private_msg(int(config.OWNER_QQ),
+                f"🚨 **待审批: 踢人（多次发名片）**\n"
+                f"群: {group_id}\n"
+                f"用户: {user_name}({user_id})\n"
+                f"累计: 第{violation_count}次\n\n"
+                f"回复 \"同意 {aid}\" 执行踢人\n"
+                f"回复 \"拒绝 {aid}\" 取消")
+            guardian.set_notify_msg(aid, nid)
+        except Exception:
+            pass
+    logger.warning(f"名片分享已撤回: 群{group_id} {user_name}({user_id}) "
+                   f"{kind} 第{violation_count}次")
+    return True
+
+
 def _handle_gray_tip(group_id: int, user_id: int, event: dict):
     """灰条提示 → 事件感知（content 是 JSON 字符串，尽量抠出可读文本）。"""
     content = event.get("content", "") or ""
@@ -1186,38 +1245,18 @@ async def check_member_names(bot: OneBotClient, group_id: int, dry_run: bool = F
 
 
 async def check_group_name(bot: OneBotClient, group_id: int) -> str | None:
-    """检查群名是否违规，返回警告消息或 None"""
-    info = await bot.get_group_info(group_id)
-    if not info:
-        return None
-    name = info.get("group_name", "")
-    if not name:
-        return None
-
-    # 用学习引擎评分（更全面）
-    score = learner.score_with_learning(name)
-    if score["is_violation"]:
-        db.add_violation(
-            message_id=0, group_id=group_id, group_name=name,
-            violator_qq=0, violator_name="群名称",
-            raw_message=f"[群名违规] {name}",
-            violation_note=f"自动检测 置信度{score['confidence']:.0%}",
-            keywords=[h["keyword"] for h in score.get("details", {}).get("keyword_hits", [])],
-            recorded_by=int(config.BOT_QQ or 0),
-            confidence=score["confidence"], source="auto",
-        )
-        return (
-            f"⚠️ **群名违规警告**\n"
-            f"群名: {name}\n"
-            f"置信度: {score['confidence']:.0%}\n"
-            f"匹配词: {', '.join(h['keyword'] for h in score.get('details', {}).get('keyword_hits', [])[:5])}\n"
-            f"提示: 只有群主能修改群名，请联系群主处理"
-        )
+    """[已下线 2026-10-13] 群名违规检查——群名由群主设定，bot 无权修改，
+    且会把 API 交流群的正常群名误报成违规（"交流/六哥/api"全是日常词）。
+    保留空壳防止外部引用炸掉，不再有任何调用方。"""
     return None
 
 
 async def monitor_all_group_names(bot: OneBotClient):
-    """定时检查所有群名+成员昵称，发现违规自动告警"""
+    """定时检查所有群成员昵称，发现违规自动处理。
+
+    （群名检查已移除——群名是群主设的，bot 管不着还会把自家正常群名
+    误报成违规，2026-10-13 用户判定无用下线）
+    """
     try:
         r = await bot._call("get_group_list", {})
         groups = r.get("data", []) if r.get("status") == "ok" else []
@@ -1225,14 +1264,6 @@ async def monitor_all_group_names(bot: OneBotClient):
             gid = g.get("group_id", 0)
             if not gid:
                 continue
-            # 检查群名
-            gw = await check_group_name(bot, gid)
-            if gw:
-                await bot.send_group_msg(gid, gw)
-                if config.OWNER_QQ:
-                    await bot.send_private_msg(int(config.OWNER_QQ),
-                        f"🔔 群名违规\n群: {g.get('group_name', gid)}\n{gw}")
-                logger.warning(f"群名违规: {g.get('group_name', gid)}")
 
             # 检查成员昵称
             result = await check_member_names(bot, gid, dry_run=False)
@@ -1411,6 +1442,16 @@ async def handle_group_message(bot: OneBotClient, event: dict):
         db.usage_hour_add(msgs_in=1)
     except Exception:
         pass
+
+    # ── 名片分享一律撤回（导流拉人套路；主人/官方豁免）──
+    if (message_id and raw_message and "[CQ:contact," in raw_message
+            and not _is_owner(user_id) and not _is_official_account(user_id)):
+        try:
+            if await _recall_contact_card(bot, group_id, user_id, user_name,
+                                          message_id, raw_message):
+                return
+        except Exception as e:
+            logger.warning(f"名片处理异常: {e}")
 
     sender = event.get("sender", {})
     user_name = sender.get("card", "") or sender.get("nickname", "")
@@ -1923,15 +1964,12 @@ async def handle_group_message(bot: OneBotClient, event: dict):
                 await bot.send_group_msg(group_id, "⚠️ 用法: 加词 <关键词1,关键词2,...>")
             return
 
-        # --- 群名检查 ---
+        # --- 群名检查（已下线）---
         if cmd in ("查群名", "checkgroupname"):
-            warning = await check_group_name(bot, group_id)
-            if warning:
-                await bot.send_group_msg(group_id, warning)
-            else:
-                info = await bot.get_group_info(group_id)
-                name = info.get("group_name", "未知") if info else "未知"
-                await bot.send_group_msg(group_id, f"✅ 群名「{name}」未检测到违规")
+            info = await bot.get_group_info(group_id)
+            name = info.get("group_name", "未知") if info else "未知"
+            await bot.send_group_msg(group_id,
+                f"ℹ️ 群名检查功能已下线。群名「{name}」由群主管理。")
             return
 
         # --- 查/训 违规昵称 ---
